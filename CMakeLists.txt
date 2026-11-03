@@ -19,6 +19,7 @@ add_library(winhttp SHARED src/main.cpp src/winhttp_stubs.asm src/winhttp.def)
 target_compile_features(winhttp PRIVATE cxx_std_17)
 target_compile_definitions(winhttp PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(winhttp PRIVATE minhook)
+target_include_directories(winhttp PRIVATE third_party/minhook/include)
 set_property(TARGET winhttp minhook PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
 add_custom_command(TARGET winhttp POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:winhttp> ${CMAKE_CURRENT_SOURCE_DIR}/../build/winhttp.dll)
