@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 29
+#define BUILD_NUMBER 33
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -120,6 +120,10 @@ static const Target kLensPose{"LensPose", 0x1214150, "\x40\x53\x48\x83\xec\x60\x
 static const Target kJitter{"Jitter", 0x1234030, "\x48\x89\x5c\x24\x08\x48\x89\x74\x24\x10\x48\x89\x7c\x24\x18\x41\x56"};
 static const Target kBufferSize{"BufferSize", 0x120c2e0, "\x48\x89\x5c\x24\x08\x48\x89\x74\x24\x10\x48\x89\x7c\x24\x18\x55\x41\x54"};
 static const Target kTone{"Tone", 0x11dc080, "\x48\x8b\xc4\x48\x89\x50\x10\x55\x53\x56\x57\x41"};
+static const Target kUpscalePass{"UpscalePass", 0x11df5a0, "\x85\xd2\x0f\x8e\xbf\x0c"};
+static const Target kSlConstants{"SlConstants", 0x1238930, "\x48\x89\x5c\x24\x08\x48\x89\x74\x24\x10"};
+static const Target kUpEval{"UpscalerEvaluate", 0x16e87b0, "\x40\x55\x53\x56\x57\x41\x54\x41\x55"};
+static const Target kUpEvalDlss{"DlssEvaluate", 0x16e8100, "\x48\x89\x5c\x24\x08\x48\x89\x74\x24\x10"};
 static const Target kCameraPush{"CameraPush", 0xfc7110, "\x40\x53\x57\x41\x56\x48\x81\xec\x30\x05"};
 static const size_t kManager = 0x6739a10;
     // ViewContextManager
@@ -165,21 +169,34 @@ static void __fastcall HookViewCreate(uint8_t* view, const char* name, void* buf
 // Eyes get their own full buffer set at their own size, whatever the game's window or resolution setting is.
 using BufferSizeFn = void(__fastcall*)(uint8_t*, const char*, uint32_t, uint32_t, int, char);
 static BufferSizeFn g_origBufferSize;
+// Percent of the eye's size that the scene is drawn at, DLSS making up the rest. 100 is DLAA.
+static std::atomic<int> g_eyeRenderPercent{67};
+static std::atomic<uint32_t> g_eyeRenderW{0}, g_eyeRenderH{0};
 static std::atomic<uint32_t> g_forceW{0}, g_forceH{0};
 static void __fastcall HookBufferSize(uint8_t* buffers, const char* name, uint32_t w, uint32_t h, int kind, char align) {
     const bool ours = name == kEyeName && g_forceW != 0;
+    uint32_t outW = w, outH = h;
     if (ours) {
-        w = g_forceW;
-        h = g_forceH;
+        // The size passed in, kept at +0x14908, is what the scene is drawn at. +0x14910 on is the size after upscaling.
+        outW = g_forceW;
+        outH = g_forceH;
+        // Only DLSS can make up the difference. With any other choice in the game's menu the eyes draw at full size.
+        const int aaType = *reinterpret_cast<int*>(g_base + 0x533959c);
+        const int percent = aaType == 0 ? g_eyeRenderPercent.load() : 100;
+        Log("EYE scene percent %d (setting %d, game aa type %d)", percent, g_eyeRenderPercent.load(), aaType);
+        w = (outW * percent / 100 + 7) & ~7u;
+        h = (outH * percent / 100 + 7) & ~7u;
+        g_eyeRenderW = w;
+        g_eyeRenderH = h;
         *reinterpret_cast<void**>(buffers + 0x14990) = nullptr;  // no sharing with, or clamping to, the main view's set
     }
     g_origBufferSize(buffers, name, w, h, kind, align);
     if (ours) {
         for (size_t off : {size_t{0x14910}, size_t{0x14918}, size_t{0x14920}}) {
-            reinterpret_cast<uint32_t*>(buffers + off)[0] = w;
-            reinterpret_cast<uint32_t*>(buffers + off)[1] = h;
+            reinterpret_cast<uint32_t*>(buffers + off)[0] = outW;
+            reinterpret_cast<uint32_t*>(buffers + off)[1] = outH;
         }
-        Log("EYE buffers %p %ux%u kind %d", buffers, w, h, kind);
+        Log("EYE buffers %p output %ux%u scene %ux%u kind %d", buffers, outW, outH, w, h, kind);
     }
 }
 
@@ -467,9 +484,9 @@ static void __fastcall HookRenderAll() {
                     if (mode == 0) {
                         jx = 0;
                         jy = 0;
-                    } else if (mode == 1 && g_forceW && g_forceH && mw > 0 && mh > 0) {
-                        jx *= mw / static_cast<float>(g_forceW);
-                        jy *= mh / static_cast<float>(g_forceH);
+                    } else if (mode == 1 && g_eyeRenderW.load() && g_eyeRenderH.load() && mw > 0 && mh > 0) {
+                        jx *= mw / static_cast<float>(g_eyeRenderW.load());
+                        jy *= mh / static_cast<float>(g_eyeRenderH.load());
                     }
                 }
                 const float cy = cosf(-g_centreYaw), sy = sinf(-g_centreYaw);
@@ -804,11 +821,12 @@ static void StartXr(int percent) {
 static std::atomic<bool> g_menuOpen{false};
 static int g_menuRow = 0;
 static int g_resolutionSetting = 100;
-static bool g_forceTaa = true;
+static bool g_skipLauncherSetting = true;
+static int g_dlssPercentSetting = 67;  // 0 means no DLSS in the eyes: the game's own anti-aliasing
 static float g_hudDistanceSetting = 2.0f;
 static std::wstring g_iniPath;
 static std::vector<uint32_t> g_menuImage;
-static const int kMenuW = 1024, kMenuH = 704, kMenuRows = 7;
+static const int kMenuW = 1024, kMenuH = 768, kMenuRows = 8;
 
 static void SaveSetting(const wchar_t* name, int value) {
     WritePrivateProfileStringW(L"VR", name, std::to_wstring(value).c_str(), g_iniPath.c_str());
@@ -835,8 +853,13 @@ static void MenuRowText(int row, wchar_t (&name)[64], wchar_t (&value)[32]) {
         swprintf_s(value, L"%d%%", g_resolutionSetting);
         break;
     case 5:
-        wcscpy_s(name, L"Game anti-aliasing (next launch)");
-        wcscpy_s(value, g_forceTaa ? L"On" : L"Off");
+        wcscpy_s(name, L"DLSS scene size (next launch)");
+        if (g_dlssPercentSetting == 0) wcscpy_s(value, L"DLSS off");
+        else swprintf_s(value, L"%d%%", g_dlssPercentSetting);
+        break;
+    case 6:
+        wcscpy_s(name, L"Skip the launcher window (next launch)");
+        wcscpy_s(value, g_skipLauncherSetting ? L"On" : L"Off");
         break;
     default: wcscpy_s(name, L"Close"); break;
     }
@@ -948,8 +971,20 @@ static void MenuChange(int dir) {
         SaveSetting(L"Resolution", g_resolutionSetting);
         break;
     case 5:
-        g_forceTaa = !g_forceTaa;
-        SaveSetting(L"ForceGameAA", g_forceTaa ? 1 : 0);
+    {
+        // Off, Performance, Balanced, Quality, Ultra Quality, DLAA.
+        static const int steps[] = {0, 50, 58, 67, 77, 100};
+        int i = 3;
+        for (int k = 0; k < 6; ++k) if (steps[k] == g_dlssPercentSetting) i = k;
+        i = std::clamp(i + (dir == 0 ? 1 : dir), 0, 5);
+        g_dlssPercentSetting = steps[i];
+        SaveSetting(L"EyeDLSS", g_dlssPercentSetting ? 1 : 0);
+        if (g_dlssPercentSetting) SaveSetting(L"EyeDLSSPercent", g_dlssPercentSetting);
+        break;
+    }
+    case 6:
+        g_skipLauncherSetting = !g_skipLauncherSetting;
+        SaveSetting(L"SkipLauncher", g_skipLauncherSetting ? 1 : 0);
         break;
     default:
         if (dir == 0) {
@@ -958,7 +993,7 @@ static void MenuChange(int dir) {
         }
         break;
     }
-    Log("MENU row %d dir %d: scale %.2f pitch decoupled %d hud %.2f resolution %d aa %d", g_menuRow, dir, g_worldScale.load(), g_levelCamera.load() ? 1 : 0, g_hudDistanceSetting, g_resolutionSetting, g_forceTaa ? 1 : 0);
+    Log("MENU row %d dir %d: scale %.2f pitch decoupled %d hud %.2f resolution %d dlss %d", g_menuRow, dir, g_worldScale.load(), g_levelCamera.load() ? 1 : 0, g_hudDistanceSetting, g_resolutionSetting, g_dlssPercentSetting);
     MenuDraw();
 }
 
@@ -1061,7 +1096,7 @@ static void PollPad() {
         } else if (i == kLeft || i == kRight) {
             MenuChange(i == kLeft ? -1 : 1);
         } else if (i == kA) {
-            if (g_menuRow == 2 || g_menuRow == 5 || g_menuRow == 0 || g_menuRow == kMenuRows - 1) MenuChange(0);
+            if (g_menuRow == 0 || g_menuRow == 2 || g_menuRow == 6 || g_menuRow == kMenuRows - 1) MenuChange(0);
         } else {
             MenuClose();
         }
@@ -1076,10 +1111,164 @@ static DWORD WINAPI PadThread(void*) {
     }
 }
 
+// ---- DLSS for each eye: one Streamline viewport per view. Main 0, left eye 1, right eye 2. ----
+// The game has one viewport and rebuilds DLSS when the output size changes, and it skips offscreen views. So on the
+// render thread: the upscale pass sees eyes as ordinary views, and each eye calls the DLSS step directly on its own viewport.
+static std::atomic<bool> g_eyeDlss{true};
+static std::atomic<int> g_slViewport{0};
+static std::atomic<int> g_slLogLeft{12};
+static std::atomic<uint32_t> g_slCount[8];
+static const size_t kViewportValue = 0x20;  // sl::ViewportHandle: next, GUID, version, then the value. Seen live, always 0 from the game.
+struct ViewportCopy {
+    uint8_t bytes[0x30];
+    explicit ViewportCopy(const void* from) {
+        memcpy(bytes, from, sizeof(bytes));
+        *reinterpret_cast<uint32_t*>(bytes + kViewportValue) = static_cast<uint32_t>(g_slViewport.load());
+    }
+};
+using SlEvaluateFn = int(__cdecl*)(uint32_t, const void*, const void**, uint32_t, void*);
+using SlSetConstFn = int(__cdecl*)(const void*, const void*, const void*);
+using SlGetFeatureFn = int(__cdecl*)(uint32_t, const char*, void**);
+using SlSetOptionsFn = int(__cdecl*)(const void*, const void*);
+static SlEvaluateFn g_origSlEvaluate;
+static SlSetConstFn g_origSlSetConst;
+static SlGetFeatureFn g_origSlGetFeature;
+static SlSetOptionsFn g_origSlSetOptions;
+static int __cdecl HookSlEvaluate(uint32_t feature, const void* frame, const void** inputs, uint32_t n, void* cmd) {
+    ++g_slCount[0];
+    const int vp = g_slViewport.load();
+    if (vp == 0 || feature != 0 || n == 0 || n > 8) return g_origSlEvaluate(feature, frame, inputs, n, cmd);
+    const void* local[8];
+    memcpy(local, inputs, n * sizeof(void*));
+    ViewportCopy copy(inputs[0]);
+    local[0] = copy.bytes;
+    const int r = g_origSlEvaluate(feature, frame, local, n, cmd);
+    ++g_slCount[3];
+    if (r != 0 && g_slLogLeft.fetch_sub(1) > 0) Log("SL evaluate viewport %d result %d", vp, r);
+    return r;
+}
+static int __cdecl HookSlSetConst(const void* values, const void* frame, const void* viewport) {
+    ++g_slCount[2];
+    if (g_slViewport.load() == 0) return g_origSlSetConst(values, frame, viewport);
+    ViewportCopy copy(viewport);
+    const int r = g_origSlSetConst(values, frame, copy.bytes);
+    if (r != 0 && g_slLogLeft.fetch_sub(1) > 0) Log("SL constants viewport %d result %d", g_slViewport.load(), r);
+    return r;
+}
+static int __cdecl HookSlSetOptions(const void* viewport, const void* options) {
+    ++g_slCount[4];
+    if (g_slViewport.load() == 0) return g_origSlSetOptions(viewport, options);
+    ViewportCopy copy(viewport);
+    const int r = g_origSlSetOptions(copy.bytes, options);
+    if (r != 0 && g_slLogLeft.fetch_sub(1) > 0) Log("SL options viewport %d result %d", g_slViewport.load(), r);
+    return r;
+}
+static int __cdecl HookSlGetFeature(uint32_t feature, const char* name, void** fn) {
+    const int r = g_origSlGetFeature(feature, name, fn);
+    if (r == 0 && fn && *fn && name && !strcmp(name, "slDLSSSetOptions") && !g_origSlSetOptions) {
+        g_origSlSetOptions = reinterpret_cast<SlSetOptionsFn>(*fn);
+        *fn = reinterpret_cast<void*>(&HookSlSetOptions);
+        Log("SL options routed");
+    }
+    return r;
+}
+
+static int EyeIndexOfJob(uint8_t* job) {
+    if (!job) return 0;
+    uint8_t* owner = nullptr;
+    if (!SafeCopy(&owner, job + 0x1ff8, 8) || !owner) return 0;
+    if (owner == g_eyeA.load()) return 1;
+    if (owner == g_eyeB.load()) return 2;
+    return 0;
+}
+// The constants step takes the job's view and runs just before its DLSS, so it names the viewport for what follows.
+using SlConstantsFn = void(__fastcall*)(uint8_t*, int, int, int);
+static SlConstantsFn g_origSlConstants;
+static void __fastcall HookSlConstants(uint8_t* job, int frame, int w, int h) {
+    g_slViewport = g_eyeDlss ? EyeIndexOfJob(job) : 0;
+    g_origSlConstants(job, frame, w, h);
+}
+using UpscalePassFn = void(__fastcall*)(uint8_t*, int);
+static UpscalePassFn g_origUpscalePass;
+static void __fastcall HookUpscalePass(uint8_t* list, int count) {
+    int saved[8] = {};
+    uint8_t* jobs[8] = {};
+    const int n = std::min(count, 8);
+    if (g_eyeDlss && count > 0) {
+        for (int i = 0; i < n; ++i) {
+            uint8_t** entry = *reinterpret_cast<uint8_t***>(list + 8 + i * 16);
+            uint8_t* job = entry ? *entry : nullptr;
+            if (EyeIndexOfJob(job)) {
+                jobs[i] = job;
+                int* id = reinterpret_cast<int*>(job + 0xf90);
+                saved[i] = *id;
+                *id = 0;  // negative is what makes the pass skip a view
+            }
+        }
+    }
+    g_origUpscalePass(list, count);
+    for (int i = 0; i < n; ++i) {
+        if (jobs[i]) *reinterpret_cast<int*>(jobs[i] + 0xf90) = saved[i];
+    }
+    g_slViewport = 0;
+}
+using UpEvalFn = void(__fastcall*)(uint8_t*, uint32_t*);
+static UpEvalFn g_origUpEval;
+static void __fastcall HookUpEval(uint8_t* self, uint32_t* desc) {
+    const int vp = g_slViewport.load();
+    if (vp == 0 || !g_eyeDlss) {
+        g_origUpEval(self, desc);
+        return;
+    }
+    static std::atomic<int> left{6};
+    if (left.fetch_sub(1) > 0) Log("EYEDLSS viewport %d in %ux%u out %ux%u method %d ready %u", vp, desc[0], desc[1], desc[2], desc[3], *reinterpret_cast<int*>(self + 0x10), self[0xd]);
+    // Only once the game's own DLSS is set up, and only for the DLSS method.
+    if (*reinterpret_cast<int*>(self + 0x10) != 2 || !self[0xd]) return;
+    reinterpret_cast<UpEvalFn>(g_base + kUpEvalDlss.rva)(self, desc);
+}
+
+static void InstallSlProbe() {
+    HMODULE m = GetModuleHandleW(L"sl.interposer.dll");
+    if (!m) m = LoadLibraryW((g_dir + L"sl.interposer.dll").c_str());
+    if (!m) {
+        Log("SL interposer not loaded");
+        return;
+    }
+    struct Item {
+        const char* name;
+        void* hook;
+        void** orig;
+    };
+    const Item items[] = {{"slEvaluateFeature", reinterpret_cast<void*>(&HookSlEvaluate), reinterpret_cast<void**>(&g_origSlEvaluate)},
+                          {"slSetConstants", reinterpret_cast<void*>(&HookSlSetConst), reinterpret_cast<void**>(&g_origSlSetConst)},
+                          {"slGetFeatureFunction", reinterpret_cast<void*>(&HookSlGetFeature), reinterpret_cast<void**>(&g_origSlGetFeature)}};
+    for (const Item& h : items) {
+        void* f = reinterpret_cast<void*>(GetProcAddress(m, h.name));
+        const MH_STATUS st = f ? MH_CreateHook(f, h.hook, h.orig) : MH_ERROR_FUNCTION_NOT_FOUND;
+        const MH_STATUS en = f ? MH_EnableHook(f) : MH_UNKNOWN;
+        Log("SL hook %s %s %s", h.name, MH_StatusToString(st), MH_StatusToString(en));
+    }
+    if (!Check(kUpscalePass) || !Check(kSlConstants) || !Check(kUpEval) || !Check(kUpEvalDlss)) {
+        g_eyeDlss = false;
+        return;
+    }
+    MH_CreateHook(g_base + kUpscalePass.rva, reinterpret_cast<void*>(&HookUpscalePass), reinterpret_cast<void**>(&g_origUpscalePass));
+    MH_CreateHook(g_base + kSlConstants.rva, reinterpret_cast<void*>(&HookSlConstants), reinterpret_cast<void**>(&g_origSlConstants));
+    MH_CreateHook(g_base + kUpEval.rva, reinterpret_cast<void*>(&HookUpEval), reinterpret_cast<void**>(&g_origUpEval));
+    Log("EYEDLSS hooks %s", MH_StatusToString(MH_EnableHook(MH_ALL_HOOKS)));
+}
+
 // ---- the eyes need the game's own anti-aliasing, which it turns off when an upscaler is chosen ----
 static std::atomic<bool> g_regForce{false};
+static std::atomic<bool> g_skipLauncher{true};
 static void OverrideSetting(const wchar_t* name, void* data) {
-    if (!g_regForce || !name || !data) return;
+    if (!name || !data) return;
+    if (g_skipLauncher && !_wcsicmp(name, L"ShowLauncher")) {
+        Log("REG ShowLauncher was %d, the game is told 0", *static_cast<int*>(data));
+        *static_cast<int*>(data) = 0;
+        return;
+    }
+    if (!g_regForce) return;
     int value = -1;
     if (!_wcsicmp(name, L"UpscaleMethod")) value = 0;
     else if (!_wcsicmp(name, L"AA")) value = 2;
@@ -1264,7 +1453,19 @@ static void RunCommand(const std::string& c) {
         }
     }
     else if (sscanf(c.c_str(), "eyejitter %u", &g_w) == 1) g_eyeJitter = static_cast<int>(g_w);
-    else if (c == "aainfo") {
+    else if (sscanf(c.c_str(), "eyedlss %u", &g_w) == 1) g_eyeDlss = g_w != 0;
+    else if (c == "slinfo") {
+        Log("SLINFO evaluate %u, on eye viewports %u, constants %u, options %u", g_slCount[0].load(), g_slCount[3].load(), g_slCount[2].load(), g_slCount[4].load());
+        uint8_t* app = *reinterpret_cast<uint8_t**>(g_base + 0x684bda0);
+        if (app) {
+            uint8_t* up = *reinterpret_cast<uint8_t**>(app + 0xe0);
+            if (up) {
+                size_t* vt = *reinterpret_cast<size_t**>(up);
+                Log("SLINFO upscaler %p vtable rva %zx, +0x28 rva %zx", up, reinterpret_cast<uint8_t*>(vt) - g_base, static_cast<size_t>(vt[5] - reinterpret_cast<size_t>(g_base)));
+            }
+        }
+        g_slLogLeft = 20;
+    } else if (c == "aainfo") {
         auto u8at = [](size_t rva) { return static_cast<unsigned>(*(g_base + rva)); };
         auto i32at = [](size_t rva) { return *reinterpret_cast<int*>(g_base + rva); };
         Log("AAINFO pass type %d, aa type %d, flags %u %u %u, global render %d x %d, taa ring %d, frame %d", i32at(0x6732b8c), i32at(0x533959c), u8at(0x53395e9), u8at(0x53395a4), u8at(0x6733634), i32at(0x67334c0), i32at(0x67334c4), i32at(0x533b8ec), i32at(0x6794fe8));
@@ -1322,14 +1523,24 @@ static void RunCommand(const std::string& c) {
 }
 
 static DWORD WINAPI ProbeThread(void*) {
+    {
+        const std::wstring early = g_dir + L"RiftApartVR.ini";
+        g_eyeDlss = GetPrivateProfileIntW(L"VR", L"EyeDLSS", 1, early.c_str()) != 0;
+        g_eyeRenderPercent = g_eyeDlss ? std::clamp(static_cast<int>(GetPrivateProfileIntW(L"VR", L"EyeDLSSPercent", 67, early.c_str())), 33, 100) : 100;
+        g_regForce = !g_eyeDlss && GetPrivateProfileIntW(L"VR", L"ForceGameAA", 1, early.c_str()) != 0;
+        g_skipLauncher = GetPrivateProfileIntW(L"VR", L"SkipLauncher", 1, early.c_str()) != 0;
+        MH_Initialize();
+        InstallRegHooks();
+    }
     FindSections();
     FindActiveView();
     InstallHooks();
     const std::wstring ini = g_dir + L"RiftApartVR.ini";
     g_iniPath = ini;
-    g_forceTaa = GetPrivateProfileIntW(L"VR", L"ForceGameAA", 1, ini.c_str()) != 0;
-    g_regForce = g_forceTaa;
-    InstallRegHooks();
+    g_skipLauncherSetting = GetPrivateProfileIntW(L"VR", L"SkipLauncher", 1, ini.c_str()) != 0;
+    g_dlssPercentSetting = g_eyeDlss ? g_eyeRenderPercent.load() : 0;
+    g_skipLauncher = g_skipLauncherSetting;
+    InstallSlProbe();
     InstallPadHooks();
     CreateThread(nullptr, 0, PadThread, nullptr, 0, nullptr);
     const bool autoStart = GetPrivateProfileIntW(L"VR", L"AutoStart", 1, ini.c_str()) != 0;
