@@ -201,6 +201,51 @@ void XrMarkRendered(const float worldPos[3]) {
     ++g_unmatched;
 }
 
+static std::mutex g_fakeLock;
+static bool g_fakeHeadOn = false, g_fakeLensOn = false;
+static XrQuaternionf g_fakeQ{0, 0, 0, 1};
+static XrVector3f g_fakeP{0, 0, 0}, g_fakeSide{0.032f, 0, 0};
+static float g_fakeLens[4] = {-1, 1, 1, -1};
+
+void XrFakeHead(bool on, float yaw, float pitch, float roll, float x, float y, float z, float ipd) {
+    const float k = 3.14159265f / 360.0f;
+    const float cy = cosf(yaw * k), sy = sinf(yaw * k), cp = cosf(pitch * k), sp = sinf(pitch * k), cr = cosf(roll * k), sr = sinf(roll * k);
+    // Yaw about Y, then pitch about X, then roll about Z.
+    const float qx = cy * sp * cr + sy * cp * sr, qy = sy * cp * cr - cy * sp * sr, qz = cy * cp * sr - sy * sp * cr, qw = cy * cp * cr + sy * sp * sr;
+    std::lock_guard<std::mutex> l(g_fakeLock);
+    g_fakeHeadOn = on;
+    g_fakeQ = {qx, qy, qz, qw};
+    g_fakeP = {x, y, z};
+    const float h = ipd * 0.5f;
+    g_fakeSide = {(1 - 2 * (qy * qy + qz * qz)) * h, 2 * (qx * qy + qw * qz) * h, 2 * (qx * qz - qw * qy) * h};
+    Log("FAKE head %d yaw %.2f pitch %.2f roll %.2f pos %.3f %.3f %.3f ipd %.3f", on ? 1 : 0, yaw, pitch, roll, x, y, z, ipd);
+}
+
+void XrFakeLens(bool on, float left, float right, float up, float down) {
+    std::lock_guard<std::mutex> l(g_fakeLock);
+    g_fakeLensOn = on;
+    g_fakeLens[0] = left;
+    g_fakeLens[1] = right;
+    g_fakeLens[2] = up;
+    g_fakeLens[3] = down;
+    Log("FAKE lens %d L %.3f R %.3f U %.3f D %.3f", on ? 1 : 0, left, right, up, down);
+}
+
+static void ApplyFake(XrView v[2]) {
+    std::lock_guard<std::mutex> l(g_fakeLock);
+    if (g_fakeHeadOn) {
+        for (int e = 0; e < 2; ++e) {
+            const float s = e == 0 ? -1.0f : 1.0f;
+            v[e].pose.orientation = g_fakeQ;
+            v[e].pose.position = {g_fakeP.x + s * g_fakeSide.x, g_fakeP.y + s * g_fakeSide.y, g_fakeP.z + s * g_fakeSide.z};
+        }
+    }
+    if (g_fakeLensOn) {
+        v[0].fov = {atanf(g_fakeLens[0]), atanf(g_fakeLens[1]), atanf(g_fakeLens[2]), atanf(g_fakeLens[3])};
+        v[1].fov = {atanf(-g_fakeLens[1]), atanf(-g_fakeLens[0]), atanf(g_fakeLens[2]), atanf(g_fakeLens[3])};
+    }
+}
+
 bool XrLocate(XrEyePose out[2]) {
     const XrTime t = g_predicted;
     if (!g_sess || !t) return false;
@@ -213,6 +258,7 @@ bool XrLocate(XrEyePose out[2]) {
     XrView v[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
     if (XR_FAILED(p_xrLocateViews(g_sess, &li, &vs, 2, &n, v)) || n != 2) return false;
     if (!(vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) return false;
+    ApplyFake(v);
     for (int e = 0; e < 2; ++e) {
         out[e].qx = v[e].pose.orientation.x;
         out[e].qy = v[e].pose.orientation.y;

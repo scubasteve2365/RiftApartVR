@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 26
+#define BUILD_NUMBER 27
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -306,6 +306,8 @@ static std::atomic<float> g_ipd{0.064f};
 static std::atomic<bool> g_wantRecenter{false}, g_pace{true}, g_shareLum{false};
 static std::atomic<float> g_worldScale{1.0f};
 static std::atomic<bool> g_levelCamera{true};
+// The engine's lens takes the top of the picture first, measured along its downward Y: minus OpenXR's up, then minus its down.
+static std::atomic<bool> g_lensFix{true};
 static float g_lastFacing[2] = {0, 1};
 static float g_centre[3], g_centreYaw;
 // Off-centre perspective from edges, then the pose: the same two steps the game's own camera builders end with.
@@ -487,7 +489,8 @@ static void __fastcall HookRenderAll() {
                     }
                     eyePose[15] = 1;
                     if (e == 0) XrTagPose(eyePose + 12);
-                    reinterpret_cast<LensPerspFn>(g_base + kLensPersp.rva)(desc, nearZ, farZ, p.tanLeft, p.tanRight, p.tanDown, p.tanUp, 0, 0, jx, jy, 0, 0);
+                    const bool fix = g_lensFix.load();
+                    reinterpret_cast<LensPerspFn>(g_base + kLensPersp.rva)(desc, nearZ, farZ, p.tanLeft, p.tanRight, fix ? -p.tanUp : p.tanDown, fix ? -p.tanDown : p.tanUp, 0, 0, jx, jy, 0, 0);
                     reinterpret_cast<LensPoseFn>(g_base + kLensPose.rva)(desc, eyePose);
                     g_origCameraSubmit(g_eyes[e], desc);
                 }
@@ -913,6 +916,7 @@ static float g_hud[3];
 static char g_text[64];
 static int g_show;
 
+static float g_fh[7];
 static void RunCommand(const std::string& c) {
     Log("CMD %s", c.c_str());
     if (c == "probe") LogView();
@@ -930,6 +934,11 @@ static void RunCommand(const std::string& c) {
     else if (sscanf(c.c_str(), "tonefix %u", &g_w) == 1) g_toneFix = g_w != 0;
     else if (sscanf(c.c_str(), "keepfocus %u", &g_w) == 1) g_keepFocus = g_w != 0;
     else if (sscanf(c.c_str(), "level %u", &g_w) == 1) g_levelCamera = g_w != 0;
+    else if (sscanf(c.c_str(), "lensfix %u", &g_w) == 1) g_lensFix = g_w != 0;
+    else if (c == "fakehead off") XrFakeHead(false, 0, 0, 0, 0, 0, 0, 0);
+    else if (c == "fakelens off") XrFakeLens(false, -1, 1, 1, -1);
+    else if (sscanf(c.c_str(), "fakehead %f %f %f %f %f %f %f", &g_fh[0], &g_fh[1], &g_fh[2], &g_fh[3], &g_fh[4], &g_fh[5], &g_fh[6]) == 7) XrFakeHead(true, g_fh[0], g_fh[1], g_fh[2], g_fh[3], g_fh[4], g_fh[5], g_fh[6]);
+    else if (sscanf(c.c_str(), "fakelens %f %f %f %f", &g_fh[0], &g_fh[1], &g_fh[2], &g_fh[3]) == 4) XrFakeLens(true, g_fh[0], g_fh[1], g_fh[2], g_fh[3]);
     else if (sscanf(c.c_str(), "uicount %u", &g_w) == 1) g_uiCount = static_cast<int>(g_w);
     else if (sscanf(c.c_str(), "restflat %u", &g_w) == 1) g_restFlat = g_w != 0;
     else if (sscanf(c.c_str(), "novsync %u", &g_w) == 1) CaptureNoVsync(g_w != 0);

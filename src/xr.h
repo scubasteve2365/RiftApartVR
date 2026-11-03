@@ -32,3 +32,8 @@ void XrOnPresentScreen(void* resource, int width, int height, int dxgiFormat);
 void XrRecenterScreen();
 // HUD panel in metres.
 void XrSetHud(float width, float distance, float drop);
+// Lab only: replace what the headset reports, so head movement and lens shape can be tested without a headset.
+// Degrees and metres. Positive yaw turns left, positive pitch looks up, as OpenXR rotates.
+void XrFakeHead(bool on, float yaw, float pitch, float roll, float x, float y, float z, float ipd);
+// Left eye tangents, the right eye gets the mirror image.
+void XrFakeLens(bool on, float left, float right, float up, float down);
