@@ -11,3 +11,5 @@ void* CaptureDevice();
 void* CaptureQueue();
 // Called on the Present thread, before the game's Present.
 void CaptureSetPresentCallback(void (*fn)());
+// While VR runs the flat window must not hold the game to the monitor's rate.
+void CaptureNoVsync(bool on);

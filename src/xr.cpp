@@ -125,6 +125,25 @@ void XrRecommended(int* w, int* h) {
 // ---- GPU copies on the game's queue ----
 static ID3D12Device* g_dev;
 static ID3D12CommandQueue* g_queue;
+static const int kUiSlots = 3;
+struct UiChain {
+    XrSwapchain chain = XR_NULL_HANDLE;
+    std::vector<XrSwapchainImageD3D12KHR> images;
+    int w = 0, h = 0;
+};
+static UiChain g_ui[kUiSlots];
+static int64_t g_format;
+static std::atomic<float> g_hudWidth{2.2f}, g_hudDistance{2.0f}, g_hudDrop{0.1f};
+static float g_hudYaw;
+static float g_hudPos[3];
+static bool g_hudPlaced;
+
+void XrSetHud(float width, float distance, float drop) {
+    g_hudWidth = width;
+    g_hudDistance = distance;
+    g_hudDrop = drop;
+}
+
 static const int kRing = 4;
 static ID3D12CommandAllocator* g_alloc[kRing];
 static ID3D12GraphicsCommandList* g_list[kRing];
@@ -139,6 +158,13 @@ static bool g_open;
 static bool g_should;
 static XrTime g_openTime;
 static std::atomic<uint64_t> g_endedWithImages{0}, g_endedEmpty{0}, g_notReady{0};
+static std::atomic<uint64_t> g_usWaitImage{0}, g_usEnd{0}, g_usPresent{0}, g_usWaitFrame{0};
+static uint64_t NowUs() {
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return static_cast<uint64_t>(c.QuadPart * 1000000 / f.QuadPart);
+}
 
 struct PendingPose {
     XrView views[2];
@@ -230,7 +256,9 @@ static DWORD WINAPI XrWorker(void*) {
             continue;
         }
         XrFrameState fs{XR_TYPE_FRAME_STATE};
+        const uint64_t w0 = NowUs();
         XrResult r = p_xrWaitFrame(g_sess, nullptr, &fs);
+        g_usWaitFrame += NowUs() - w0;
         if (XR_FAILED(r)) {
             Log("XR xrWaitFrame failed %d", static_cast<int>(r));
             Sleep(100);
@@ -265,7 +293,11 @@ static DWORD WINAPI XrWorker(void*) {
         const ULONGLONG now = GetTickCount64();
         if (now - lastStats > 5000) {
             lastStats = now;
-            Log("XRSTAT state %d period %.2f ms with images %llu empty %llu not ready %llu", g_state.load(), g_periodNs.load() / 1e6, g_endedWithImages.load(), g_endedEmpty.load(), g_notReady.load());
+            const uint64_t n = g_endedWithImages.load();
+            static uint64_t lastN = 0;
+            const uint64_t dn = n - lastN ? n - lastN : 1;
+            lastN = n;
+            Log("XRSTAT state %d period %.2f ms with images %llu empty %llu not ready %llu; per image us: wait frame %llu, image waits %llu, xrEndFrame %llu, whole present step %llu", g_state.load(), g_periodNs.load() / 1e6, n, g_endedEmpty.load(), g_notReady.load(), g_usWaitFrame.exchange(0) / dn, g_usWaitImage.exchange(0) / dn, g_usEnd.exchange(0) / dn, g_usPresent.exchange(0) / dn);
         }
     }
 }
@@ -309,6 +341,7 @@ bool XrStartSession(void* device, void* queue, int eyeW, int eyeH) {
         }
     }
     Log("XR swapchain format %lld of %u offered", format, nf);
+    g_format = format;
     if (!format) return false;
     g_chainW = eyeW;
     g_chainH = eyeH;
@@ -345,12 +378,64 @@ bool XrStartSession(void* device, void* queue, int eyeW, int eyeH) {
 }
 
 // On the Present thread. The two eye images were queued before this Present.
-void XrOnPresent(void* const resources[2], const uint32_t states[2]) {
+static bool EnsureUiChain(UiChain& c, int w, int h) {
+    if (c.chain) return c.w == w && c.h == h;
+    XrSwapchainCreateInfo ci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    ci.format = g_format;
+    ci.sampleCount = 1;
+    ci.width = w;
+    ci.height = h;
+    ci.faceCount = 1;
+    ci.arraySize = 1;
+    ci.mipCount = 1;
+    const XrResult r = p_xrCreateSwapchain(g_sess, &ci, &c.chain);
+    if (XR_FAILED(r)) {
+        Log("XR UI swapchain failed %d", static_cast<int>(r));
+        c.chain = XR_NULL_HANDLE;
+        return false;
+    }
+    uint32_t n = 0;
+    p_xrEnumerateSwapchainImages(c.chain, 0, &n, nullptr);
+    c.images.assign(n, {XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
+    p_xrEnumerateSwapchainImages(c.chain, n, &n, reinterpret_cast<XrSwapchainImageBaseHeader*>(c.images.data()));
+    c.w = w;
+    c.h = h;
+    Log("XR UI swapchain %dx%d", w, h);
+    return true;
+}
+
+// Places the HUD ahead of the head, level, and lets it lag: it only starts to follow past 20 degrees.
+static void PlaceHud(const PendingPose& pose) {
+    const XrPosef& a = pose.views[0].pose;
+    const XrPosef& b = pose.views[1].pose;
+    const float hx = (a.position.x + b.position.x) * 0.5f, hy = (a.position.y + b.position.y) * 0.5f, hz = (a.position.z + b.position.z) * 0.5f;
+    const float fx = -2 * (a.orientation.x * a.orientation.z + a.orientation.w * a.orientation.y);
+    const float fz = -(1 - 2 * (a.orientation.x * a.orientation.x + a.orientation.y * a.orientation.y));
+    const float yaw = atan2f(-fx, -fz);
+    if (!g_hudPlaced) {
+        g_hudYaw = yaw;
+        g_hudPlaced = true;
+    }
+    float d = yaw - g_hudYaw;
+    while (d > 3.14159265f) d -= 6.2831853f;
+    while (d < -3.14159265f) d += 6.2831853f;
+    const float dead = 0.35f;
+    if (d > dead) g_hudYaw += (d - dead) * 0.1f;
+    else if (d < -dead) g_hudYaw += (d + dead) * 0.1f;
+    const float dist = g_hudDistance;
+    g_hudPos[0] = hx - sinf(g_hudYaw) * dist;
+    g_hudPos[1] = hy - g_hudDrop.load();
+    g_hudPos[2] = hz - cosf(g_hudYaw) * dist;
+}
+
+void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiImage* ui, int uiCount) {
     std::lock_guard<std::mutex> l(g_frameLock);
     if (!g_open) {
         ++g_notReady;
         return;
     }
+    const uint64_t present0 = NowUs();
     PendingPose pose;
     bool havePose = false;
     {
@@ -378,10 +463,12 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2]) {
     XrCompositionLayerProjectionView pv[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
     for (int e = 0; e < 2; ++e) {
         uint32_t idx = 0;
+        const uint64_t t0 = NowUs();
         p_xrAcquireSwapchainImage(g_chain[e], nullptr, &idx);
         XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
         wi.timeout = 100000000;
         p_xrWaitSwapchainImage(g_chain[e], &wi);
+        g_usWaitImage += NowUs() - t0;
         ID3D12Resource* dst = g_images[e][idx].texture;
         auto* src = static_cast<ID3D12Resource*>(resources[e]);
         D3D12_RESOURCE_BARRIER bar[2]{};
@@ -411,6 +498,54 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2]) {
         pv[e].subImage.swapchain = g_chain[e];
         pv[e].subImage.imageRect.extent = {g_chainW, g_chainH};
     }
+    XrCompositionLayerQuad quads[kUiSlots];
+    uint32_t quadCount = 0;
+    PlaceHud(pose);
+    bool uiAcquired[kUiSlots] = {};
+    for (int i = 0; i < uiCount && i < kUiSlots; ++i) {
+        if (!ui[i].resource || !EnsureUiChain(g_ui[i], ui[i].width, ui[i].height)) continue;
+        uint32_t idx = 0;
+        const uint64_t t0 = NowUs();
+        p_xrAcquireSwapchainImage(g_ui[i].chain, nullptr, &idx);
+        XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+        wi.timeout = 100000000;
+        p_xrWaitSwapchainImage(g_ui[i].chain, &wi);
+        g_usWaitImage += NowUs() - t0;
+        uiAcquired[i] = true;
+        ID3D12Resource* dst = g_ui[i].images[idx].texture;
+        auto* src = static_cast<ID3D12Resource*>(ui[i].resource);
+        D3D12_RESOURCE_BARRIER bar[2]{};
+        bar[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        bar[0].Transition.pResource = src;
+        bar[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        bar[0].Transition.StateBefore = static_cast<D3D12_RESOURCE_STATES>(ui[i].state);
+        bar[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        bar[1] = bar[0];
+        bar[1].Transition.pResource = dst;
+        bar[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        bar[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        list->ResourceBarrier(2, bar);
+        D3D12_TEXTURE_COPY_LOCATION d{}, s{};
+        d.pResource = dst;
+        d.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        s.pResource = src;
+        s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        list->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
+        std::swap(bar[0].Transition.StateBefore, bar[0].Transition.StateAfter);
+        std::swap(bar[1].Transition.StateBefore, bar[1].Transition.StateAfter);
+        list->ResourceBarrier(2, bar);
+        XrCompositionLayerQuad& q = quads[quadCount++];
+        q = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+        q.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;  // premultiplied, as Coherent draws it
+        q.space = g_space;
+        q.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+        q.subImage.swapchain = g_ui[i].chain;
+        q.subImage.imageRect.extent = {ui[i].width, ui[i].height};
+        q.pose.orientation = {0, sinf(g_hudYaw * 0.5f), 0, cosf(g_hudYaw * 0.5f)};
+        q.pose.position = {g_hudPos[0], g_hudPos[1], g_hudPos[2]};
+        const float width = g_hudWidth;
+        q.size = {width, width * ui[i].height / static_cast<float>(ui[i].width)};
+    }
     list->Close();
     ID3D12CommandList* lists[] = {list};
     g_queue->ExecuteCommandLists(1, lists);
@@ -421,18 +556,28 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2]) {
         XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         p_xrReleaseSwapchainImage(g_chain[e], &ri);
     }
+    for (int i = 0; i < kUiSlots; ++i) {
+        if (uiAcquired[i]) {
+            XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+            p_xrReleaseSwapchainImage(g_ui[i].chain, &ri);
+        }
+    }
     XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     layer.space = g_space;
     layer.viewCount = 2;
     layer.views = pv;
-    const XrCompositionLayerBaseHeader* layers[] = {reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer)};
+    const XrCompositionLayerBaseHeader* layers[1 + kUiSlots] = {reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer)};
+    for (uint32_t i = 0; i < quadCount; ++i) layers[1 + i] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&quads[i]);
     XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
     ei.displayTime = g_openTime;
     ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-    ei.layerCount = 1;
+    ei.layerCount = 1 + quadCount;
     ei.layers = layers;
+    const uint64_t e0 = NowUs();
     const XrResult r = p_xrEndFrame(g_sess, &ei);
+    g_usEnd += NowUs() - e0;
     if (XR_FAILED(r)) Log("XR xrEndFrame failed %d", static_cast<int>(r));
     ++g_endedWithImages;
+    g_usPresent += NowUs() - present0;
     g_open = false;
 }

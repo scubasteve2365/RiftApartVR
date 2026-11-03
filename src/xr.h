@@ -17,4 +17,11 @@ bool XrLocate(XrEyePose out[2]);
 // Game thread: wait for the headset's next frame, at most one and a half periods.
 void XrPaceWait();
 // Present thread: copy both eye images to the swapchains and end the open frame.
-void XrOnPresent(void* const resources[2], const uint32_t states[2]);
+struct XrUiImage {
+    void* resource;
+    uint32_t state;
+    int width, height;
+};
+void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiImage* ui, int uiCount);
+// HUD panel in metres.
+void XrSetHud(float width, float distance, float drop);

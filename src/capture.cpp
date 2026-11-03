@@ -173,7 +173,11 @@ void* CaptureDevice() { return g_device; }
 void* CaptureQueue() { return g_queue.load(); }
 void CaptureSetPresentCallback(void (*fn)()) { g_callback = fn; }
 
+static std::atomic<bool> g_noVsync{false};
+void CaptureNoVsync(bool on) { g_noVsync = on; }
+
 static HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* s, UINT a, UINT b) {
+    if (g_noVsync) a = 0;
     if (t_depth++ == 0) OnPresent();
     const HRESULT r = g_origPresent(s, a, b);
     --t_depth;
@@ -181,6 +185,7 @@ static HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* s, UINT a, UINT b) 
 }
 
 static HRESULT STDMETHODCALLTYPE HookPresent1(IDXGISwapChain1* s, UINT a, UINT b, const DXGI_PRESENT_PARAMETERS* p) {
+    if (g_noVsync) a = 0;
     if (t_depth++ == 0) OnPresent();
     const HRESULT r = g_origPresent1(s, a, b, p);
     --t_depth;

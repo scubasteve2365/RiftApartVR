@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 15
+#define BUILD_NUMBER 19
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -488,6 +488,69 @@ static void TexInfo() {
     WalkObject("inner", inner, 0x200);
 }
 
+// ---- keep the game running without Windows focus, only while VR is on ----
+static std::atomic<HWND> g_gameWindow{nullptr};
+static std::atomic<bool> g_keepFocus{false};
+static WNDPROC g_origWndProc;
+static std::atomic<uint64_t> g_focusDropped{0};
+using GetWindowFn = HWND(WINAPI*)();
+static GetWindowFn g_origGetForeground, g_origGetActive, g_origGetFocus;
+static HWND WINAPI HookGetForeground() {
+    HWND g = g_gameWindow;
+    return g_keepFocus && g ? g : g_origGetForeground();
+}
+static HWND WINAPI HookGetActive() {
+    HWND g = g_gameWindow;
+    return g_keepFocus && g ? g : g_origGetActive();
+}
+static HWND WINAPI HookGetFocus() {
+    HWND g = g_gameWindow;
+    return g_keepFocus && g ? g : g_origGetFocus();
+}
+static LRESULT CALLBACK FocusWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (g_keepFocus) {
+        const bool losing = (m == WM_ACTIVATEAPP && w == FALSE) || (m == WM_ACTIVATE && LOWORD(w) == WA_INACTIVE) || m == WM_KILLFOCUS || (m == WM_NCACTIVATE && w == FALSE);
+        if (losing) {
+            ++g_focusDropped;
+            return m == WM_NCACTIVATE ? TRUE : 0;
+        }
+    }
+    return CallWindowProcW(g_origWndProc, h, m, w, l);
+}
+static BOOL CALLBACK FindGameWindow(HWND h, LPARAM) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    wchar_t cls[64] = {};
+    GetClassNameW(h, cls, 64);
+    if (pid == GetCurrentProcessId() && IsWindowVisible(h) && wcscmp(cls, L"GameNxApp") == 0) {
+        g_gameWindow = h;
+        return FALSE;
+    }
+    return TRUE;
+}
+static void InstallFocusFix() {
+    EnumWindows(FindGameWindow, 0);
+    HWND g = g_gameWindow;
+    if (!g) {
+        Log("FOCUS game window not found");
+        return;
+    }
+    HMODULE u = GetModuleHandleW(L"user32.dll");
+    MH_CreateHook(GetProcAddress(u, "GetForegroundWindow"), reinterpret_cast<void*>(&HookGetForeground), reinterpret_cast<void**>(&g_origGetForeground));
+    MH_CreateHook(GetProcAddress(u, "GetActiveWindow"), reinterpret_cast<void*>(&HookGetActive), reinterpret_cast<void**>(&g_origGetActive));
+    MH_CreateHook(GetProcAddress(u, "GetFocus"), reinterpret_cast<void*>(&HookGetFocus), reinterpret_cast<void**>(&g_origGetFocus));
+    MH_EnableHook(GetProcAddress(u, "GetForegroundWindow"));
+    MH_EnableHook(GetProcAddress(u, "GetActiveWindow"));
+    MH_EnableHook(GetProcAddress(u, "GetFocus"));
+    g_origWndProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(g, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&FocusWndProc)));
+    g_keepFocus = true;
+    Log("FOCUS fix on, window %p", g);
+}
+
+static uint8_t* UiTexture(int i, int* w, int* h);
+static void* TextureResource(uint8_t* tex, uint32_t* state);
+static std::atomic<int> g_uiCount{3};
+
 static void OnPresentForXr() {
     std::lock_guard<std::mutex> l(g_eyesLock);
     if (g_eyes.size() < 2) return;
@@ -497,7 +560,13 @@ static void OnPresentForXr() {
         st[0] = *reinterpret_cast<uint32_t*>(EyeRecord(g_eyes[0]) + 0x28);
         st[1] = *reinterpret_cast<uint32_t*>(EyeRecord(g_eyes[1]) + 0x28);
     }
-    XrOnPresent(res, st);
+    XrUiImage ui[3] = {};
+    const int ids[3] = {0, 3, 4};  // UI views the size of the screen: 0 and 4 not yet identified, 3 the pause menu
+    for (int i = 0; i < 3; ++i) {
+        uint8_t* tex = UiTexture(ids[i], &ui[i].width, &ui[i].height);
+        if (tex) ui[i].resource = TextureResource(tex, &ui[i].state);
+    }
+    XrOnPresent(res, st, ui, g_uiCount.load());
 }
 
 static bool g_xrStarted = false;
@@ -578,6 +647,8 @@ static DWORD WINAPI XrStartThread(void* arg) {
         return 0;
     }
     if (!XrStartSession(CaptureDevice(), CaptureQueue(), w, h)) return 0;
+    InstallFocusFix();
+    CaptureNoVsync(true);
     g_xrEyes = true;
     CaptureSetPresentCallback(&OnPresentForXr);
     Log("XR running");
@@ -633,6 +704,7 @@ static void UiList(bool dump, const std::string& name) {
 
 static uint32_t g_w, g_h, g_k;
 static float g_f;
+static float g_hud[3];
 static char g_text[64];
 static int g_show;
 
@@ -652,6 +724,10 @@ static void RunCommand(const std::string& c) {
     else if (sscanf(c.c_str(), "sharelum %u", &g_w) == 1) g_shareLum = g_w != 0;
     else if (sscanf(c.c_str(), "sharefog %u", &g_w) == 1) g_shareFog = g_w != 0;
     else if (sscanf(c.c_str(), "tonefix %u", &g_w) == 1) g_toneFix = g_w != 0;
+    else if (sscanf(c.c_str(), "keepfocus %u", &g_w) == 1) g_keepFocus = g_w != 0;
+    else if (sscanf(c.c_str(), "uicount %u", &g_w) == 1) g_uiCount = static_cast<int>(g_w);
+    else if (sscanf(c.c_str(), "novsync %u", &g_w) == 1) CaptureNoVsync(g_w != 0);
+    else if (sscanf(c.c_str(), "hud %f %f %f", &g_hud[0], &g_hud[1], &g_hud[2]) == 3) XrSetHud(g_hud[0], g_hud[1], g_hud[2]);
     else if (c == "recenter") g_wantRecenter = true;
     else if (sscanf(c.c_str(), "scale %f", &g_f) == 1) g_worldScale = g_f;
     else if (c == "d3d") {
