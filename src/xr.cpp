@@ -345,6 +345,7 @@ static DWORD WINAPI XrWorker(void*) {
             continue;
         }
         g_predicted = fs.predictedDisplayTime;
+        SetEvent(FrameEvent());
         g_periodNs = fs.predictedDisplayPeriod;
         r = p_xrBeginFrame(g_sess, nullptr);
         if (XR_FAILED(r)) {
