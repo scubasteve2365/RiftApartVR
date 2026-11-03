@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 34
+#define BUILD_NUMBER 37
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -365,6 +365,15 @@ static void CreateEyeImpl() {
 // The title sits at the origin with a 39.43 degree lens. Anything else that lasts a second is treated as the world.
 static std::atomic<bool> g_xrSession{false};
 static void CreateEyeNow();
+// Above 0 while a cinematic runs: counts active Cinematic2 atmosphere tracks (0xfe08f8 adds to it, near the string
+// "Cinematic2 Atmosphere Modifier Track"). Found by comparing .data across cinematics and play (tools\data_cross.py,
+// flag_watch.py, cine_prune.py). A cinematic with no such track would be missed and stay in the 3D world.
+static const size_t kCinematicTracks = 0x5339144;
+// The other flags that passed the same test, logged when they change so a longer play can judge them.
+static const size_t kCinematicOthers[] = {0x512cf1c, 0x512f770, 0x513195c, 0x5f3bdc0, 0x5f3d6f8, 0x5ffa764, 0x61d19d4, 0x6240ba8};
+static std::atomic<bool> g_cinemaOn{true};
+static std::atomic<bool> g_cinemaNow{false};
+static std::atomic<float> g_cinemaIpd{0.03f};
 static void UpdateMode() {
     uint8_t* main = ActiveView();
     bool world = false;
@@ -375,7 +384,39 @@ static void UpdateMode() {
         const double vfov = proj[5] != 0 ? 2.0 * atan(1.0 / fabs(proj[5])) * 57.29577951 : 0;
         // The title's fly-by holds one spot with a 33.3 degree lens.
         const bool titleSpot = fabsf(cam[12] + 17.55f) + fabsf(cam[13] - 39.476f) + fabsf(cam[14] + 223.651f) < 1.0f;
-        world = !atOrigin && !titleSpot && fabs(vfov - 39.43) > 0.05;
+        // Counted through the frame, so hold a state until it is steady.
+        static int onFrames = 0, offFrames = 0;
+        static bool steady = false;
+        if (*reinterpret_cast<int*>(g_base + kCinematicTracks) > 0) {
+            ++onFrames;
+            offFrames = 0;
+        } else {
+            ++offFrames;
+            onFrames = 0;
+        }
+        if (onFrames >= 3) steady = true;
+        if (offFrames >= 15) steady = false;
+        const bool cine = g_cinemaOn && steady;
+        {
+            static uint8_t seen[8] = {};
+            char changes[160];
+            int n = 0;
+            for (int i = 0; i < 8; ++i) {
+                const uint8_t v = *(g_base + kCinematicOthers[i]);
+                if (v != seen[i]) {
+                    n += sprintf_s(changes + n, sizeof(changes) - n, " %zx=%u", kCinematicOthers[i], v);
+                    seen[i] = v;
+                }
+            }
+            if (n) Log("CINEFLAGS%s (tracks %d)", changes, *reinterpret_cast<int*>(g_base + kCinematicTracks));
+        }
+        // Cinematics can use the title's lens too.
+        world = !atOrigin && !titleSpot && (cine || fabs(vfov - 39.43) > 0.05);
+        if (cine != g_cinemaNow.load()) {
+            Log("MODE cinematic %s, lens %.2f", cine ? "starts" : "ends", vfov);
+            g_cinemaNow = cine;
+            XrSetCinema(cine);
+        }
     }
     static ULONGLONG since = 0;
     const ULONGLONG now = GetTickCount64();
@@ -521,7 +562,20 @@ static void __fastcall HookRenderAll() {
                     eyePose[15] = 1;
                     if (e == 0) XrTagPose(eyePose + 12);
                     const bool fix = g_lensFix.load();
+                    if (g_cinemaNow) {
+                        // The game's own camera and framing, eyes apart along its right row. The head does not move it.
+                        memcpy(eyePose, main, sizeof(eyePose));
+                        const float side = (e == 0 ? -0.5f : 0.5f) * g_cinemaIpd.load();
+                        for (int i = 0; i < 3; ++i) eyePose[12 + i] = reinterpret_cast<const float*>(main)[12 + i] + reinterpret_cast<const float*>(main)[i] * side;
+                        if (e == 0) XrTagPose(eyePose + 12);
+                        // Width as the game has it; height fills the eye image, of which the middle 16 by 9 band is shown.
+                        const float* noJitter = reinterpret_cast<const float*>(main + 0x1c0);
+                        const float tanX = 1.0f / fabsf(noJitter[0]);
+                        const float tanY = tanX * static_cast<float>(g_forceH) / static_cast<float>(g_forceW);
+                        reinterpret_cast<LensPerspFn>(g_base + kLensPersp.rva)(desc, nearZ, farZ, -tanX, tanX, -tanY, tanY, 0, 0, jx, jy, 0, 0);
+                    } else {
                     reinterpret_cast<LensPerspFn>(g_base + kLensPersp.rva)(desc, nearZ, farZ, p.tanLeft, p.tanRight, fix ? -p.tanUp : p.tanDown, fix ? -p.tanDown : p.tanUp, 0, 0, jx, jy, 0, 0);
+                    }
                     reinterpret_cast<LensPoseFn>(g_base + kLensPose.rva)(desc, eyePose);
                     g_origCameraSubmit(g_eyes[e], desc);
                 }
@@ -826,7 +880,7 @@ static int g_dlssPercentSetting = 67;  // 0 means no DLSS in the eyes: the game'
 static float g_hudDistanceSetting = 2.0f;
 static std::wstring g_iniPath;
 static std::vector<uint32_t> g_menuImage;
-static const int kMenuW = 1024, kMenuH = 768, kMenuRows = 8;
+static const int kMenuW = 1024, kMenuH = 840, kMenuRows = 9;
 
 static void SaveSetting(const wchar_t* name, int value) {
     WritePrivateProfileStringW(L"VR", name, std::to_wstring(value).c_str(), g_iniPath.c_str());
@@ -860,6 +914,10 @@ static void MenuRowText(int row, wchar_t (&name)[64], wchar_t (&value)[32]) {
     case 6:
         wcscpy_s(name, L"Skip the launcher window (next launch)");
         wcscpy_s(value, g_skipLauncherSetting ? L"On" : L"Off");
+        break;
+    case 7:
+        wcscpy_s(name, L"Cutscenes on a screen");
+        wcscpy_s(value, g_cinemaOn ? L"On" : L"Off");
         break;
     default: wcscpy_s(name, L"Close"); break;
     }
@@ -985,6 +1043,10 @@ static void MenuChange(int dir) {
     case 6:
         g_skipLauncherSetting = !g_skipLauncherSetting;
         SaveSetting(L"SkipLauncher", g_skipLauncherSetting ? 1 : 0);
+        break;
+    case 7:
+        g_cinemaOn = !g_cinemaOn;
+        SaveSetting(L"CutsceneScreen", g_cinemaOn ? 1 : 0);
         break;
     default:
         if (dir == 0) {
@@ -1199,7 +1261,7 @@ static void PollPad() {
         } else if (i == kLeft || i == kRight) {
             MenuChange(i == kLeft ? -1 : 1);
         } else if (i == kA) {
-            if (g_menuRow == 0 || g_menuRow == 2 || g_menuRow == 6 || g_menuRow == kMenuRows - 1) MenuChange(0);
+            if (g_menuRow == 0 || g_menuRow == 2 || g_menuRow == 6 || g_menuRow == 7 || g_menuRow == kMenuRows - 1) MenuChange(0);
         } else {
             MenuClose();
         }
@@ -1546,6 +1608,8 @@ static void RunCommand(const std::string& c) {
     else if (sscanf(c.c_str(), "keepfocus %u", &g_w) == 1) g_keepFocus = g_w != 0;
     else if (sscanf(c.c_str(), "level %u", &g_w) == 1) g_levelCamera = g_w != 0;
     else if (sscanf(c.c_str(), "lensfix %u", &g_w) == 1) g_lensFix = g_w != 0;
+    else if (sscanf(c.c_str(), "cinemaipd %f", &g_f) == 1) g_cinemaIpd = g_f;
+    else if (sscanf(c.c_str(), "cinema %u", &g_w) == 1) g_cinemaOn = g_w != 0;
     else if (c == "padinfo") {
         Log("PADINFO WGI gamepad reads %u, raw reads %u, blocked %u", g_wgiGamepadCalls.load(), g_wgiRawCalls.load(), g_wgiBlocked.load());
         Log("PADINFO XInput calls: 1_4 %u, 1_3 %u, 9_1_0 %u, 1_4 Ex %u, 1_3 Ex %u", g_xinputCalls[0].load(), g_xinputCalls[1].load(), g_xinputCalls[2].load(), g_xinputCalls[3].load(), g_xinputCalls[4].load());
@@ -1632,6 +1696,60 @@ static void RunCommand(const std::string& c) {
     }
 }
 
+// ---- read-only probe: which methods of a class run, and when. Swaps vtable slots for a stub that counts and jumps on. ----
+struct VtProbe {
+    const char* name;
+    size_t rva;
+    std::vector<volatile uint64_t*> counters;
+    std::vector<uint64_t> last;
+};
+static std::vector<VtProbe> g_vtProbes;
+static void VtProbeAdd(const char* name, size_t rva) {
+    VtProbe probe{name, rva, {}, {}};
+    void** vt = reinterpret_cast<void**>(g_base + rva);
+    uint8_t* page = static_cast<uint8_t*>(VirtualAlloc(nullptr, 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!page) return;
+    uint8_t* out = page;
+    for (int i = 0; i < 64; ++i) {
+        uint8_t* target = static_cast<uint8_t*>(vt[i]);
+        if (target < g_base + 0x1000 || target >= g_base + 0x2e36000) break;  // past the end of the vtable: not in .text
+        // Data: counter, then original. Code: lock inc qword [rip+counter]; jmp [rip+original].
+        auto* counter = reinterpret_cast<volatile uint64_t*>(out);
+        *reinterpret_cast<uint64_t*>(out) = 0;
+        *reinterpret_cast<void**>(out + 8) = target;
+        uint8_t* code = out + 16;
+        const uint8_t inc[] = {0xf0, 0x48, 0xff, 0x05};
+        memcpy(code, inc, 4);
+        *reinterpret_cast<int32_t*>(code + 4) = static_cast<int32_t>(out - (code + 8));
+        code[8] = 0xff;
+        code[9] = 0x25;
+        *reinterpret_cast<int32_t*>(code + 10) = static_cast<int32_t>((out + 8) - (code + 14));
+        out += 32;
+        DWORD old = 0;
+        VirtualProtect(&vt[i], 8, PAGE_READWRITE, &old);
+        vt[i] = code;
+        VirtualProtect(&vt[i], 8, old, &old);
+        probe.counters.push_back(counter);
+        probe.last.push_back(0);
+    }
+    Log("VTPROBE %s rva %zx: %zu methods", name, rva, probe.counters.size());
+    g_vtProbes.push_back(std::move(probe));
+}
+static void VtProbeReport() {
+    for (VtProbe& p : g_vtProbes) {
+        char line[512];
+        int n = 0;
+        for (size_t i = 0; i < p.counters.size() && n < 480; ++i) {
+            const uint64_t c = *p.counters[i];
+            if (c != p.last[i]) {
+                n += sprintf_s(line + n, sizeof(line) - n, " %zu:%llu", i, static_cast<unsigned long long>(c - p.last[i]));
+                p.last[i] = c;
+            }
+        }
+        if (n) Log("VTC %s%s", p.name, line);
+    }
+}
+
 static DWORD WINAPI ProbeThread(void*) {
     {
         const std::wstring early = g_dir + L"RiftApartVR.ini";
@@ -1649,8 +1767,22 @@ static DWORD WINAPI ProbeThread(void*) {
     g_iniPath = ini;
     g_skipLauncherSetting = GetPrivateProfileIntW(L"VR", L"SkipLauncher", 1, ini.c_str()) != 0;
     g_dlssPercentSetting = g_eyeDlss ? g_eyeRenderPercent.load() : 0;
+    g_cinemaOn = GetPrivateProfileIntW(L"VR", L"CutsceneScreen", 1, ini.c_str()) != 0;
     g_skipLauncher = g_skipLauncherSetting;
     InstallSlProbe();
+    if (GetPrivateProfileIntW(L"VR", L"VtProbe", 0, ini.c_str())) {
+        VtProbeAdd("CameraCinematic", 0x2ee2ae0);
+        VtProbeAdd("GameCamera", 0x2ee3258);
+        VtProbeAdd("LookCamera", 0x2ee36b0);
+        VtProbeAdd("StrafeCamera", 0x2ee3fa8);
+        VtProbeAdd("RelativeAnimCamera", 0x45acda0);
+        VtProbeAdd("PlacedCamera", 0x45ac578);
+        VtProbeAdd("FixedCamera", 0x45ac600);
+        VtProbeAdd("PanCamera", 0x45ac698);
+        VtProbeAdd("SplineCameraFly", 0x45ace40);
+        VtProbeAdd("DualSplineCameraFly", 0x45abb80);
+        VtProbeAdd("CollisionPredictive", 0x2ee60c8);
+    }
     InstallPadHooks();
     CreateThread(nullptr, 0, PadThread, nullptr, 0, nullptr);
     const bool autoStart = GetPrivateProfileIntW(L"VR", L"AutoStart", 1, ini.c_str()) != 0;
@@ -1680,6 +1812,13 @@ static DWORD WINAPI ProbeThread(void*) {
             fclose(f);
         }
         const ULONGLONG now = GetTickCount64();
+        {
+            static ULONGLONG lastVt = 0;
+            if (!g_vtProbes.empty() && now - lastVt >= 1000) {
+                lastVt = now;
+                VtProbeReport();
+            }
+        }
         {
             // Gravity boots: does the game's camera lean? Logged once a second when its right row leaves the level.
             static ULONGLONG lastRow = 0;

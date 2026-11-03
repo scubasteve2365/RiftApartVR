@@ -35,6 +35,8 @@ void XrSetHud(float width, float distance, float drop);
 // Any thread: the mod menu's picture, RGBA, top row first, width a multiple of 64. Placed ahead of the head when it opens.
 void XrMenuShow(const uint32_t* rgba, int width, int height);
 void XrMenuHide();
+// Game thread: cutscene now. Each eye's image goes on a screen fixed in the room instead of filling the view.
+void XrSetCinema(bool on);
 // Lab only: replace what the headset reports, so head movement and lens shape can be tested without a headset.
 // Degrees and metres. Positive yaw turns left, positive pitch looks up, as OpenXR rotates.
 void XrFakeHead(bool on, float yaw, float pitch, float roll, float x, float y, float z, float ipd);

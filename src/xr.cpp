@@ -632,6 +632,8 @@ static void MenuRelease() {
     g_menuAcquired = false;
 }
 static XrPosef g_screenPose{{0, 0, 0, 1}, {0, 0, -2.5f}};
+static std::atomic<bool> g_cinema{false};
+void XrSetCinema(bool on) { g_cinema = on; }
 static const float kScreenWidth = 3.2f, kScreenDistance = 2.5f;
 void XrRecenterScreen() { g_screenPlaced = false; }
 
@@ -920,13 +922,33 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
     layer.space = g_space;
     layer.viewCount = 2;
     layer.views = pv;
-    const XrCompositionLayerBaseHeader* layers[2 + kUiSlots] = {reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer)};
-    for (uint32_t i = 0; i < quadCount; ++i) layers[1 + i] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&quads[i]);
-    if (haveMenu) layers[1 + quadCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&menuLayer);
+    const XrCompositionLayerBaseHeader* layers[3 + kUiSlots];
+    uint32_t layerCount = 0;
+    XrCompositionLayerQuad cinema[2];
+    if (g_cinema) {
+        // The middle band of each eye's image, 16 by 9, one quad per eye at the same place in the room. Same tick, real depth.
+        const int bandH = std::min(g_chainH, g_chainW * 9 / 16);
+        for (int e = 0; e < 2; ++e) {
+            XrCompositionLayerQuad& c = cinema[e];
+            c = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+            c.space = g_space;
+            c.eyeVisibility = e == 0 ? XR_EYE_VISIBILITY_LEFT : XR_EYE_VISIBILITY_RIGHT;
+            c.subImage.swapchain = g_chain[e];
+            c.subImage.imageRect.offset = {0, (g_chainH - bandH) / 2};
+            c.subImage.imageRect.extent = {g_chainW, bandH};
+            c.pose = g_screenPose;
+            c.size = {kScreenWidth, kScreenWidth * bandH / static_cast<float>(g_chainW)};
+            layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&c);
+        }
+    } else {
+        layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer);
+    }
+    for (uint32_t i = 0; i < quadCount; ++i) layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&quads[i]);
+    if (haveMenu) layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&menuLayer);
     XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
     ei.displayTime = g_openTime;
     ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-    ei.layerCount = 1 + quadCount;
+    ei.layerCount = layerCount;
     ei.layers = layers;
     const uint64_t e0 = NowUs();
     const XrResult r = p_xrEndFrame(g_sess, &ei);
