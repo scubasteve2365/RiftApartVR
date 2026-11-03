@@ -506,6 +506,131 @@ static void PlaceHud(const PendingPose& pose) {
 static UiChain g_screen;
 static int64_t g_screenFormat;
 static std::atomic<bool> g_screenPlaced{false};
+
+// ---- mod menu: a picture made on the CPU, shown on top of everything, fixed in the room while open ----
+static const float kMenuWidth = 1.3f, kMenuDistance = 1.6f;
+static std::mutex g_menuLock;
+static std::vector<uint32_t> g_menuPixels;
+static int g_menuW, g_menuH;
+static std::atomic<bool> g_menuVisible{false}, g_menuDirty{false}, g_menuPlaced{false};
+static UiChain g_menu;
+static ID3D12Resource* g_menuUpload;
+static XrPosef g_menuPose{{0, 0, 0, 1}, {0, 0, 0}};
+static bool g_menuAcquired;
+
+void XrMenuShow(const uint32_t* rgba, int width, int height) {
+    {
+        std::lock_guard<std::mutex> l(g_menuLock);
+        g_menuPixels.assign(rgba, rgba + static_cast<size_t>(width) * height);
+        g_menuW = width;
+        g_menuH = height;
+    }
+    g_menuDirty = true;
+    if (!g_menuVisible.exchange(true)) g_menuPlaced = false;
+}
+
+void XrMenuHide() { g_menuVisible = false; }
+
+static bool MenuPlace() {
+    XrViewLocateInfo li{XR_TYPE_VIEW_LOCATE_INFO};
+    li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    li.displayTime = g_openTime;
+    li.space = g_space;
+    XrViewState vs{XR_TYPE_VIEW_STATE};
+    uint32_t n = 0;
+    XrView v[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+    if (XR_FAILED(p_xrLocateViews(g_sess, &li, &vs, 2, &n, v)) || n != 2 || !(vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) return false;
+    const XrQuaternionf& q = v[0].pose.orientation;
+    const float fx = -2 * (q.x * q.z + q.w * q.y), fz = -(1 - 2 * (q.x * q.x + q.y * q.y));
+    const float yaw = atan2f(-fx, -fz);
+    g_menuPose.orientation = {0, sinf(yaw * 0.5f), 0, cosf(yaw * 0.5f)};
+    g_menuPose.position = {(v[0].pose.position.x + v[1].pose.position.x) * 0.5f - sinf(yaw) * kMenuDistance, (v[0].pose.position.y + v[1].pose.position.y) * 0.5f, (v[0].pose.position.z + v[1].pose.position.z) * 0.5f - cosf(yaw) * kMenuDistance};
+    return true;
+}
+
+// Called with the frame's command list open. True if the menu layer is to be sent this frame.
+static bool MenuRecord(ID3D12GraphicsCommandList* list, XrCompositionLayerQuad* out) {
+    g_menuAcquired = false;
+    if (!g_menuVisible) return false;
+    int w, h;
+    {
+        std::lock_guard<std::mutex> l(g_menuLock);
+        w = g_menuW;
+        h = g_menuH;
+    }
+    if (!w || !EnsureUiChain(g_menu, w, h)) return false;
+    if (!g_menuUpload) {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = static_cast<UINT64>(w) * h * 4;
+        rd.Height = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_menuUpload)))) {
+            Log("MENU upload buffer failed");
+            return false;
+        }
+        g_menuDirty = true;
+    }
+    if (!g_menuPlaced && MenuPlace()) g_menuPlaced = true;
+    if (g_menuDirty.exchange(false)) {
+        void* mapped = nullptr;
+        if (SUCCEEDED(g_menuUpload->Map(0, nullptr, &mapped))) {
+            {
+                std::lock_guard<std::mutex> l(g_menuLock);
+                memcpy(mapped, g_menuPixels.data(), g_menuPixels.size() * 4);
+            }
+            g_menuUpload->Unmap(0, nullptr);
+        }
+        uint32_t idx = 0;
+        p_xrAcquireSwapchainImage(g_menu.chain, nullptr, &idx);
+        XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+        wi.timeout = 100000000;
+        p_xrWaitSwapchainImage(g_menu.chain, &wi);
+        g_menuAcquired = true;
+        ID3D12Resource* dst = g_menu.images[idx].texture;
+        D3D12_RESOURCE_BARRIER bar{};
+        bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        bar.Transition.pResource = dst;
+        bar.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        bar.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        bar.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        list->ResourceBarrier(1, &bar);
+        D3D12_TEXTURE_COPY_LOCATION d{}, s{};
+        d.pResource = dst;
+        d.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        s.pResource = g_menuUpload;
+        s.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        s.PlacedFootprint.Footprint.Format = static_cast<DXGI_FORMAT>(g_format);
+        s.PlacedFootprint.Footprint.Width = w;
+        s.PlacedFootprint.Footprint.Height = h;
+        s.PlacedFootprint.Footprint.Depth = 1;
+        s.PlacedFootprint.Footprint.RowPitch = w * 4;
+        list->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
+        std::swap(bar.Transition.StateBefore, bar.Transition.StateAfter);
+        list->ResourceBarrier(1, &bar);
+    }
+    *out = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+    out->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+    out->space = g_space;
+    out->eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+    out->subImage.swapchain = g_menu.chain;
+    out->subImage.imageRect.extent = {w, h};
+    out->pose = g_menuPose;
+    out->size = {kMenuWidth, kMenuWidth * h / static_cast<float>(w)};
+    return true;
+}
+
+static void MenuRelease() {
+    if (!g_menuAcquired) return;
+    XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    p_xrReleaseSwapchainImage(g_menu.chain, &ri);
+    g_menuAcquired = false;
+}
 static XrPosef g_screenPose{{0, 0, 0, 1}, {0, 0, -2.5f}};
 static const float kScreenWidth = 3.2f, kScreenDistance = 2.5f;
 void XrRecenterScreen() { g_screenPlaced = false; }
@@ -615,6 +740,8 @@ void XrOnPresentScreen(void* resource, int width, int height, int dxgiFormat) {
     std::swap(bar[0].Transition.StateBefore, bar[0].Transition.StateAfter);
     std::swap(bar[1].Transition.StateBefore, bar[1].Transition.StateAfter);
     list->ResourceBarrier(2, bar);
+    XrCompositionLayerQuad menuLayer{XR_TYPE_COMPOSITION_LAYER_QUAD};
+    const bool haveMenu = MenuRecord(list, &menuLayer);
     list->Close();
     ID3D12CommandList* lists[] = {list};
     g_queue->ExecuteCommandLists(1, lists);
@@ -623,6 +750,7 @@ void XrOnPresentScreen(void* resource, int width, int height, int dxgiFormat) {
     g_ringIndex = (g_ringIndex + 1) % kRing;
     XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     p_xrReleaseSwapchainImage(g_screen.chain, &ri);
+    MenuRelease();
     XrCompositionLayerQuad q{XR_TYPE_COMPOSITION_LAYER_QUAD};
     q.space = g_space;
     q.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
@@ -630,11 +758,11 @@ void XrOnPresentScreen(void* resource, int width, int height, int dxgiFormat) {
     q.subImage.imageRect.extent = {width, height};
     q.pose = g_screenPose;
     q.size = {kScreenWidth, kScreenWidth * height / static_cast<float>(width)};
-    const XrCompositionLayerBaseHeader* layers[] = {reinterpret_cast<XrCompositionLayerBaseHeader*>(&q)};
+    const XrCompositionLayerBaseHeader* layers[] = {reinterpret_cast<XrCompositionLayerBaseHeader*>(&q), reinterpret_cast<XrCompositionLayerBaseHeader*>(&menuLayer)};
     XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
     ei.displayTime = g_openTime;
     ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-    ei.layerCount = 1;
+    ei.layerCount = haveMenu ? 2 : 1;
     ei.layers = layers;
     const XrResult r = p_xrEndFrame(g_sess, &ei);
     if (XR_FAILED(r)) Log("XR xrEndFrame failed %d (screen)", static_cast<int>(r));
@@ -769,12 +897,15 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
         const float width = g_hudWidth;
         q.size = {width, width * ui[i].height / static_cast<float>(ui[i].width)};
     }
+    XrCompositionLayerQuad menuLayer{XR_TYPE_COMPOSITION_LAYER_QUAD};
+    const bool haveMenu = MenuRecord(list, &menuLayer);
     list->Close();
     ID3D12CommandList* lists[] = {list};
     g_queue->ExecuteCommandLists(1, lists);
     g_queue->Signal(g_fence, ++g_fenceValue);
     g_ringValue[g_ringIndex] = g_fenceValue;
     g_ringIndex = (g_ringIndex + 1) % kRing;
+    MenuRelease();
     for (int e = 0; e < 2; ++e) {
         XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         p_xrReleaseSwapchainImage(g_chain[e], &ri);
@@ -789,8 +920,9 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
     layer.space = g_space;
     layer.viewCount = 2;
     layer.views = pv;
-    const XrCompositionLayerBaseHeader* layers[1 + kUiSlots] = {reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer)};
+    const XrCompositionLayerBaseHeader* layers[2 + kUiSlots] = {reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer)};
     for (uint32_t i = 0; i < quadCount; ++i) layers[1 + i] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&quads[i]);
+    if (haveMenu) layers[1 + quadCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&menuLayer);
     XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
     ei.displayTime = g_openTime;
     ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;

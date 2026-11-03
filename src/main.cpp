@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 27
+#define BUILD_NUMBER 29
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -308,6 +308,8 @@ static std::atomic<float> g_worldScale{1.0f};
 static std::atomic<bool> g_levelCamera{true};
 // The engine's lens takes the top of the picture first, measured along its downward Y: minus OpenXR's up, then minus its down.
 static std::atomic<bool> g_lensFix{true};
+// Eye jitter: 0 none, 1 the game's value resized from the flat view's pixels to the eye's, 2 the flat view's value as it is.
+static std::atomic<int> g_eyeJitter{1};
 static float g_lastFacing[2] = {0, 1};
 static float g_centre[3], g_centreYaw;
 // Off-centre perspective from edges, then the pose: the same two steps the game's own camera builders end with.
@@ -458,6 +460,18 @@ static void __fastcall HookRenderAll() {
                 const float nearZ = *reinterpret_cast<float*>(main + 0x3f8), farZ = *reinterpret_cast<float*>(main + 0x3fc);
                 float jx = 0, jy = 0;
                 reinterpret_cast<JitterFn>(g_base + kJitter.rva)(main, &jx, &jy);
+                {
+                    // The game scales jitter by the size at +0x448, +0x44c: one pixel of the flat view, not of an eye.
+                    const int mode = g_eyeJitter.load();
+                    const float mw = *reinterpret_cast<float*>(main + 0x448), mh = *reinterpret_cast<float*>(main + 0x44c);
+                    if (mode == 0) {
+                        jx = 0;
+                        jy = 0;
+                    } else if (mode == 1 && g_forceW && g_forceH && mw > 0 && mh > 0) {
+                        jx *= mw / static_cast<float>(g_forceW);
+                        jy *= mh / static_cast<float>(g_forceH);
+                    }
+                }
                 const float cy = cosf(-g_centreYaw), sy = sinf(-g_centreYaw);
                 const float scale = g_worldScale.load();
                 alignas(16) static uint8_t desc[0x600];
@@ -785,26 +799,234 @@ static void StartXr(int percent) {
     if (HANDLE t = CreateThread(nullptr, 0, XrStartThread, reinterpret_cast<void*>(static_cast<intptr_t>(percent)), 0, nullptr)) CloseHandle(t);
 }
 
-// Both sticks clicked and held half a second: recenter. Reads the pad through XInput, loaded only here.
+// ---- mod menu ----
+// Opens with both sticks clicked and held half a second. Settings save to RiftApartVR.ini as they change.
+static std::atomic<bool> g_menuOpen{false};
+static int g_menuRow = 0;
+static int g_resolutionSetting = 100;
+static bool g_forceTaa = true;
+static float g_hudDistanceSetting = 2.0f;
+static std::wstring g_iniPath;
+static std::vector<uint32_t> g_menuImage;
+static const int kMenuW = 1024, kMenuH = 704, kMenuRows = 7;
+
+static void SaveSetting(const wchar_t* name, int value) {
+    WritePrivateProfileStringW(L"VR", name, std::to_wstring(value).c_str(), g_iniPath.c_str());
+}
+
+static void MenuRowText(int row, wchar_t (&name)[64], wchar_t (&value)[32]) {
+    value[0] = 0;
+    switch (row) {
+    case 0: wcscpy_s(name, L"Recenter view"); break;
+    case 1:
+        wcscpy_s(name, L"World scale");
+        swprintf_s(value, L"%d%%", static_cast<int>(g_worldScale.load() * 100 + 0.5f));
+        break;
+    case 2:
+        wcscpy_s(name, L"Decoupled pitch");
+        wcscpy_s(value, g_levelCamera ? L"On" : L"Off");
+        break;
+    case 3:
+        wcscpy_s(name, L"HUD distance");
+        swprintf_s(value, L"%.2f m", g_hudDistanceSetting);
+        break;
+    case 4:
+        wcscpy_s(name, L"Resolution (next launch)");
+        swprintf_s(value, L"%d%%", g_resolutionSetting);
+        break;
+    case 5:
+        wcscpy_s(name, L"Game anti-aliasing (next launch)");
+        wcscpy_s(value, g_forceTaa ? L"On" : L"Off");
+        break;
+    default: wcscpy_s(name, L"Close"); break;
+    }
+}
+
+// Draws the menu with GDI into a top-down buffer, then gives it to the headset as RGBA.
+static void MenuDraw() {
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = kMenuW;
+    bi.bmiHeader.biHeight = -kMenuH;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    void* bits = nullptr;
+    HDC dc = CreateCompatibleDC(nullptr);
+    HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!bmp) {
+        DeleteDC(dc);
+        return;
+    }
+    HGDIOBJ oldBmp = SelectObject(dc, bmp);
+    auto fill = [&](int l, int t, int r, int b, COLORREF c) {
+        RECT rc{l, t, r, b};
+        HBRUSH br = CreateSolidBrush(c);
+        FillRect(dc, &rc, br);
+        DeleteObject(br);
+    };
+    fill(0, 0, kMenuW, kMenuH, RGB(20, 16, 44));
+    fill(0, 0, kMenuW, 8, RGB(60, 210, 230));
+    HFONT big = CreateFontW(56, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
+    HFONT mid = CreateFontW(38, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
+    HFONT small = CreateFontW(28, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
+    SetBkMode(dc, TRANSPARENT);
+    HGDIOBJ oldFont = SelectObject(dc, big);
+    SetTextColor(dc, RGB(255, 255, 255));
+    RECT title{44, 26, kMenuW - 44, 100};
+    DrawTextW(dc, L"Rift Apart VR", -1, &title, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    SelectObject(dc, mid);
+    for (int i = 0; i < kMenuRows; ++i) {
+        const int top = 116 + i * 72;
+        if (i == g_menuRow) fill(28, top, kMenuW - 28, top + 64, RGB(60, 210, 230));
+        wchar_t name[64], value[32];
+        MenuRowText(i, name, value);
+        SetTextColor(dc, i == g_menuRow ? RGB(12, 10, 30) : RGB(235, 235, 245));
+        RECT a{48, top, kMenuW - 48, top + 64};
+        DrawTextW(dc, name, -1, &a, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        DrawTextW(dc, value, -1, &a, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+    }
+    SelectObject(dc, small);
+    SetTextColor(dc, RGB(170, 170, 195));
+    RECT help{44, kMenuH - 62, kMenuW - 44, kMenuH - 12};
+    DrawTextW(dc, L"D-pad: choose and change     A: select     B: close", -1, &help, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    GdiFlush();
+    g_menuImage.resize(static_cast<size_t>(kMenuW) * kMenuH);
+    const uint32_t* src = static_cast<const uint32_t*>(bits);
+    for (size_t i = 0; i < g_menuImage.size(); ++i) {
+        const uint32_t p = src[i];
+        g_menuImage[i] = 0xff000000u | ((p & 0xff) << 16) | (p & 0xff00) | ((p >> 16) & 0xff);
+    }
+    SelectObject(dc, oldFont);
+    SelectObject(dc, oldBmp);
+    DeleteObject(big);
+    DeleteObject(mid);
+    DeleteObject(small);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+    XrMenuShow(g_menuImage.data(), kMenuW, kMenuH);
+}
+
+static void MenuClose() {
+    g_menuOpen = false;
+    XrMenuHide();
+    Log("MENU closed");
+}
+
+static void MenuOpen() {
+    g_menuOpen = true;
+    MenuDraw();
+    Log("MENU open");
+}
+
+// dir: -1 or 1 changes the value, 0 is A.
+static void MenuChange(int dir) {
+    switch (g_menuRow) {
+    case 0:
+        if (dir == 0) {
+            g_wantRecenter = true;
+            XrRecenterScreen();
+            Log("MENU recenter");
+        }
+        break;
+    case 1: {
+        const int v = std::clamp(static_cast<int>(g_worldScale.load() * 100 + 0.5f) + dir * 25, 100, 1000);
+        g_worldScale = v / 100.0f;
+        SaveSetting(L"WorldScalePercent", v);
+        break;
+    }
+    case 2:
+        g_levelCamera = !g_levelCamera;
+        SaveSetting(L"LevelCamera", g_levelCamera ? 1 : 0);
+        break;
+    case 3:
+        g_hudDistanceSetting = std::clamp(g_hudDistanceSetting + dir * 0.25f, 1.0f, 5.0f);
+        XrSetHud(2.2f * g_hudDistanceSetting / 2.0f, g_hudDistanceSetting, 0.1f);
+        SaveSetting(L"HudDistanceCm", static_cast<int>(g_hudDistanceSetting * 100 + 0.5f));
+        break;
+    case 4:
+        g_resolutionSetting = std::clamp(g_resolutionSetting + dir * 10, 50, 200);
+        SaveSetting(L"Resolution", g_resolutionSetting);
+        break;
+    case 5:
+        g_forceTaa = !g_forceTaa;
+        SaveSetting(L"ForceGameAA", g_forceTaa ? 1 : 0);
+        break;
+    default:
+        if (dir == 0) {
+            MenuClose();
+            return;
+        }
+        break;
+    }
+    Log("MENU row %d dir %d: scale %.2f pitch decoupled %d hud %.2f resolution %d aa %d", g_menuRow, dir, g_worldScale.load(), g_levelCamera.load() ? 1 : 0, g_hudDistanceSetting, g_resolutionSetting, g_forceTaa ? 1 : 0);
+    MenuDraw();
+}
+
+// The game must not see the pad while the menu is open.
+using XInputGetStateFn = DWORD(WINAPI*)(DWORD, void*);
+static XInputGetStateFn g_origXInput14, g_origXInput13, g_origXInput910, g_origXInputEx14, g_origXInputEx13;
+static std::atomic<uint32_t> g_xinputCalls[5];
+template <XInputGetStateFn* Orig, int Slot>
+static DWORD WINAPI HookXInput(DWORD pad, void* state) {
+    ++g_xinputCalls[Slot];
+    const DWORD r = (*Orig)(pad, state);
+    if (r == 0 && g_menuOpen) {
+        const DWORD packet = *static_cast<DWORD*>(state);
+        memset(state, 0, 16);
+        *static_cast<DWORD*>(state) = packet;
+    }
+    return r;
+}
+
+static void InstallPadHooks() {
+    struct Item {
+        const wchar_t* dll;
+        const char* name;
+        void* hook;
+        void** orig;
+    };
+    // Ordinal 100 is XInputGetStateEx, which many games use for the guide button.
+    const Item items[] = {
+        {L"xinput1_4.dll", "XInputGetState", reinterpret_cast<void*>(&HookXInput<&g_origXInput14, 0>), reinterpret_cast<void**>(&g_origXInput14)},
+        {L"xinput1_3.dll", "XInputGetState", reinterpret_cast<void*>(&HookXInput<&g_origXInput13, 1>), reinterpret_cast<void**>(&g_origXInput13)},
+        {L"xinput9_1_0.dll", "XInputGetState", reinterpret_cast<void*>(&HookXInput<&g_origXInput910, 2>), reinterpret_cast<void**>(&g_origXInput910)},
+        {L"xinput1_4.dll", MAKEINTRESOURCEA(100), reinterpret_cast<void*>(&HookXInput<&g_origXInputEx14, 3>), reinterpret_cast<void**>(&g_origXInputEx14)},
+        {L"xinput1_3.dll", MAKEINTRESOURCEA(100), reinterpret_cast<void*>(&HookXInput<&g_origXInputEx13, 4>), reinterpret_cast<void**>(&g_origXInputEx13)},
+    };
+    for (const Item& h : items) {
+        HMODULE m = LoadLibraryW(h.dll);
+        void* f = m ? reinterpret_cast<void*>(GetProcAddress(m, h.name)) : nullptr;
+        if (!f) continue;
+        const MH_STATUS st = MH_CreateHook(f, h.hook, h.orig);
+        const MH_STATUS en = MH_EnableHook(f);
+        Log("PAD hook %ls %s %s", h.dll, MH_StatusToString(st), MH_StatusToString(en));
+    }
+}
+
+// Runs every 16 ms: reads the pad underneath the hooks above.
 static void PollPad() {
-    using GetStateFn = DWORD(WINAPI*)(DWORD, void*);
-    static GetStateFn get = [] {
-        HMODULE m = LoadLibraryW(L"xinput1_4.dll");
-        return m ? reinterpret_cast<GetStateFn>(GetProcAddress(m, "XInputGetState")) : nullptr;
-    }();
+    XInputGetStateFn get = g_origXInput14 ? g_origXInput14 : g_origXInput13 ? g_origXInput13 : g_origXInput910;
     if (!get || !g_xrSession) return;
-    static ULONGLONG since = 0;
-    static bool fired = false;
-    bool held = false;
-    for (DWORD pad = 0; pad < 4 && !held; ++pad) {
-        struct {
-            DWORD packet;
-            WORD buttons;
-            uint8_t rest[10];
-        } st{};
-        if (get(pad, &st) == 0 && (st.buttons & 0x00C0) == 0x00C0) held = true;  // left and right thumb
+    struct {
+        DWORD packet;
+        WORD buttons;
+        uint8_t lt, rt;
+        short lx, ly, rx, ry;
+    } st{};
+    WORD buttons = 0;
+    short ly = 0, lx = 0;
+    for (DWORD pad = 0; pad < 4; ++pad) {
+        if (get(pad, &st) == 0) {
+            buttons |= st.buttons;
+            if (abs(st.ly) > abs(ly)) ly = st.ly;
+            if (abs(st.lx) > abs(lx)) lx = st.lx;
+        }
     }
     const ULONGLONG now = GetTickCount64();
+    // Both sticks clicked and held: open or close.
+    static ULONGLONG since = 0;
+    static bool fired = false;
+    const bool held = (buttons & 0x00C0) == 0x00C0;
     if (!held) {
         since = 0;
         fired = false;
@@ -812,10 +1034,101 @@ static void PollPad() {
         since = now;
     } else if (!fired && now - since >= 500) {
         fired = true;
-        g_wantRecenter = true;
-        XrRecenterScreen();
-        Log("PAD both sticks: recenter");
+        if (g_menuOpen) MenuClose();
+        else MenuOpen();
+        return;
     }
+    if (!g_menuOpen) return;
+    // One step per press, then repeating after a short hold, so key repeat never skips rows.
+    enum { kUp, kDown, kLeft, kRight, kA, kB, kCount };
+    const bool now_down[kCount] = {(buttons & 1) != 0 || ly > 16000, (buttons & 2) != 0 || ly < -16000, (buttons & 4) != 0 || lx < -16000, (buttons & 8) != 0 || lx > 16000, (buttons & 0x1000) != 0, (buttons & 0x2000) != 0};
+    static ULONGLONG next[kCount] = {};
+    static bool was[kCount] = {};
+    for (int i = 0; i < kCount; ++i) {
+        bool press = false;
+        if (now_down[i] && !was[i]) {
+            press = true;
+            next[i] = now + 400;
+        } else if (now_down[i] && i <= kRight && now >= next[i]) {
+            press = true;
+            next[i] = now + 150;
+        }
+        was[i] = now_down[i];
+        if (!press) continue;
+        if (i == kUp || i == kDown) {
+            g_menuRow = (g_menuRow + (i == kUp ? kMenuRows - 1 : 1)) % kMenuRows;
+            MenuDraw();
+        } else if (i == kLeft || i == kRight) {
+            MenuChange(i == kLeft ? -1 : 1);
+        } else if (i == kA) {
+            if (g_menuRow == 2 || g_menuRow == 5 || g_menuRow == 0 || g_menuRow == kMenuRows - 1) MenuChange(0);
+        } else {
+            MenuClose();
+        }
+        if (!g_menuOpen) return;
+    }
+}
+
+static DWORD WINAPI PadThread(void*) {
+    for (;;) {
+        Sleep(16);
+        PollPad();
+    }
+}
+
+// ---- the eyes need the game's own anti-aliasing, which it turns off when an upscaler is chosen ----
+static std::atomic<bool> g_regForce{false};
+static void OverrideSetting(const wchar_t* name, void* data) {
+    if (!g_regForce || !name || !data) return;
+    int value = -1;
+    if (!_wcsicmp(name, L"UpscaleMethod")) value = 0;
+    else if (!_wcsicmp(name, L"AA")) value = 2;
+    // Nobody sees the flat view in VR: a target it cannot meet keeps it small. Eyes are sized on their own (measured, build 29).
+    else if (!_wcsicmp(name, L"DynamicResolutionTargetFPS")) value = 120;
+    if (value < 0) return;
+    int* d = static_cast<int*>(data);
+    if (*d != value) {
+        Log("REG %ls was %d, the game is told %d", name, *d, value);
+        *d = value;
+    }
+}
+using RegQueryFn = LSTATUS(WINAPI*)(HKEY, LPCWSTR, LPDWORD, LPDWORD, LPBYTE, LPDWORD);
+using RegGetFn = LSTATUS(WINAPI*)(HKEY, LPCWSTR, LPCWSTR, DWORD, LPDWORD, PVOID, LPDWORD);
+static RegQueryFn g_origRegQuery;
+static RegGetFn g_origRegGet;
+static LSTATUS WINAPI HookRegQuery(HKEY k, LPCWSTR name, LPDWORD res, LPDWORD type, LPBYTE data, LPDWORD size) {
+    const LSTATUS r = g_origRegQuery(k, name, res, type, data, size);
+    // The caller may not ask for the type. These two settings are the only names touched, and always four bytes.
+    if (r == 0 && (!type || *type == REG_DWORD) && (!size || *size == 4)) OverrideSetting(name, data);
+    return r;
+}
+using RegQueryAFn = LSTATUS(WINAPI*)(HKEY, LPCSTR, LPDWORD, LPDWORD, LPBYTE, LPDWORD);
+static RegQueryAFn g_origRegQueryA;
+static LSTATUS WINAPI HookRegQueryA(HKEY k, LPCSTR name, LPDWORD res, LPDWORD type, LPBYTE data, LPDWORD size) {
+    const LSTATUS r = g_origRegQueryA(k, name, res, type, data, size);
+    if (r == 0 && name && (!type || *type == REG_DWORD) && (!size || *size == 4)) {
+        wchar_t wide[64];
+        if (MultiByteToWideChar(CP_ACP, 0, name, -1, wide, 64)) OverrideSetting(wide, data);
+    }
+    return r;
+}
+static LSTATUS WINAPI HookRegGet(HKEY k, LPCWSTR sub, LPCWSTR name, DWORD flags, LPDWORD type, PVOID data, LPDWORD size) {
+    DWORD localType = 0;
+    const LSTATUS r = g_origRegGet(k, sub, name, flags, type ? type : &localType, data, size);
+    if (r == 0 && (type ? *type : localType) == REG_DWORD && (!size || *size == 4)) OverrideSetting(name, data);
+    return r;
+}
+static void InstallRegHooks() {
+    void* a = nullptr;
+    void* b = nullptr;
+    const MH_STATUS s1 = MH_CreateHookApiEx(L"kernelbase.dll", "RegQueryValueExW", reinterpret_cast<void*>(&HookRegQuery), reinterpret_cast<void**>(&g_origRegQuery), &a);
+    const MH_STATUS s2 = MH_CreateHookApiEx(L"kernelbase.dll", "RegGetValueW", reinterpret_cast<void*>(&HookRegGet), reinterpret_cast<void**>(&g_origRegGet), &b);
+    void* c = nullptr;
+    const MH_STATUS s3 = MH_CreateHookApiEx(L"kernelbase.dll", "RegQueryValueExA", reinterpret_cast<void*>(&HookRegQueryA), reinterpret_cast<void**>(&g_origRegQueryA), &c);
+    if (a) MH_EnableHook(a);
+    if (b) MH_EnableHook(b);
+    if (c) MH_EnableHook(c);
+    Log("REG hooks %s %s %s", MH_StatusToString(s1), MH_StatusToString(s2), MH_StatusToString(s3));
 }
 
 // Runs on a thread of its own: `xr <scale percent>`.
@@ -935,6 +1248,39 @@ static void RunCommand(const std::string& c) {
     else if (sscanf(c.c_str(), "keepfocus %u", &g_w) == 1) g_keepFocus = g_w != 0;
     else if (sscanf(c.c_str(), "level %u", &g_w) == 1) g_levelCamera = g_w != 0;
     else if (sscanf(c.c_str(), "lensfix %u", &g_w) == 1) g_lensFix = g_w != 0;
+    else if (c == "padinfo") {
+        Log("PADINFO XInput calls: 1_4 %u, 1_3 %u, 9_1_0 %u, 1_4 Ex %u, 1_3 Ex %u", g_xinputCalls[0].load(), g_xinputCalls[1].load(), g_xinputCalls[2].load(), g_xinputCalls[3].load(), g_xinputCalls[4].load());
+        for (const wchar_t* n : {L"sdl2.dll", L"sdl3.dll", L"libScePad.dll", L"GameInput.dll", L"hid.dll", L"dinput8.dll", L"Windows.Gaming.Input.dll", L"steam_api64.dll", L"nvapi64.dll"}) Log("PADINFO module %ls %p", n, GetModuleHandleW(n));
+    } else if (c == "menu") {
+        if (g_menuOpen) MenuClose();
+        else MenuOpen();
+    } else if (sscanf(c.c_str(), "menushot %63s", g_text) == 1) {
+        MenuDraw();
+        const std::wstring path = g_dir + L"vrlab_shots\\" + std::wstring(g_text, g_text + strlen(g_text)) + L".raw";
+        if (FILE* f = _wfopen(path.c_str(), L"wb")) {
+            fwrite(g_menuImage.data(), 4, g_menuImage.size(), f);
+            fclose(f);
+            Log("MENU shot %dx%d", kMenuW, kMenuH);
+        }
+    }
+    else if (sscanf(c.c_str(), "eyejitter %u", &g_w) == 1) g_eyeJitter = static_cast<int>(g_w);
+    else if (c == "aainfo") {
+        auto u8at = [](size_t rva) { return static_cast<unsigned>(*(g_base + rva)); };
+        auto i32at = [](size_t rva) { return *reinterpret_cast<int*>(g_base + rva); };
+        Log("AAINFO pass type %d, aa type %d, flags %u %u %u, global render %d x %d, taa ring %d, frame %d", i32at(0x6732b8c), i32at(0x533959c), u8at(0x53395e9), u8at(0x53395a4), u8at(0x6733634), i32at(0x67334c0), i32at(0x67334c4), i32at(0x533b8ec), i32at(0x6794fe8));
+        if (uint8_t* m = ActiveView()) {
+            float jx = 0, jy = 0;
+            reinterpret_cast<JitterFn>(g_base + kJitter.rva)(m, &jx, &jy);
+            Log("AAINFO main size %.1f %.1f jitter %.7f %.7f, in eye pixels %.3f %.3f", *reinterpret_cast<float*>(m + 0x448), *reinterpret_cast<float*>(m + 0x44c), jx, jy, jx * g_forceW * 0.5f, jy * g_forceH * 0.5f);
+        }
+        std::lock_guard<std::mutex> l(g_eyesLock);
+        if (!g_eyes.empty()) {
+            uint8_t* e = g_eyes[0];
+            float jx = 0, jy = 0;
+            reinterpret_cast<JitterFn>(g_base + kJitter.rva)(e, &jx, &jy);
+            Log("AAINFO eye size %.1f %.1f own jitter %.7f %.7f buffers %p", *reinterpret_cast<float*>(e + 0x448), *reinterpret_cast<float*>(e + 0x44c), jx, jy, *reinterpret_cast<void**>(e + 0x1690));
+        }
+    }
     else if (c == "fakehead off") XrFakeHead(false, 0, 0, 0, 0, 0, 0, 0);
     else if (c == "fakelens off") XrFakeLens(false, -1, 1, 1, -1);
     else if (sscanf(c.c_str(), "fakehead %f %f %f %f %f %f %f", &g_fh[0], &g_fh[1], &g_fh[2], &g_fh[3], &g_fh[4], &g_fh[5], &g_fh[6]) == 7) XrFakeHead(true, g_fh[0], g_fh[1], g_fh[2], g_fh[3], g_fh[4], g_fh[5], g_fh[6]);
@@ -980,11 +1326,20 @@ static DWORD WINAPI ProbeThread(void*) {
     FindActiveView();
     InstallHooks();
     const std::wstring ini = g_dir + L"RiftApartVR.ini";
+    g_iniPath = ini;
+    g_forceTaa = GetPrivateProfileIntW(L"VR", L"ForceGameAA", 1, ini.c_str()) != 0;
+    g_regForce = g_forceTaa;
+    InstallRegHooks();
+    InstallPadHooks();
+    CreateThread(nullptr, 0, PadThread, nullptr, 0, nullptr);
     const bool autoStart = GetPrivateProfileIntW(L"VR", L"AutoStart", 1, ini.c_str()) != 0;
     const int resolution = GetPrivateProfileIntW(L"VR", L"Resolution", 100, ini.c_str());
     g_worldScale = GetPrivateProfileIntW(L"VR", L"WorldScalePercent", 300, ini.c_str()) / 100.0f;
     g_levelCamera = GetPrivateProfileIntW(L"VR", L"LevelCamera", 1, ini.c_str()) != 0;
     g_pace = GetPrivateProfileIntW(L"VR", L"Pace", 1, ini.c_str()) != 0;
+    g_resolutionSetting = resolution;
+    g_hudDistanceSetting = GetPrivateProfileIntW(L"VR", L"HudDistanceCm", 200, ini.c_str()) / 100.0f;
+    XrSetHud(2.2f * g_hudDistanceSetting / 2.0f, g_hudDistanceSetting, 0.1f);
     Log("INI AutoStart %d Resolution %d WorldScale %.2f Pace %d", autoStart ? 1 : 0, resolution, g_worldScale.load(), g_pace.load() ? 1 : 0);
     const std::wstring cmdPath = g_dir + L"vrlab_command.txt";
     DeleteFileW(cmdPath.c_str());
@@ -1004,7 +1359,17 @@ static DWORD WINAPI ProbeThread(void*) {
             fclose(f);
         }
         const ULONGLONG now = GetTickCount64();
-        PollPad();
+        {
+            // Gravity boots: does the game's camera lean? Logged once a second when its right row leaves the level.
+            static ULONGLONG lastRow = 0;
+            if (now - lastRow >= 1000) {
+                lastRow = now;
+                if (uint8_t* v = ActiveView()) {
+                    float m[16];
+                    if (SafeCopy(m, v, sizeof(m)) && fabsf(m[1]) > 0.03f) Log("CAMROW right %.3f %.3f %.3f down %.3f %.3f %.3f forward %.3f %.3f %.3f pos %.2f %.2f %.2f", m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10], m[12], m[13], m[14]);
+                }
+            }
+        }
         {
             // When do the first game textures exist? Log once.
             static bool seenUi = false;
