@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 39
+#define BUILD_NUMBER 41
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -204,11 +204,27 @@ static void __fastcall HookBufferSize(uint8_t* buffers, const char* name, uint32
 using ToneFn = void*(__fastcall*)(void*, void*, void*, uint8_t*, void*, uint64_t);
 static ToneFn g_origTone;
 static std::atomic<bool> g_toneFix{true};
+// The tone map blends the game's whole UI into the view from the overlay target (0x67334c0 + 0x230, its resource word at
+// +0x98) when the view is not "generic". Eyes need that path for colour, not the UI: the UI goes on its own quads.
+// 0x678e710 is the game's own neutral stand-in, used when it runs without the overlay (0x11dc080).
+static std::atomic<bool> g_eyeNoUi{true};
+static const size_t kOverlayResource = 0x67334c0 + 0x230 + 0x98, kNeutralResource = 0x678e710;
 static std::atomic<uint8_t*> g_eyeA{nullptr}, g_eyeB{nullptr};
 static void* __fastcall HookTone(void* a, void* b, void* c, uint8_t* view, void* e, uint64_t generic) {
     if (g_toneFix && view) {
         uint8_t* owner = *reinterpret_cast<uint8_t**>(view + 0x1ff8);
-        if (owner && (owner == g_eyeA.load() || owner == g_eyeB.load())) generic = 0;
+        if (owner && (owner == g_eyeA.load() || owner == g_eyeB.load())) {
+            generic = 0;
+            if (g_eyeNoUi) {
+                if (owner == g_eyeA.load()) XrMarkRendered(reinterpret_cast<const float*>(view + 0x30));
+                uint64_t* overlay = reinterpret_cast<uint64_t*>(g_base + kOverlayResource);
+                const uint64_t saved = *overlay;
+                *overlay = *reinterpret_cast<uint64_t*>(g_base + kNeutralResource);
+                void* r = g_origTone(a, b, c, view, e, generic);
+                *overlay = saved;
+                return r;
+            }
+        }
     }
     if (view) {
         // The render thread's copy of the view holds the camera this image was drawn with.
@@ -365,12 +381,12 @@ static void CreateEyeImpl() {
 // The title sits at the origin with a 39.43 degree lens. Anything else that lasts a second is treated as the world.
 static std::atomic<bool> g_xrSession{false};
 static void CreateEyeNow();
-// Above 0 while a cinematic runs: counts active Cinematic2 atmosphere tracks (0xfe08f8 adds to it, near the string
-// "Cinematic2 Atmosphere Modifier Track"). Found by comparing .data across cinematics and play (tools\data_cross.py,
-// flag_watch.py, cine_prune.py). A cinematic with no such track would be missed and stay in the 3D world.
-static const size_t kCinematicTracks = 0x5339144;
-// The other flags that passed the same test, logged when they change so a longer play can judge them.
-static const size_t kCinematicOthers[] = {0x512cf1c, 0x512f770, 0x513195c, 0x5f3bdc0, 0x5f3d6f8, 0x5ffa764, 0x61d19d4, 0x6240ba8};
+// Above 0 during real cinematics. Found by comparing .data (data_cross.py, flag_watch.py, cine_prune.py), chosen from
+// Steve's long play: the atmosphere track count 0x5339144 also fires for short scripted moments in combat, this does not.
+// Nothing references it directly, so what it is is unknown.
+static const size_t kCinematicTracks = 0x61d19d4;
+// The others that passed the same test, logged when they change so a longer play can judge them.
+static const size_t kCinematicOthers[] = {0x512cf1c, 0x512f770, 0x513195c, 0x5339144, 0x5f3bdc0, 0x5f3d6f8, 0x5ffa764, 0x6240ba8};
 static std::atomic<bool> g_cinemaOn{true};
 static std::atomic<bool> g_cinemaNow{false};
 static std::atomic<float> g_cinemaIpd{0.03f};
@@ -411,7 +427,7 @@ static void UpdateMode() {
                     seen[i] = v;
                 }
             }
-            if (n) Log("CINEFLAGS%s (tracks %d)", changes, *reinterpret_cast<int*>(g_base + kCinematicTracks));
+            if (n) Log("CINEFLAGS%s (chosen %d)", changes, *reinterpret_cast<int*>(g_base + kCinematicTracks));
         }
         // Cinematics can use the title's lens too.
         world = !atOrigin && !titleSpot && (cine || fabs(vfov - 39.43) > 0.05);
@@ -633,6 +649,8 @@ static void __fastcall HookRenderAll() {
 
 // Resting the flat view: the scene submit returns at once when view +0x11d8 is clear. Set again when not resting.
 static std::atomic<bool> g_restFlat{false};
+static std::atomic<int> g_skipMain{0};
+static std::atomic<uint64_t> g_mainSkipped{0};
 static void* __fastcall HookSceneSubmit(uint8_t* view, void* a, uint32_t mask, char b) {
     if (view == ActiveView()) {
         static uint8_t saved = 1;
@@ -659,6 +677,21 @@ static void* __fastcall HookSceneSubmit(uint8_t* view, void* a, uint32_t mask, c
     }
     // Eyes read the main view's Adapted Lum, so they have the exposure the game chose. The handle is only lent while
     // the scene submit copies the view into its job: if it stayed, rebuilding an eye would free the main view's buffer.
+    if (view == ActiveView() && g_skipMain.load() && g_xrEyes.load()) {
+        ++g_mainSkipped;
+        return nullptr;
+    }
+    // With the main view skipped, the left eye stands in for it: the game draws the UI overlay in the main view's work.
+    if (g_skipMain.load() == 2 && g_xrEyes.load() && view == g_eyeA.load()) {
+        int* id = reinterpret_cast<int*>(view + 0xf90);
+        const int saved = *id;
+        *id = 0;
+        void* r = nullptr;
+        if (g_shareLum.load() && false) {}
+        r = g_origSceneSubmit(view, a, mask, b);
+        *id = saved;
+        return r;
+    }
     uint8_t* main = g_shareLum ? ActiveView() : nullptr;
     if (main && view != main && (view == g_eyeA.load() || view == g_eyeB.load())) {
         uint8_t saved[0x38];
@@ -1582,7 +1615,17 @@ static DWORD WINAPI XrStartThread(void* arg) {
 
 // Coherent UI views: a table of 0x150 byte records. +0x20 render target data, whose first word is the colour texture.
 static const size_t kUiViews = 0x687d310;
+// Slot 5 is not a Coherent view: the game's own composite of its whole UI, the overlay the tone map blends in.
+static uint8_t* OverlayTexture(int* w, int* h) {
+    uint8_t* t = g_base + 0x67334c0;
+    if (*reinterpret_cast<int*>(t + 0x400) == 0) return nullptr;
+    uint8_t* tex = t + 0x230;
+    if (w) SafeCopy(w, tex + 0x1d0, 4);
+    if (h) SafeCopy(h, tex + 0x1d4, 4);
+    return tex;
+}
 static uint8_t* UiTexture(int i, int* w, int* h) {
+    if (i == 5) return OverlayTexture(w, h);
     uint8_t* v = g_base + kUiViews + static_cast<size_t>(i) * 0x150;
     uint8_t* rt = nullptr;
     if (!SafeCopy(&rt, v + 0x20, 8) || !rt) return nullptr;
@@ -1597,7 +1640,9 @@ static void* TextureResource(uint8_t* tex, uint32_t* state) {
     uint8_t* wrap = nullptr;
     uint8_t* rec = nullptr;
     void* res = nullptr;
-    if (!SafeCopy(&wrap, tex + 0x40, 8) || !wrap || !SafeCopy(&rec, wrap + 0x38, 8) || !rec || !SafeCopy(&res, rec, 8) || !res) return nullptr;
+    // A render target struct, such as the overlay, keeps its wrapper at +0x88 (0x11df5a0 reads it there).
+    const size_t wrapAt = tex == g_base + 0x67334c0 + 0x230 ? 0x88 : 0x40;
+    if (!SafeCopy(&wrap, tex + wrapAt, 8) || !wrap || !SafeCopy(&rec, wrap + 0x38, 8) || !rec || !SafeCopy(&res, rec, 8) || !res) return nullptr;
     SafeCopy(state, rec + 0x28, 4);
     return res;
 }
@@ -1652,6 +1697,8 @@ static void RunCommand(const std::string& c) {
     else if (sscanf(c.c_str(), "keepfocus %u", &g_w) == 1) g_keepFocus = g_w != 0;
     else if (sscanf(c.c_str(), "level %u", &g_w) == 1) g_levelCamera = g_w != 0;
     else if (sscanf(c.c_str(), "lensfix %u", &g_w) == 1) g_lensFix = g_w != 0;
+    else if (sscanf(c.c_str(), "eyenoui %u", &g_w) == 1) g_eyeNoUi = g_w != 0;
+    else if (sscanf(c.c_str(), "skipmain %u", &g_w) == 1) g_skipMain = static_cast<int>(g_w);
     else if (sscanf(c.c_str(), "cinemaipd %f", &g_f) == 1) g_cinemaIpd = g_f;
     else if (sscanf(c.c_str(), "aimdot %u", &g_w) == 1) g_aimDot = static_cast<int>(g_w);
     else if (c == "aiminfo") {
