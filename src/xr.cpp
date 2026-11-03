@@ -1,0 +1,438 @@
+// RiftApartVR. Copyright (c) 2026 scubasteve2365. MIT licence.
+//
+// OpenXR on the game's own D3D12 device and direct queue. A worker thread owns xrWaitFrame, so the game never blocks
+// in OpenXR. The game thread reads the newest head pose once a frame. The Present thread copies the two finished eye
+// images to the swapchains and ends the frame. Errors are logged and leave the flat game running.
+#include <windows.h>
+#include <d3d12.h>
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <vector>
+#define XR_NO_PROTOTYPES
+#define XR_USE_PLATFORM_WIN32
+#define XR_USE_GRAPHICS_API_D3D12
+#include <openxr/openxr.h>
+#include <openxr/openxr_platform.h>
+#include "xr.h"
+
+extern void Log(const char* fmt, ...);
+
+static PFN_xrGetInstanceProcAddr g_gipa;
+static XrInstance g_inst = XR_NULL_HANDLE;
+static XrSystemId g_sys = 0;
+static XrSession g_sess = XR_NULL_HANDLE;
+static XrSpace g_space = XR_NULL_HANDLE;
+static XrSwapchain g_chain[2];
+static std::vector<XrSwapchainImageD3D12KHR> g_images[2];
+static int g_chainW, g_chainH;
+static std::atomic<int> g_recW{0}, g_recH{0};
+static std::atomic<XrTime> g_predicted{0};
+static std::atomic<int> g_state{XR_SESSION_STATE_UNKNOWN};
+static std::atomic<int64_t> g_periodNs{0};
+
+#define XRFN(name) static PFN_##name p_##name;
+XRFN(xrEnumerateInstanceExtensionProperties)
+XRFN(xrCreateInstance)
+XRFN(xrGetSystem)
+XRFN(xrGetSystemProperties)
+XRFN(xrEnumerateViewConfigurationViews)
+XRFN(xrCreateSession)
+XRFN(xrCreateReferenceSpace)
+XRFN(xrPollEvent)
+XRFN(xrBeginSession)
+XRFN(xrEndSession)
+XRFN(xrWaitFrame)
+XRFN(xrBeginFrame)
+XRFN(xrEndFrame)
+XRFN(xrLocateViews)
+XRFN(xrEnumerateSwapchainFormats)
+XRFN(xrCreateSwapchain)
+XRFN(xrEnumerateSwapchainImages)
+XRFN(xrAcquireSwapchainImage)
+XRFN(xrWaitSwapchainImage)
+XRFN(xrReleaseSwapchainImage)
+XRFN(xrGetD3D12GraphicsRequirementsKHR)
+
+template <class T>
+static bool Fn(const char* name, T& out) {
+    PFN_xrVoidFunction f = nullptr;
+    const XrResult r = g_gipa(g_inst, name, &f);
+    out = reinterpret_cast<T>(f);
+    if (XR_FAILED(r) || !f) {
+        Log("XR no function %s: %d", name, static_cast<int>(r));
+        return false;
+    }
+    return true;
+}
+
+bool XrInit(const wchar_t* dir) {
+    if (g_inst) return true;
+    const std::wstring path = std::wstring(dir) + L"openxr_loader.dll";
+    HMODULE lib = LoadLibraryW(path.c_str());
+    if (!lib) {
+        Log("XR loader not loaded, error %lu", GetLastError());
+        return false;
+    }
+    g_gipa = reinterpret_cast<PFN_xrGetInstanceProcAddr>(GetProcAddress(lib, "xrGetInstanceProcAddr"));
+    if (!g_gipa || !Fn("xrCreateInstance", p_xrCreateInstance)) return false;
+    XrInstanceCreateInfo ci{XR_TYPE_INSTANCE_CREATE_INFO};
+    strcpy_s(ci.applicationInfo.applicationName, "RiftApartVR");
+    ci.applicationInfo.apiVersion = XR_API_VERSION_1_0;
+    const char* ext[] = {XR_KHR_D3D12_ENABLE_EXTENSION_NAME};
+    ci.enabledExtensionCount = 1;
+    ci.enabledExtensionNames = ext;
+    XrResult r = p_xrCreateInstance(&ci, &g_inst);
+    if (XR_FAILED(r)) {
+        Log("XR xrCreateInstance failed: %d", static_cast<int>(r));
+        return false;
+    }
+    if (!Fn("xrGetSystem", p_xrGetSystem) || !Fn("xrGetSystemProperties", p_xrGetSystemProperties) || !Fn("xrEnumerateViewConfigurationViews", p_xrEnumerateViewConfigurationViews) ||
+        !Fn("xrCreateSession", p_xrCreateSession) || !Fn("xrCreateReferenceSpace", p_xrCreateReferenceSpace) || !Fn("xrPollEvent", p_xrPollEvent) ||
+        !Fn("xrBeginSession", p_xrBeginSession) || !Fn("xrEndSession", p_xrEndSession) || !Fn("xrWaitFrame", p_xrWaitFrame) || !Fn("xrBeginFrame", p_xrBeginFrame) ||
+        !Fn("xrEndFrame", p_xrEndFrame) || !Fn("xrLocateViews", p_xrLocateViews) || !Fn("xrEnumerateSwapchainFormats", p_xrEnumerateSwapchainFormats) ||
+        !Fn("xrCreateSwapchain", p_xrCreateSwapchain) || !Fn("xrEnumerateSwapchainImages", p_xrEnumerateSwapchainImages) || !Fn("xrAcquireSwapchainImage", p_xrAcquireSwapchainImage) ||
+        !Fn("xrWaitSwapchainImage", p_xrWaitSwapchainImage) || !Fn("xrReleaseSwapchainImage", p_xrReleaseSwapchainImage) || !Fn("xrGetD3D12GraphicsRequirementsKHR", p_xrGetD3D12GraphicsRequirementsKHR))
+        return false;
+    XrSystemGetInfo si{XR_TYPE_SYSTEM_GET_INFO};
+    si.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
+    r = p_xrGetSystem(g_inst, &si, &g_sys);
+    if (XR_FAILED(r)) {
+        Log("XR xrGetSystem failed: %d (is a headset on?)", static_cast<int>(r));
+        return false;
+    }
+    XrSystemProperties sp{XR_TYPE_SYSTEM_PROPERTIES};
+    p_xrGetSystemProperties(g_inst, g_sys, &sp);
+    uint32_t n = 0;
+    p_xrEnumerateViewConfigurationViews(g_inst, g_sys, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &n, nullptr);
+    std::vector<XrViewConfigurationView> v(n, {XR_TYPE_VIEW_CONFIGURATION_VIEW});
+    p_xrEnumerateViewConfigurationViews(g_inst, g_sys, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, n, &n, v.data());
+    if (n < 2) return false;
+    g_recW = v[0].recommendedImageRectWidth;
+    g_recH = v[0].recommendedImageRectHeight;
+    Log("XR system '%s', recommended %ux%u per eye, max %ux%u", sp.systemName, v[0].recommendedImageRectWidth, v[0].recommendedImageRectHeight, v[0].maxImageRectWidth, v[0].maxImageRectHeight);
+    return true;
+}
+
+void XrRecommended(int* w, int* h) {
+    *w = g_recW;
+    *h = g_recH;
+}
+
+// ---- GPU copies on the game's queue ----
+static ID3D12Device* g_dev;
+static ID3D12CommandQueue* g_queue;
+static const int kRing = 4;
+static ID3D12CommandAllocator* g_alloc[kRing];
+static ID3D12GraphicsCommandList* g_list[kRing];
+static ID3D12Fence* g_fence;
+static uint64_t g_fenceValue, g_ringValue[kRing];
+static int g_ringIndex;
+static HANDLE g_fenceEvent;
+
+// ---- frame hand-over between threads ----
+static std::mutex g_frameLock;
+static bool g_open;
+static bool g_should;
+static XrTime g_openTime;
+static std::atomic<uint64_t> g_endedWithImages{0}, g_endedEmpty{0}, g_notReady{0};
+
+struct PendingPose {
+    XrView views[2];
+};
+static const int kPoses = 8;
+static PendingPose g_poses[kPoses];
+static int g_poseHead, g_poseCount;
+static std::mutex g_poseLock;
+
+bool XrLocate(XrEyePose out[2]) {
+    const XrTime t = g_predicted;
+    if (!g_sess || !t) return false;
+    XrViewLocateInfo li{XR_TYPE_VIEW_LOCATE_INFO};
+    li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    li.displayTime = t;
+    li.space = g_space;
+    XrViewState vs{XR_TYPE_VIEW_STATE};
+    uint32_t n = 0;
+    XrView v[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+    if (XR_FAILED(p_xrLocateViews(g_sess, &li, &vs, 2, &n, v)) || n != 2) return false;
+    if (!(vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) return false;
+    for (int e = 0; e < 2; ++e) {
+        out[e].qx = v[e].pose.orientation.x;
+        out[e].qy = v[e].pose.orientation.y;
+        out[e].qz = v[e].pose.orientation.z;
+        out[e].qw = v[e].pose.orientation.w;
+        out[e].px = v[e].pose.position.x;
+        out[e].py = v[e].pose.position.y;
+        out[e].pz = v[e].pose.position.z;
+        out[e].tanLeft = tanf(v[e].fov.angleLeft);
+        out[e].tanRight = tanf(v[e].fov.angleRight);
+        out[e].tanUp = tanf(v[e].fov.angleUp);
+        out[e].tanDown = tanf(v[e].fov.angleDown);
+    }
+    std::lock_guard<std::mutex> l(g_poseLock);
+    const int slot = (g_poseHead + g_poseCount) % kPoses;
+    g_poses[slot].views[0] = v[0];
+    g_poses[slot].views[1] = v[1];
+    if (g_poseCount < kPoses) ++g_poseCount;
+    else g_poseHead = (g_poseHead + 1) % kPoses;
+    return true;
+}
+
+void XrPaceWait() {
+    static XrTime seen = 0;
+    const int64_t period = g_periodNs;
+    if (!period) return;
+    const ULONGLONG limitMs = static_cast<ULONGLONG>(period * 3 / 2 / 1000000) + 1;
+    const ULONGLONG start = GetTickCount64();
+    while (g_predicted.load() == seen && GetTickCount64() - start < limitMs) Sleep(0);
+    seen = g_predicted.load();
+}
+
+static void PollEvents() {
+    XrEventDataBuffer ev{XR_TYPE_EVENT_DATA_BUFFER};
+    while (p_xrPollEvent(g_inst, &ev) == XR_SUCCESS) {
+        if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
+            const auto& s = *reinterpret_cast<XrEventDataSessionStateChanged*>(&ev);
+            g_state = s.state;
+            Log("XR session state %d", static_cast<int>(s.state));
+            if (s.state == XR_SESSION_STATE_READY) {
+                XrSessionBeginInfo bi{XR_TYPE_SESSION_BEGIN_INFO};
+                bi.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+                const XrResult r = p_xrBeginSession(g_sess, &bi);
+                Log("XR xrBeginSession %d", static_cast<int>(r));
+            } else if (s.state == XR_SESSION_STATE_STOPPING) {
+                p_xrEndSession(g_sess);
+            }
+        }
+        ev = {XR_TYPE_EVENT_DATA_BUFFER};
+    }
+}
+
+static void EndEmpty(XrTime t) {
+    XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
+    ei.displayTime = t;
+    ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    p_xrEndFrame(g_sess, &ei);
+    ++g_endedEmpty;
+}
+
+static DWORD WINAPI XrWorker(void*) {
+    ULONGLONG lastStats = GetTickCount64();
+    for (;;) {
+        PollEvents();
+        const int st = g_state;
+        if (st != XR_SESSION_STATE_READY && st != XR_SESSION_STATE_SYNCHRONIZED && st != XR_SESSION_STATE_VISIBLE && st != XR_SESSION_STATE_FOCUSED) {
+            Sleep(10);
+            continue;
+        }
+        XrFrameState fs{XR_TYPE_FRAME_STATE};
+        XrResult r = p_xrWaitFrame(g_sess, nullptr, &fs);
+        if (XR_FAILED(r)) {
+            Log("XR xrWaitFrame failed %d", static_cast<int>(r));
+            Sleep(100);
+            continue;
+        }
+        g_predicted = fs.predictedDisplayTime;
+        g_periodNs = fs.predictedDisplayPeriod;
+        r = p_xrBeginFrame(g_sess, nullptr);
+        if (XR_FAILED(r)) {
+            Log("XR xrBeginFrame failed %d", static_cast<int>(r));
+            continue;
+        }
+        {
+            std::lock_guard<std::mutex> l(g_frameLock);
+            g_open = true;
+            g_should = fs.shouldRender != XR_FALSE;
+            g_openTime = fs.predictedDisplayTime;
+        }
+        const ULONGLONG start = GetTickCount64();
+        for (;;) {
+            {
+                std::lock_guard<std::mutex> l(g_frameLock);
+                if (!g_open) break;
+                if (GetTickCount64() - start > 200) {
+                    EndEmpty(g_openTime);
+                    g_open = false;
+                    break;
+                }
+            }
+            Sleep(1);
+        }
+        const ULONGLONG now = GetTickCount64();
+        if (now - lastStats > 5000) {
+            lastStats = now;
+            Log("XRSTAT state %d period %.2f ms with images %llu empty %llu not ready %llu", g_state.load(), g_periodNs.load() / 1e6, g_endedWithImages.load(), g_endedEmpty.load(), g_notReady.load());
+        }
+    }
+}
+
+bool XrStartSession(void* device, void* queue, int eyeW, int eyeH) {
+    g_dev = static_cast<ID3D12Device*>(device);
+    g_queue = static_cast<ID3D12CommandQueue*>(queue);
+    XrGraphicsRequirementsD3D12KHR req{XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR};
+    XrResult r = p_xrGetD3D12GraphicsRequirementsKHR(g_inst, g_sys, &req);
+    Log("XR graphics requirements %d, adapter LUID %08lx%08lx, min feature level %x", static_cast<int>(r), req.adapterLuid.HighPart, req.adapterLuid.LowPart, req.minFeatureLevel);
+    LUID ours = g_dev->GetAdapterLuid();
+    if (req.adapterLuid.LowPart != ours.LowPart || req.adapterLuid.HighPart != ours.HighPart)
+        Log("XR adapter LUID differs from the game's %08lx%08lx (expected on the null driver)", ours.HighPart, ours.LowPart);
+    XrGraphicsBindingD3D12KHR b{XR_TYPE_GRAPHICS_BINDING_D3D12_KHR};
+    b.device = g_dev;
+    b.queue = g_queue;
+    XrSessionCreateInfo sc{XR_TYPE_SESSION_CREATE_INFO};
+    sc.next = &b;
+    sc.systemId = g_sys;
+    r = p_xrCreateSession(g_inst, &sc, &g_sess);
+    if (XR_FAILED(r)) {
+        Log("XR xrCreateSession failed %d", static_cast<int>(r));
+        return false;
+    }
+    XrReferenceSpaceCreateInfo rs{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+    rs.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+    rs.poseInReferenceSpace.orientation.w = 1;
+    p_xrCreateReferenceSpace(g_sess, &rs, &g_space);
+
+    uint32_t nf = 0;
+    p_xrEnumerateSwapchainFormats(g_sess, 0, &nf, nullptr);
+    std::vector<int64_t> fmts(nf);
+    p_xrEnumerateSwapchainFormats(g_sess, nf, &nf, fmts.data());
+    int64_t format = 0;
+    for (int64_t f : fmts) {
+        if (f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) format = f;
+    }
+    if (!format) {
+        for (int64_t f : fmts) {
+            if (f == DXGI_FORMAT_R8G8B8A8_UNORM) format = f;
+        }
+    }
+    Log("XR swapchain format %lld of %u offered", format, nf);
+    if (!format) return false;
+    g_chainW = eyeW;
+    g_chainH = eyeH;
+    for (int e = 0; e < 2; ++e) {
+        XrSwapchainCreateInfo ci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+        ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+        ci.format = format;
+        ci.sampleCount = 1;
+        ci.width = eyeW;
+        ci.height = eyeH;
+        ci.faceCount = 1;
+        ci.arraySize = 1;
+        ci.mipCount = 1;
+        r = p_xrCreateSwapchain(g_sess, &ci, &g_chain[e]);
+        if (XR_FAILED(r)) {
+            Log("XR xrCreateSwapchain failed %d", static_cast<int>(r));
+            return false;
+        }
+        uint32_t n = 0;
+        p_xrEnumerateSwapchainImages(g_chain[e], 0, &n, nullptr);
+        g_images[e].assign(n, {XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
+        p_xrEnumerateSwapchainImages(g_chain[e], n, &n, reinterpret_cast<XrSwapchainImageBaseHeader*>(g_images[e].data()));
+    }
+    for (int i = 0; i < kRing; ++i) {
+        g_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_alloc[i]));
+        g_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_alloc[i], nullptr, IID_PPV_ARGS(&g_list[i]));
+        g_list[i]->Close();
+    }
+    g_dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence));
+    g_fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (HANDLE t = CreateThread(nullptr, 0, XrWorker, nullptr, 0, nullptr)) CloseHandle(t);
+    Log("XR session created, swapchains %dx%d", eyeW, eyeH);
+    return true;
+}
+
+// On the Present thread. The two eye images were queued before this Present.
+void XrOnPresent(void* const resources[2], const uint32_t states[2]) {
+    std::lock_guard<std::mutex> l(g_frameLock);
+    if (!g_open) {
+        ++g_notReady;
+        return;
+    }
+    PendingPose pose;
+    bool havePose = false;
+    {
+        std::lock_guard<std::mutex> pl(g_poseLock);
+        if (g_poseCount > 0) {
+            pose = g_poses[g_poseHead];
+            g_poseHead = (g_poseHead + 1) % kPoses;
+            --g_poseCount;
+            havePose = true;
+        }
+    }
+    if (!g_should || !havePose || !resources[0] || !resources[1]) {
+        EndEmpty(g_openTime);
+        g_open = false;
+        return;
+    }
+    if (g_fence->GetCompletedValue() < g_ringValue[g_ringIndex]) {
+        g_fence->SetEventOnCompletion(g_ringValue[g_ringIndex], g_fenceEvent);
+        WaitForSingleObject(g_fenceEvent, 500);
+    }
+    ID3D12CommandAllocator* alloc = g_alloc[g_ringIndex];
+    ID3D12GraphicsCommandList* list = g_list[g_ringIndex];
+    alloc->Reset();
+    list->Reset(alloc, nullptr);
+    XrCompositionLayerProjectionView pv[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
+    for (int e = 0; e < 2; ++e) {
+        uint32_t idx = 0;
+        p_xrAcquireSwapchainImage(g_chain[e], nullptr, &idx);
+        XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+        wi.timeout = 100000000;
+        p_xrWaitSwapchainImage(g_chain[e], &wi);
+        ID3D12Resource* dst = g_images[e][idx].texture;
+        auto* src = static_cast<ID3D12Resource*>(resources[e]);
+        D3D12_RESOURCE_BARRIER bar[2]{};
+        bar[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        bar[0].Transition.pResource = src;
+        bar[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        bar[0].Transition.StateBefore = static_cast<D3D12_RESOURCE_STATES>(states[e]);
+        bar[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        bar[1] = bar[0];
+        bar[1].Transition.pResource = dst;
+        bar[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        bar[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        list->ResourceBarrier(2, bar);
+        D3D12_TEXTURE_COPY_LOCATION d{}, s{};
+        d.pResource = dst;
+        d.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        s.pResource = src;
+        s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        const D3D12_RESOURCE_DESC sd = src->GetDesc();
+        D3D12_BOX box{0, 0, 0, static_cast<UINT>(std::min(static_cast<UINT64>(g_chainW), sd.Width)), std::min(static_cast<UINT>(g_chainH), sd.Height), 1};
+        list->CopyTextureRegion(&d, 0, 0, 0, &s, &box);
+        std::swap(bar[0].Transition.StateBefore, bar[0].Transition.StateAfter);
+        std::swap(bar[1].Transition.StateBefore, bar[1].Transition.StateAfter);
+        list->ResourceBarrier(2, bar);
+        pv[e].pose = pose.views[e].pose;
+        pv[e].fov = pose.views[e].fov;
+        pv[e].subImage.swapchain = g_chain[e];
+        pv[e].subImage.imageRect.extent = {g_chainW, g_chainH};
+    }
+    list->Close();
+    ID3D12CommandList* lists[] = {list};
+    g_queue->ExecuteCommandLists(1, lists);
+    g_queue->Signal(g_fence, ++g_fenceValue);
+    g_ringValue[g_ringIndex] = g_fenceValue;
+    g_ringIndex = (g_ringIndex + 1) % kRing;
+    for (int e = 0; e < 2; ++e) {
+        XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        p_xrReleaseSwapchainImage(g_chain[e], &ri);
+    }
+    XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    layer.space = g_space;
+    layer.viewCount = 2;
+    layer.views = pv;
+    const XrCompositionLayerBaseHeader* layers[] = {reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer)};
+    XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
+    ei.displayTime = g_openTime;
+    ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    ei.layerCount = 1;
+    ei.layers = layers;
+    const XrResult r = p_xrEndFrame(g_sess, &ei);
+    if (XR_FAILED(r)) Log("XR xrEndFrame failed %d", static_cast<int>(r));
+    ++g_endedWithImages;
+    g_open = false;
+}

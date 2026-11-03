@@ -18,6 +18,7 @@ extern void Log(const char* fmt, ...);
 static ID3D12Device* g_device;
 static std::atomic<ID3D12CommandQueue*> g_queue{nullptr};
 static std::atomic<uint64_t> g_presents{0};
+static std::atomic<bool> g_ready{false};
 
 using ExecuteFn = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
@@ -43,7 +44,10 @@ static void STDMETHODCALLTYPE HookExecute(ID3D12CommandQueue* q, UINT n, ID3D12C
 
 static void WriteBmp(const std::wstring& path, const uint8_t* data, UINT pitch, UINT w, UINT h) {
     FILE* f = _wfopen(path.c_str(), L"wb");
-    if (!f) return;
+    if (!f) {
+        Log("DUMP could not open file, errno %d", errno);
+        return;
+    }
     const uint32_t row = w * 3 + (4 - (w * 3) % 4) % 4;
     BITMAPFILEHEADER fh{};
     BITMAPINFOHEADER ih{};
@@ -134,8 +138,9 @@ static void RunJob(DumpJob* job) {
     Log("DUMP wait %lu device removed reason %lx", wait, g_device->GetDeviceRemovedReason());
     for (size_t i = 0; i < buffers.size(); ++i) {
         void* p = nullptr;
-        D3D12_RANGE rg{0, static_cast<SIZE_T>(prints[i].Footprint.RowPitch) * prints[i].Footprint.Height};
-        if (wait == WAIT_OBJECT_0 && SUCCEEDED(buffers[i]->Map(0, &rg, &p))) {
+        const HRESULT mapped = wait == WAIT_OBJECT_0 ? buffers[i]->Map(0, nullptr, &p) : E_FAIL;
+        Log("DUMP map %lx pitch %u %ls", mapped, prints[i].Footprint.RowPitch, job->paths[i].c_str());
+        if (SUCCEEDED(mapped)) {
             WriteBmp(job->paths[i], static_cast<uint8_t*>(p), prints[i].Footprint.RowPitch, prints[i].Footprint.Width, prints[i].Footprint.Height);
             buffers[i]->Unmap(0, nullptr);
         }
@@ -148,19 +153,33 @@ static void RunJob(DumpJob* job) {
     Log("DUMP done");
 }
 
+static std::atomic<void (*)()> g_callback{nullptr};
+
+static thread_local int t_depth = 0;
+
 static void OnPresent() {
     ++g_presents;
     if (DumpJob* job = g_job.exchange(nullptr)) RunJob(job);
+    if (auto fn = g_callback.load()) fn();
 }
 
+bool CaptureReady() { return g_ready.load(); }
+void* CaptureDevice() { return g_device; }
+void* CaptureQueue() { return g_queue.load(); }
+void CaptureSetPresentCallback(void (*fn)()) { g_callback = fn; }
+
 static HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* s, UINT a, UINT b) {
-    OnPresent();
-    return g_origPresent(s, a, b);
+    if (t_depth++ == 0) OnPresent();
+    const HRESULT r = g_origPresent(s, a, b);
+    --t_depth;
+    return r;
 }
 
 static HRESULT STDMETHODCALLTYPE HookPresent1(IDXGISwapChain1* s, UINT a, UINT b, const DXGI_PRESENT_PARAMETERS* p) {
-    OnPresent();
-    return g_origPresent1(s, a, b, p);
+    if (t_depth++ == 0) OnPresent();
+    const HRESULT r = g_origPresent1(s, a, b, p);
+    --t_depth;
+    return r;
 }
 
 static DWORD WINAPI SetupThread(void* resource) {
@@ -222,6 +241,7 @@ static DWORD WINAPI SetupThread(void* resource) {
     DestroyWindow(wnd);
     Sleep(500);
     Log("D3D presents seen %llu", g_presents.load());
+    g_ready = true;
     return 0;
 }
 

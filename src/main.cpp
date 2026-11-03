@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <MinHook.h>
 #include "capture.h"
+#include "xr.h"
 #include <intrin.h>
 #include <algorithm>
 #include <atomic>
@@ -18,7 +19,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 6
+#define BUILD_NUMBER 10
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -114,8 +115,10 @@ static const Target kCameraSubmit{"CameraSubmit", 0x12324e0, "\x48\x3b\xd1\x74\x
 static const Target kOffscreenCreate{"OffscreenCreate", 0x1239af0, "\x48\x89\x5c\x24\x10\x48\x89\x6c\x24\x18\x57\x48\x83\xec\x60"};
 static const Target kSceneSubmit{"SceneSubmit", 0x12bb640, "\x44\x88\x4c\x24\x20\x48\x89\x54\x24\x10\x55\x53\x56\x57"};
 static const Target kViewCreate{"ViewCreate", 0x1238fb0, "\x48\x89\x5c\x24\x08\x48\x89\x6c\x24\x10\x48\x89\x74\x24\x18\x48\x89\x7c\x24\x20\x41\x56"};
-static const Target kLensEdges{"LensEdges", 0x1210810, "\x48\x8b\xc4\x48\x81\xec\x08\x01"};
+static const Target kLensPersp{"LensPersp", 0x1213240, "\x48\x8b\xc4\x48\x89\x58\x08\x55\x48\x8d\x6c\x24\x80"};
+static const Target kLensPose{"LensPose", 0x1214150, "\x40\x53\x48\x83\xec\x60\x0f\x10\x02\x48\x8b\xd9\x0f\x11"};
 static const Target kJitter{"Jitter", 0x1234030, "\x48\x89\x5c\x24\x08\x48\x89\x74\x24\x10\x48\x89\x7c\x24\x18\x41\x56"};
+static const Target kBufferSize{"BufferSize", 0x120c2e0, "\x48\x89\x5c\x24\x08\x48\x89\x74\x24\x10\x48\x89\x7c\x24\x18\x55\x41\x54"};
 static const size_t kManager = 0x6739a10;
     // ViewContextManager
 static const size_t kShowSlot = 0x5339598;   // the game draws this offscreen slot over the active view
@@ -155,6 +158,27 @@ static void __fastcall HookViewCreate(uint8_t* view, const char* name, void* buf
     g_origViewCreate(view, name, buffers, a4, a5, kind, parent, a8);
 }
 
+// Eyes get their own full buffer set at their own size, whatever the game's window or resolution setting is.
+using BufferSizeFn = void(__fastcall*)(uint8_t*, const char*, uint32_t, uint32_t, int, char);
+static BufferSizeFn g_origBufferSize;
+static std::atomic<uint32_t> g_forceW{0}, g_forceH{0};
+static void __fastcall HookBufferSize(uint8_t* buffers, const char* name, uint32_t w, uint32_t h, int kind, char align) {
+    const bool ours = name == kEyeName && g_forceW != 0;
+    if (ours) {
+        w = g_forceW;
+        h = g_forceH;
+        *reinterpret_cast<void**>(buffers + 0x14990) = nullptr;  // no sharing with, or clamping to, the main view's set
+    }
+    g_origBufferSize(buffers, name, w, h, kind, align);
+    if (ours) {
+        for (size_t off : {size_t{0x14910}, size_t{0x14918}, size_t{0x14920}}) {
+            reinterpret_cast<uint32_t*>(buffers + off)[0] = w;
+            reinterpret_cast<uint32_t*>(buffers + off)[1] = h;
+        }
+        Log("EYE buffers %p %ux%u kind %d", buffers, w, h, kind);
+    }
+}
+
 static SceneSubmitFn g_origSceneSubmit;
 static RenderAllFn g_origRenderAll;
 static CameraSubmitFn g_origCameraSubmit;
@@ -173,7 +197,14 @@ static std::mutex g_eyesLock;
 static std::atomic<bool> g_copyCamera{false};
 static std::atomic<bool> g_stereo{false};
 static std::atomic<float> g_ipd{0.064f};
-using LensEdgesFn = void(__fastcall*)(void*, const float*, float, float, float, float, float, float, float, float, uint8_t);
+static std::atomic<bool> g_xrEyes{false}, g_wantRecenter{false}, g_pace{true};
+static std::atomic<float> g_worldScale{1.0f};
+static bool g_haveCentre = false;
+static float g_centre[3], g_centreYaw;
+// Off-centre perspective from edges, then the pose: the same two steps the game's own camera builders end with.
+// Edges are tangents: left, right, bottom, top, as OpenXR gives them.
+using LensPerspFn = void(__fastcall*)(void*, float, float, float, float, float, float, float, float, float, float, char, char);
+using LensPoseFn = void(__fastcall*)(void*, const float*);
 using JitterFn = void(__fastcall*)(uint8_t*, float*, float*);
 
 static uint8_t* ActiveView() {
@@ -182,6 +213,7 @@ static uint8_t* ActiveView() {
 
 static void __fastcall HookRenderAll() {
     ++g_frames;
+    if (g_xrEyes && g_pace) XrPaceWait();
     if (g_wantCreate.exchange(0)) {
         OffscreenDesc d{};
         d.name = kEyeName;
@@ -206,6 +238,66 @@ static void __fastcall HookRenderAll() {
             for (uint8_t* eye : g_eyes) g_origCameraSubmit(eye, main);
         }
     }
+    if (g_xrEyes) {
+        if (uint8_t* main = ActiveView()) {
+            XrEyePose eye[2];
+            std::lock_guard<std::mutex> l(g_eyesLock);
+            if (g_eyes.size() >= 2 && XrLocate(eye)) {
+                if (!g_haveCentre || g_wantRecenter.exchange(false)) {
+                    // Centre: the head's position and yaw now become the game camera's.
+                    const float cx = (eye[0].px + eye[1].px) * 0.5f, cy = (eye[0].py + eye[1].py) * 0.5f, cz = (eye[0].pz + eye[1].pz) * 0.5f;
+                    g_centre[0] = cx;
+                    g_centre[1] = cy;
+                    g_centre[2] = cz;
+                    const float fx = -2 * (eye[0].qx * eye[0].qz + eye[0].qw * eye[0].qy), fz = -(1 - 2 * (eye[0].qx * eye[0].qx + eye[0].qy * eye[0].qy));
+                    g_centreYaw = atan2f(-fx, -fz);
+                    g_haveCentre = true;
+                    Log("XR eye0 q %.3f %.3f %.3f %.3f p %.3f %.3f %.3f tan L %.3f R %.3f U %.3f D %.3f", eye[0].qx, eye[0].qy, eye[0].qz, eye[0].qw, eye[0].px, eye[0].py, eye[0].pz, eye[0].tanLeft, eye[0].tanRight, eye[0].tanUp, eye[0].tanDown);
+                    Log("XR eye1 q %.3f %.3f %.3f %.3f p %.3f %.3f %.3f tan L %.3f R %.3f U %.3f D %.3f", eye[1].qx, eye[1].qy, eye[1].qz, eye[1].qw, eye[1].px, eye[1].py, eye[1].pz, eye[1].tanLeft, eye[1].tanRight, eye[1].tanUp, eye[1].tanDown);
+                    Log("XR centred at %.3f %.3f %.3f yaw %.3f", cx, cy, cz, g_centreYaw);
+                }
+                float cam[16];
+                memcpy(cam, main, sizeof(cam));
+                const float nearZ = *reinterpret_cast<float*>(main + 0x3f8), farZ = *reinterpret_cast<float*>(main + 0x3fc);
+                float jx = 0, jy = 0;
+                reinterpret_cast<JitterFn>(g_base + kJitter.rva)(main, &jx, &jy);
+                const float cy = cosf(-g_centreYaw), sy = sinf(-g_centreYaw);
+                const float scale = g_worldScale.load();
+                alignas(16) static uint8_t desc[0x600];
+                for (int e = 0; e < 2; ++e) {
+                    const XrEyePose& p = eye[e];
+                    // Head axes in LOCAL space from the quaternion.
+                    const float x = p.qx, y = p.qy, z = p.qz, w = p.qw;
+                    const float ax[3][3] = {
+                        {1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y)},
+                        {2 * (x * y - w * z), 1 - 2 * (x * x + z * z), 2 * (y * z + w * x)},
+                        {2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y)}};
+                    const float dp[3] = {p.px - g_centre[0], p.py - g_centre[1], p.pz - g_centre[2]};
+                    // Recentre around up, then: ref x = camera right, ref y = camera up (minus row 1), ref z = camera back (minus row 2).
+                    auto toWorld = [&](const float v[3], float out[3]) {
+                        const float vx = cy * v[0] + sy * v[2], vz = -sy * v[0] + cy * v[2];
+                        for (int i = 0; i < 3; ++i) out[i] = vx * cam[i] - v[1] * cam[4 + i] - vz * cam[8 + i];
+                    };
+                    float eyePose[16] = {};
+                    float right[3], up[3], back[3], offset[3];
+                    toWorld(ax[0], right);
+                    toWorld(ax[1], up);
+                    toWorld(ax[2], back);
+                    toWorld(dp, offset);
+                    for (int i = 0; i < 3; ++i) {
+                        eyePose[i] = right[i];
+                        eyePose[4 + i] = -up[i];
+                        eyePose[8 + i] = -back[i];
+                        eyePose[12 + i] = cam[12 + i] + offset[i] * scale;
+                    }
+                    eyePose[15] = 1;
+                    reinterpret_cast<LensPerspFn>(g_base + kLensPersp.rva)(desc, nearZ, farZ, p.tanLeft, p.tanRight, p.tanDown, p.tanUp, 0, 0, jx, jy, 0, 0);
+                    reinterpret_cast<LensPoseFn>(g_base + kLensPose.rva)(desc, eyePose);
+                    g_origCameraSubmit(g_eyes[e], desc);
+                }
+            }
+        }
+    }
     if (g_stereo) {
         if (uint8_t* main = ActiveView()) {
             std::lock_guard<std::mutex> l(g_eyesLock);
@@ -224,7 +316,8 @@ static void __fastcall HookRenderAll() {
                     memcpy(eyePose, pose, sizeof(pose));
                     const float side = e == 0 ? -half : half;
                     for (int i = 0; i < 3; ++i) eyePose[12 + i] += pose[i] * side;
-                    reinterpret_cast<LensEdgesFn>(g_base + kLensEdges.rva)(desc, eyePose, nearZ, farZ, -tanX, tanX, tanY, -tanY, jx, jy, 0);
+                    reinterpret_cast<LensPerspFn>(g_base + kLensPersp.rva)(desc, nearZ, farZ, -tanX, tanX, -tanY, tanY, 0, 0, jx, jy, 0, 0);
+                    reinterpret_cast<LensPoseFn>(g_base + kLensPose.rva)(desc, eyePose);
                     g_origCameraSubmit(g_eyes[e], desc);
                 }
             }
@@ -251,12 +344,13 @@ static void __fastcall HookCameraSubmit(uint8_t* view, const uint8_t* desc) {
 }
 
 static void InstallHooks() {
-    if (!Check(kOffscreenRenderAll) || !Check(kCameraSubmit) || !Check(kOffscreenCreate) || !Check(kSceneSubmit) || !Check(kViewCreate) || !Check(kLensEdges) || !Check(kJitter)) return;
+    if (!Check(kOffscreenRenderAll) || !Check(kCameraSubmit) || !Check(kOffscreenCreate) || !Check(kSceneSubmit) || !Check(kViewCreate) || !Check(kLensPersp) || !Check(kLensPose) || !Check(kJitter) || !Check(kBufferSize)) return;
     MH_Initialize();
     MH_CreateHook(g_base + kOffscreenRenderAll.rva, reinterpret_cast<void*>(&HookRenderAll), reinterpret_cast<void**>(&g_origRenderAll));
     MH_CreateHook(g_base + kSceneSubmit.rva, reinterpret_cast<void*>(&HookSceneSubmit), reinterpret_cast<void**>(&g_origSceneSubmit));
     MH_CreateHook(g_base + kCameraSubmit.rva, reinterpret_cast<void*>(&HookCameraSubmit), reinterpret_cast<void**>(&g_origCameraSubmit));
     MH_CreateHook(g_base + kViewCreate.rva, reinterpret_cast<void*>(&HookViewCreate), reinterpret_cast<void**>(&g_origViewCreate));
+    MH_CreateHook(g_base + kBufferSize.rva, reinterpret_cast<void*>(&HookBufferSize), reinterpret_cast<void**>(&g_origBufferSize));
     const MH_STATUS st = MH_EnableHook(MH_ALL_HOOKS);
     Log("HOOKS %s", MH_StatusToString(st));
 }
@@ -364,6 +458,100 @@ static void TexInfo() {
     WalkObject("inner", inner, 0x200);
 }
 
+static void OnPresentForXr() {
+    std::lock_guard<std::mutex> l(g_eyesLock);
+    if (g_eyes.size() < 2) return;
+    void* res[2] = {EyeTexture(g_eyes[0]), EyeTexture(g_eyes[1])};
+    uint32_t st[2] = {};
+    if (res[0] && res[1]) {
+        st[0] = *reinterpret_cast<uint32_t*>(EyeRecord(g_eyes[0]) + 0x28);
+        st[1] = *reinterpret_cast<uint32_t*>(EyeRecord(g_eyes[1]) + 0x28);
+    }
+    XrOnPresent(res, st);
+}
+
+static bool g_xrStarted = false;
+static void StartXr(int percent) {
+    if (g_xrStarted) return;
+    g_xrStarted = true;
+    if (HANDLE t = CreateThread(nullptr, 0, XrStartThread, reinterpret_cast<void*>(static_cast<intptr_t>(percent)), 0, nullptr)) CloseHandle(t);
+}
+
+// Both sticks clicked and held half a second: recenter. Reads the pad through XInput, loaded only here.
+static void PollPad() {
+    using GetStateFn = DWORD(WINAPI*)(DWORD, void*);
+    static GetStateFn get = [] {
+        HMODULE m = LoadLibraryW(L"xinput1_4.dll");
+        return m ? reinterpret_cast<GetStateFn>(GetProcAddress(m, "XInputGetState")) : nullptr;
+    }();
+    if (!get || !g_xrEyes) return;
+    static ULONGLONG since = 0;
+    static bool fired = false;
+    bool held = false;
+    for (DWORD pad = 0; pad < 4 && !held; ++pad) {
+        struct {
+            DWORD packet;
+            WORD buttons;
+            uint8_t rest[10];
+        } st{};
+        if (get(pad, &st) == 0 && (st.buttons & 0x00C0) == 0x00C0) held = true;  // left and right thumb
+    }
+    const ULONGLONG now = GetTickCount64();
+    if (!held) {
+        since = 0;
+        fired = false;
+    } else if (!since) {
+        since = now;
+    } else if (!fired && now - since >= 500) {
+        fired = true;
+        g_wantRecenter = true;
+        Log("PAD both sticks: recenter");
+    }
+}
+
+// Runs on a thread of its own: `xr <scale percent>`.
+static DWORD WINAPI XrStartThread(void* arg) {
+    const int percent = static_cast<int>(reinterpret_cast<intptr_t>(arg));
+    if (!XrInit(g_dir.c_str())) return 0;
+    int w = 0, h = 0;
+    XrRecommended(&w, &h);
+    w = (w * percent / 100 + 7) & ~7;
+    h = (h * percent / 100 + 7) & ~7;
+    Log("XR eye size %dx%d (%d percent of recommended)", w, h, percent);
+    g_forceW = w;
+    g_forceH = h;
+    g_createViewKind = 3;
+    g_createW = w;
+    g_createH = h;
+    g_createKind = 1;
+    for (int i = 0; i < 2; ++i) {
+        g_wantCreate = 1;
+        while (g_wantCreate.load()) Sleep(20);
+        Sleep(1500);
+    }
+    {
+        std::lock_guard<std::mutex> l(g_eyesLock);
+        if (g_eyes.size() < 2) {
+            Log("XR eyes not created");
+            return 0;
+        }
+        for (uint8_t* eye : g_eyes) *reinterpret_cast<uint32_t*>(eye + 0x16cd4) = 0x3fff;
+        void* r = EyeTexture(g_eyes[0]);
+        if (!r) return 0;
+        CaptureSetup(r);
+    }
+    for (int i = 0; i < 500 && !CaptureReady(); ++i) Sleep(20);
+    if (!CaptureReady()) {
+        Log("XR capture not ready");
+        return 0;
+    }
+    if (!XrStartSession(CaptureDevice(), CaptureQueue(), w, h)) return 0;
+    g_xrEyes = true;
+    CaptureSetPresentCallback(&OnPresentForXr);
+    Log("XR running");
+    return 0;
+}
+
 static uint32_t g_w, g_h, g_k;
 static float g_f;
 static char g_text[64];
@@ -380,6 +568,10 @@ static void RunCommand(const std::string& c) {
         g_createKind = g_k;
         g_wantCreate = 1;
     } else if (sscanf(c.c_str(), "viewkind %u", &g_w) == 1) g_createViewKind = g_w;
+    else if (sscanf(c.c_str(), "xr %u", &g_w) == 1) StartXr(g_w);
+    else if (sscanf(c.c_str(), "pace %u", &g_w) == 1) g_pace = g_w != 0;
+    else if (c == "recenter") g_wantRecenter = true;
+    else if (sscanf(c.c_str(), "scale %f", &g_f) == 1) g_worldScale = g_f;
     else if (c == "d3d") {
         std::lock_guard<std::mutex> l(g_eyesLock);
         void* r = g_eyes.empty() ? nullptr : EyeTexture(g_eyes[0]);
@@ -388,6 +580,7 @@ static void RunCommand(const std::string& c) {
     } else if (sscanf(c.c_str(), "stereo %f", &g_f) == 1) {
         g_ipd = g_f;
         g_copyCamera = false;
+        g_xrEyes = false;
         g_stereo = true;
     } else if (sscanf(c.c_str(), "dump %63s", g_text) == 1) DumpEyes(g_text);
     else if (c == "texinfo") TexInfo();
@@ -410,6 +603,13 @@ static DWORD WINAPI ProbeThread(void*) {
     FindSections();
     FindActiveView();
     InstallHooks();
+    const std::wstring ini = g_dir + L"RiftApartVR.ini";
+    const bool autoStart = GetPrivateProfileIntW(L"VR", L"AutoStart", 1, ini.c_str()) != 0;
+    const int resolution = GetPrivateProfileIntW(L"VR", L"Resolution", 50, ini.c_str());
+    g_worldScale = GetPrivateProfileIntW(L"VR", L"WorldScalePercent", 100, ini.c_str()) / 100.0f;
+    g_pace = GetPrivateProfileIntW(L"VR", L"Pace", 1, ini.c_str()) != 0;
+    Log("INI AutoStart %d Resolution %d WorldScale %.2f Pace %d", autoStart ? 1 : 0, resolution, g_worldScale.load(), g_pace.load() ? 1 : 0);
+    ULONGLONG inPlaySince = 0;
     const std::wstring cmdPath = g_dir + L"vrlab_command.txt";
     DeleteFileW(cmdPath.c_str());
     long pos = 0;
@@ -428,6 +628,22 @@ static DWORD WINAPI ProbeThread(void*) {
             fclose(f);
         }
         const ULONGLONG now = GetTickCount64();
+        PollPad();
+        if (autoStart && !g_xrStarted && g_activeViewPtr) {
+            // Start once the game camera has been away from the origin (title and loading sit at 0) for three seconds.
+            void* view = nullptr;
+            float pos[3] = {};
+            const bool read = SafeCopy(&view, g_activeViewPtr, 8) && view && SafeCopy(pos, static_cast<uint8_t*>(view) + 0x30, sizeof(pos));
+            const bool away = read && fabsf(pos[0]) + fabsf(pos[1]) + fabsf(pos[2]) > 1.0f;
+            if (!away) {
+                inPlaySince = 0;
+            } else if (!inPlaySince) {
+                inPlaySince = now;
+            } else if (now - inPlaySince >= 3000) {
+                Log("AUTOSTART camera away from origin for 3 s");
+                StartXr(resolution);
+            }
+        }
         if (now - lastView >= 5000) {
             lastView = now;
             LogView();

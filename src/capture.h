@@ -6,3 +6,8 @@
 void CaptureSetup(void* anyGameResource);
 // Copies these textures to BMP files after the next Present's queued work. False until the setup has finished.
 bool CaptureRequest(void* const* resources, const uint32_t* states, const wchar_t* const* paths, int count);
+bool CaptureReady();
+void* CaptureDevice();
+void* CaptureQueue();
+// Called on the Present thread, before the game's Present.
+void CaptureSetPresentCallback(void (*fn)());
