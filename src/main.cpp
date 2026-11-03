@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 19
+#define BUILD_NUMBER 21
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -355,7 +355,27 @@ static void __fastcall HookRenderAll() {
     g_origRenderAll();
 }
 
+// Resting the flat view: the scene submit returns at once when view +0x11d8 is clear. Set again when not resting.
+static std::atomic<bool> g_restFlat{false};
 static void* __fastcall HookSceneSubmit(uint8_t* view, void* a, uint32_t mask, char b) {
+    if (view == ActiveView()) {
+        static uint8_t saved = 1;
+        static bool resting = false;
+        const bool want = g_restFlat && g_xrEyes;
+        uint8_t* flag = view + 0x11d8;
+        if (want && !resting) {
+            saved = *flag;
+            resting = true;
+            Log("REST flat view, flag was %u", saved);
+        }
+        if (want) {
+            *flag = 0;
+        } else if (resting) {
+            *flag = saved;
+            resting = false;
+            Log("REST flat view off");
+        }
+    }
     {
         std::lock_guard<std::mutex> l(g_statsLock);
         ++g_sceneSubmits[view];
@@ -726,6 +746,7 @@ static void RunCommand(const std::string& c) {
     else if (sscanf(c.c_str(), "tonefix %u", &g_w) == 1) g_toneFix = g_w != 0;
     else if (sscanf(c.c_str(), "keepfocus %u", &g_w) == 1) g_keepFocus = g_w != 0;
     else if (sscanf(c.c_str(), "uicount %u", &g_w) == 1) g_uiCount = static_cast<int>(g_w);
+    else if (sscanf(c.c_str(), "restflat %u", &g_w) == 1) g_restFlat = g_w != 0;
     else if (sscanf(c.c_str(), "novsync %u", &g_w) == 1) CaptureNoVsync(g_w != 0);
     else if (sscanf(c.c_str(), "hud %f %f %f", &g_hud[0], &g_hud[1], &g_hud[2]) == 3) XrSetHud(g_hud[0], g_hud[1], g_hud[2]);
     else if (c == "recenter") g_wantRecenter = true;
