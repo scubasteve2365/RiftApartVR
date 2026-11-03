@@ -625,6 +625,123 @@ static bool MenuRecord(ID3D12GraphicsCommandList* list, XrCompositionLayerQuad* 
     return true;
 }
 
+// ---- aim dot: a ring on its own small swapchain, placed along the aim line ----
+static const int kDotSize = 64;
+static const float kDotDistance = 8.0f, kDotWidth = 0.16f;
+static std::atomic<bool> g_dotOn{false};
+static float g_dotDir[3];
+static std::mutex g_dotLock;
+static UiChain g_dot;
+static ID3D12Resource* g_dotUpload;
+static bool g_dotAcquired, g_dotReady;
+
+void XrSetAimDot(const float* roomDir) {
+    if (!roomDir) {
+        g_dotOn = false;
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> l(g_dotLock);
+        g_dotDir[0] = roomDir[0];
+        g_dotDir[1] = roomDir[1];
+        g_dotDir[2] = roomDir[2];
+    }
+    g_dotOn = true;
+}
+
+static bool DotRecord(ID3D12GraphicsCommandList* list, XrCompositionLayerQuad* out, const PendingPose& pose) {
+    g_dotAcquired = false;
+    if (!g_dotOn || !EnsureUiChain(g_dot, kDotSize, kDotSize)) return false;
+    if (!g_dotUpload) {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = kDotSize * 256;
+        rd.Height = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_dotUpload)))) return false;
+        uint8_t* m = nullptr;
+        if (FAILED(g_dotUpload->Map(0, nullptr, reinterpret_cast<void**>(&m)))) return false;
+        for (int y = 0; y < kDotSize; ++y) {
+            uint32_t* row = reinterpret_cast<uint32_t*>(m + y * 256);
+            for (int x = 0; x < kDotSize; ++x) {
+                const float dx = x + 0.5f - kDotSize / 2.0f, dy = y + 0.5f - kDotSize / 2.0f;
+                const float r = sqrtf(dx * dx + dy * dy);
+                // A bright ring with a dark edge, and a centre point. Premultiplied.
+                const float ring = std::clamp(1.0f - fabsf(r - 24.0f) / 3.0f, 0.0f, 1.0f);
+                const float edge = std::clamp(1.0f - fabsf(r - 24.0f) / 6.0f, 0.0f, 1.0f);
+                const float point = std::clamp(4.0f - r, 0.0f, 1.0f);
+                const float bright = std::max(ring, point);
+                const float alpha = std::max(edge * 0.6f, bright);
+                const uint32_t g = static_cast<uint32_t>(bright * 255), rb = static_cast<uint32_t>(bright * 110), a = static_cast<uint32_t>(alpha * 255);
+                row[x] = (a << 24) | (rb << 16) | (g << 8) | rb;
+            }
+        }
+        g_dotUpload->Unmap(0, nullptr);
+    }
+    if (!g_dotReady) {
+        uint32_t idx = 0;
+        p_xrAcquireSwapchainImage(g_dot.chain, nullptr, &idx);
+        XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+        wi.timeout = 100000000;
+        p_xrWaitSwapchainImage(g_dot.chain, &wi);
+        g_dotAcquired = true;
+        ID3D12Resource* dst = g_dot.images[idx].texture;
+        D3D12_RESOURCE_BARRIER bar{};
+        bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        bar.Transition.pResource = dst;
+        bar.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        bar.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        bar.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        list->ResourceBarrier(1, &bar);
+        D3D12_TEXTURE_COPY_LOCATION d{}, s{};
+        d.pResource = dst;
+        d.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        s.pResource = g_dotUpload;
+        s.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        s.PlacedFootprint.Footprint.Format = static_cast<DXGI_FORMAT>(g_format);
+        s.PlacedFootprint.Footprint.Width = kDotSize;
+        s.PlacedFootprint.Footprint.Height = kDotSize;
+        s.PlacedFootprint.Footprint.Depth = 1;
+        s.PlacedFootprint.Footprint.RowPitch = 256;
+        list->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
+        std::swap(bar.Transition.StateBefore, bar.Transition.StateAfter);
+        list->ResourceBarrier(1, &bar);
+        g_dotReady = true;
+    }
+    float dir[3];
+    {
+        std::lock_guard<std::mutex> l(g_dotLock);
+        memcpy(dir, g_dotDir, sizeof(dir));
+    }
+    const XrPosef& a = pose.views[0].pose;
+    const XrPosef& b = pose.views[1].pose;
+    *out = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+    out->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+    out->space = g_space;
+    out->eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+    out->subImage.swapchain = g_dot.chain;
+    out->subImage.imageRect.extent = {kDotSize, kDotSize};
+    out->pose.position = {(a.position.x + b.position.x) * 0.5f + dir[0] * kDotDistance, (a.position.y + b.position.y) * 0.5f + dir[1] * kDotDistance, (a.position.z + b.position.z) * 0.5f + dir[2] * kDotDistance};
+    // Faces back along the line: yaw first, then pitch.
+    const float yaw = atan2f(-dir[0], -dir[2]), pitch = asinf(std::clamp(dir[1], -1.0f, 1.0f));
+    const float cy = cosf(yaw * 0.5f), sy = sinf(yaw * 0.5f), cp = cosf(pitch * 0.5f), sp = sinf(pitch * 0.5f);
+    out->pose.orientation = {cy * sp, sy * cp, -sy * sp, cy * cp};
+    out->size = {kDotWidth, kDotWidth};
+    return true;
+}
+
+static void DotRelease() {
+    if (!g_dotAcquired) return;
+    XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    p_xrReleaseSwapchainImage(g_dot.chain, &ri);
+    g_dotAcquired = false;
+}
+
 static void MenuRelease() {
     if (!g_menuAcquired) return;
     XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
@@ -901,6 +1018,8 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
     }
     XrCompositionLayerQuad menuLayer{XR_TYPE_COMPOSITION_LAYER_QUAD};
     const bool haveMenu = MenuRecord(list, &menuLayer);
+    XrCompositionLayerQuad dotLayer{XR_TYPE_COMPOSITION_LAYER_QUAD};
+    const bool haveDot = !g_cinema && DotRecord(list, &dotLayer, pose);
     list->Close();
     ID3D12CommandList* lists[] = {list};
     g_queue->ExecuteCommandLists(1, lists);
@@ -908,6 +1027,7 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
     g_ringValue[g_ringIndex] = g_fenceValue;
     g_ringIndex = (g_ringIndex + 1) % kRing;
     MenuRelease();
+    DotRelease();
     for (int e = 0; e < 2; ++e) {
         XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         p_xrReleaseSwapchainImage(g_chain[e], &ri);
@@ -922,7 +1042,7 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
     layer.space = g_space;
     layer.viewCount = 2;
     layer.views = pv;
-    const XrCompositionLayerBaseHeader* layers[3 + kUiSlots];
+    const XrCompositionLayerBaseHeader* layers[4 + kUiSlots];
     uint32_t layerCount = 0;
     XrCompositionLayerQuad cinema[2];
     if (g_cinema) {
@@ -944,6 +1064,7 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
         layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer);
     }
     for (uint32_t i = 0; i < quadCount; ++i) layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&quads[i]);
+    if (haveDot) layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&dotLayer);
     if (haveMenu) layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&menuLayer);
     XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
     ei.displayTime = g_openTime;

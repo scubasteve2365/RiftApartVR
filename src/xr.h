@@ -37,6 +37,8 @@ void XrMenuShow(const uint32_t* rgba, int width, int height);
 void XrMenuHide();
 // Game thread: cutscene now. Each eye's image goes on a screen fixed in the room instead of filling the view.
 void XrSetCinema(bool on);
+// Game thread: a small dot along this direction in room space, from the head, while aiming. Null hides it.
+void XrSetAimDot(const float* roomDir);
 // Lab only: replace what the headset reports, so head movement and lens shape can be tested without a headset.
 // Degrees and metres. Positive yaw turns left, positive pitch looks up, as OpenXR rotates.
 void XrFakeHead(bool on, float yaw, float pitch, float roll, float x, float y, float z, float ipd);

@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 37
+#define BUILD_NUMBER 39
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -374,6 +374,9 @@ static const size_t kCinematicOthers[] = {0x512cf1c, 0x512f770, 0x513195c, 0x5f3
 static std::atomic<bool> g_cinemaOn{true};
 static std::atomic<bool> g_cinemaNow{false};
 static std::atomic<float> g_cinemaIpd{0.03f};
+// 0 off, 1 while aiming, 2 always.
+static std::atomic<int> g_aimDot{1};
+static float g_aimRoom[3];
 static void UpdateMode() {
     uint8_t* main = ActiveView();
     bool world = false;
@@ -516,6 +519,24 @@ static void __fastcall HookRenderAll() {
                     memcpy(cam, level, sizeof(level));
                 }
                 const float nearZ = *reinterpret_cast<float*>(main + 0x3f8), farZ = *reinterpret_cast<float*>(main + 0x3fc);
+                {
+                    // The game aims along its camera's forward row. In the room: undo the level frame, then the centring.
+                    const float* real = reinterpret_cast<const float*>(main);
+                    const float d0 = real[8], d1 = real[9], d2 = real[10];
+                    const float vx = d0 * cam[0] + d1 * cam[1] + d2 * cam[2];
+                    const float vy = -(d0 * cam[4] + d1 * cam[5] + d2 * cam[6]);
+                    const float vz = -(d0 * cam[8] + d1 * cam[9] + d2 * cam[10]);
+                    const float yc = cosf(-g_centreYaw), ys = sinf(-g_centreYaw);
+                    const float room[3] = {yc * vx - ys * vz, vy, ys * vx + yc * vz};
+                    const float* lensNow = reinterpret_cast<const float*>(main + 0x1c0);
+                    const double lens = lensNow[5] != 0 ? 2.0 * atan(1.0 / fabs(lensNow[5])) * 57.29577951 : 0;
+                    const bool aiming = fabs(lens - 32.64) < 0.5;
+                    const int dot = g_aimDot.load();
+                    XrSetAimDot(!g_cinemaNow && (dot == 2 || (dot == 1 && aiming)) ? room : nullptr);
+                    g_aimRoom[0] = room[0];
+                    g_aimRoom[1] = room[1];
+                    g_aimRoom[2] = room[2];
+                }
                 float jx = 0, jy = 0;
                 reinterpret_cast<JitterFn>(g_base + kJitter.rva)(main, &jx, &jy);
                 {
@@ -880,7 +901,7 @@ static int g_dlssPercentSetting = 67;  // 0 means no DLSS in the eyes: the game'
 static float g_hudDistanceSetting = 2.0f;
 static std::wstring g_iniPath;
 static std::vector<uint32_t> g_menuImage;
-static const int kMenuW = 1024, kMenuH = 840, kMenuRows = 9;
+static const int kMenuW = 1024, kMenuH = 912, kMenuRows = 10;
 
 static void SaveSetting(const wchar_t* name, int value) {
     WritePrivateProfileStringW(L"VR", name, std::to_wstring(value).c_str(), g_iniPath.c_str());
@@ -919,6 +940,10 @@ static void MenuRowText(int row, wchar_t (&name)[64], wchar_t (&value)[32]) {
         wcscpy_s(name, L"Cutscenes on a screen");
         wcscpy_s(value, g_cinemaOn ? L"On" : L"Off");
         break;
+    case 8:
+        wcscpy_s(name, L"Aim dot");
+        wcscpy_s(value, g_aimDot == 0 ? L"Off" : g_aimDot == 1 ? L"While aiming" : L"Always");
+        break;
     default: wcscpy_s(name, L"Close"); break;
     }
 }
@@ -945,29 +970,44 @@ static void MenuDraw() {
         FillRect(dc, &rc, br);
         DeleteObject(br);
     };
-    fill(0, 0, kMenuW, kMenuH, RGB(20, 16, 44));
-    fill(0, 0, kMenuW, 8, RGB(60, 210, 230));
-    HFONT big = CreateFontW(56, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
-    HFONT mid = CreateFontW(38, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
-    HFONT small = CreateFontW(28, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
+    // After the game's Options screen: deep blue, a slanted title tab, cyan highlight, a thin line under each row.
+    for (int y = 0; y < kMenuH; ++y) {
+        const int t = y * 255 / kMenuH;
+        fill(0, y, kMenuW, y + 1, RGB(8 + t / 40, 14 + t / 18, 52 + t / 5));
+    }
+    {
+        const POINT tab[] = {{0, 26}, {kMenuW - 330, 26}, {kMenuW - 290, 66}, {kMenuW - 290, 96}, {0, 96}};
+        HBRUSH br = CreateSolidBrush(RGB(14, 72, 142));
+        HGDIOBJ oldBrush = SelectObject(dc, br);
+        HGDIOBJ oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
+        Polygon(dc, tab, 5);
+        SelectObject(dc, oldBrush);
+        SelectObject(dc, oldPen);
+        DeleteObject(br);
+    }
+    fill(0, 96, kMenuW, 99, RGB(40, 216, 232));
+    HFONT big = CreateFontW(50, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Bahnschrift");
+    HFONT mid = CreateFontW(36, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Bahnschrift");
+    HFONT small = CreateFontW(28, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Bahnschrift");
     SetBkMode(dc, TRANSPARENT);
     HGDIOBJ oldFont = SelectObject(dc, big);
     SetTextColor(dc, RGB(255, 255, 255));
-    RECT title{44, 26, kMenuW - 44, 100};
-    DrawTextW(dc, L"Rift Apart VR", -1, &title, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    RECT title{44, 30, kMenuW - 300, 92};
+    DrawTextW(dc, L"VR OPTIONS", -1, &title, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
     SelectObject(dc, mid);
     for (int i = 0; i < kMenuRows; ++i) {
         const int top = 116 + i * 72;
-        if (i == g_menuRow) fill(28, top, kMenuW - 28, top + 64, RGB(60, 210, 230));
+        if (i == g_menuRow) fill(28, top, kMenuW - 28, top + 66, RGB(40, 216, 232));
+        else fill(48, top + 68, kMenuW - 48, top + 69, RGB(40, 78, 130));
         wchar_t name[64], value[32];
         MenuRowText(i, name, value);
-        SetTextColor(dc, i == g_menuRow ? RGB(12, 10, 30) : RGB(235, 235, 245));
-        RECT a{48, top, kMenuW - 48, top + 64};
+        SetTextColor(dc, i == g_menuRow ? RGB(8, 22, 52) : RGB(214, 228, 245));
+        RECT a{48, top, kMenuW - 48, top + 66};
         DrawTextW(dc, name, -1, &a, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
         DrawTextW(dc, value, -1, &a, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
     }
     SelectObject(dc, small);
-    SetTextColor(dc, RGB(170, 170, 195));
+    SetTextColor(dc, RGB(150, 182, 214));
     RECT help{44, kMenuH - 62, kMenuW - 44, kMenuH - 12};
     DrawTextW(dc, L"D-pad: choose and change     A: select     B: close", -1, &help, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     GdiFlush();
@@ -1047,6 +1087,10 @@ static void MenuChange(int dir) {
     case 7:
         g_cinemaOn = !g_cinemaOn;
         SaveSetting(L"CutsceneScreen", g_cinemaOn ? 1 : 0);
+        break;
+    case 8:
+        g_aimDot = (g_aimDot.load() + (dir < 0 ? 2 : 1)) % 3;
+        SaveSetting(L"AimDot", g_aimDot.load());
         break;
     default:
         if (dir == 0) {
@@ -1261,7 +1305,7 @@ static void PollPad() {
         } else if (i == kLeft || i == kRight) {
             MenuChange(i == kLeft ? -1 : 1);
         } else if (i == kA) {
-            if (g_menuRow == 0 || g_menuRow == 2 || g_menuRow == 6 || g_menuRow == 7 || g_menuRow == kMenuRows - 1) MenuChange(0);
+            if (g_menuRow == 0 || g_menuRow == 2 || g_menuRow == 6 || g_menuRow == 7 || g_menuRow == 8 || g_menuRow == kMenuRows - 1) MenuChange(0);
         } else {
             MenuClose();
         }
@@ -1609,6 +1653,12 @@ static void RunCommand(const std::string& c) {
     else if (sscanf(c.c_str(), "level %u", &g_w) == 1) g_levelCamera = g_w != 0;
     else if (sscanf(c.c_str(), "lensfix %u", &g_w) == 1) g_lensFix = g_w != 0;
     else if (sscanf(c.c_str(), "cinemaipd %f", &g_f) == 1) g_cinemaIpd = g_f;
+    else if (sscanf(c.c_str(), "aimdot %u", &g_w) == 1) g_aimDot = static_cast<int>(g_w);
+    else if (c == "aiminfo") {
+        uint8_t* m = ActiveView();
+        const float* v = m ? reinterpret_cast<const float*>(m) : nullptr;
+        if (v) Log("AIM room %.4f %.4f %.4f camera forward %.4f %.4f %.4f", g_aimRoom[0], g_aimRoom[1], g_aimRoom[2], v[8], v[9], v[10]);
+    }
     else if (sscanf(c.c_str(), "cinema %u", &g_w) == 1) g_cinemaOn = g_w != 0;
     else if (c == "padinfo") {
         Log("PADINFO WGI gamepad reads %u, raw reads %u, blocked %u", g_wgiGamepadCalls.load(), g_wgiRawCalls.load(), g_wgiBlocked.load());
@@ -1768,6 +1818,7 @@ static DWORD WINAPI ProbeThread(void*) {
     g_skipLauncherSetting = GetPrivateProfileIntW(L"VR", L"SkipLauncher", 1, ini.c_str()) != 0;
     g_dlssPercentSetting = g_eyeDlss ? g_eyeRenderPercent.load() : 0;
     g_cinemaOn = GetPrivateProfileIntW(L"VR", L"CutsceneScreen", 1, ini.c_str()) != 0;
+    g_aimDot = static_cast<int>(GetPrivateProfileIntW(L"VR", L"AimDot", 1, ini.c_str()));
     g_skipLauncher = g_skipLauncherSetting;
     InstallSlProbe();
     if (GetPrivateProfileIntW(L"VR", L"VtProbe", 0, ini.c_str())) {
