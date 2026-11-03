@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 21
+#define BUILD_NUMBER 23
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -146,11 +146,13 @@ using RenderAllFn = void(__fastcall*)();
 using CameraSubmitFn = void(__fastcall*)(uint8_t*, const uint8_t*);
 using OffscreenCreateFn = uint8_t*(__fastcall*)(uint8_t*, OffscreenDesc*);
 static const char kEyeName[] = "RiftApartVR eye test";
+static std::atomic<ULONGLONG> g_rebuildTick{0};
 static std::atomic<uint32_t> g_createViewKind{0};  // 3 makes the engine treat the view as a child of the main view
 using ViewCreateFn = void(__fastcall*)(uint8_t*, const char*, void*, void*, void*, uint64_t, void*, uint32_t);
 static ViewCreateFn g_origViewCreate;
 static uint8_t* ActiveView();
 static void __fastcall HookViewCreate(uint8_t* view, const char* name, void* buffers, void* a4, void* a5, uint64_t kind, void* parent, uint32_t a8) {
+    if (name == kEyeName) g_rebuildTick = GetTickCount64();
     if (name == kEyeName && g_createViewKind != 0) {
         kind = g_createViewKind == 9 ? 0 : g_createViewKind.load();
         if (kind == 3) parent = ActiveView();
@@ -190,6 +192,11 @@ static void* __fastcall HookTone(void* a, void* b, void* c, uint8_t* view, void*
         uint8_t* owner = *reinterpret_cast<uint8_t**>(view + 0x1ff8);
         if (owner && (owner == g_eyeA.load() || owner == g_eyeB.load())) generic = 0;
     }
+    if (view) {
+        // The render thread's copy of the view holds the camera this image was drawn with.
+        uint8_t* owner = *reinterpret_cast<uint8_t**>(view + 0x1ff8);
+        if (owner && owner == g_eyeA.load()) XrMarkRendered(reinterpret_cast<const float*>(view + 0x30));
+    }
     return g_origTone(a, b, c, view, e, generic);
 }
 
@@ -211,8 +218,10 @@ static std::mutex g_eyesLock;
 static std::atomic<bool> g_copyCamera{false};
 static std::atomic<bool> g_stereo{false};
 static std::atomic<float> g_ipd{0.064f};
-static std::atomic<bool> g_xrEyes{false}, g_wantRecenter{false}, g_pace{true}, g_shareLum{false}, g_shareFog{false};
+static std::atomic<bool> g_xrEyes{false}, g_wantRecenter{false}, g_pace{true}, g_shareLum{false};
 static std::atomic<float> g_worldScale{1.0f};
+static std::atomic<bool> g_levelCamera{true};
+static float g_lastFacing[2] = {0, 1};
 static bool g_haveCentre = false;
 static float g_centre[3], g_centreYaw;
 // Off-centre perspective from edges, then the pose: the same two steps the game's own camera builders end with.
@@ -254,19 +263,6 @@ static void __fastcall HookRenderAll() {
             for (uint8_t* eye : g_eyes) g_origCameraSubmit(eye, main);
         }
     }
-    if (g_shareLum) {
-        if (uint8_t* main = ActiveView()) {
-            // The eyes read the main view's Adapted Lum, so both have the exposure the game chose for its own view.
-            std::lock_guard<std::mutex> l(g_eyesLock);
-            for (uint8_t* eye : g_eyes) memcpy(eye + 0x1740, main + 0x1740, 0x38);
-        }
-    }
-    if (g_shareFog) {
-        if (uint8_t* main = ActiveView()) {
-            std::lock_guard<std::mutex> l(g_eyesLock);
-            for (uint8_t* eye : g_eyes) memcpy(eye + 0x1030, main + 0x1030, 0x30);
-        }
-    }
     if (g_xrEyes) {
         if (uint8_t* main = ActiveView()) {
             XrEyePose eye[2];
@@ -287,6 +283,22 @@ static void __fastcall HookRenderAll() {
                 }
                 float cam[16];
                 memcpy(cam, main, sizeof(cam));
+                if (g_levelCamera) {
+                    // A solid, level world: keep only the direction the camera faces. Its pitch and roll never reach the head.
+                    float fx = cam[8], fz = cam[10];
+                    const float len = sqrtf(fx * fx + fz * fz);
+                    if (len > 0.05f) {
+                        fx /= len;
+                        fz /= len;
+                        g_lastFacing[0] = fx;
+                        g_lastFacing[1] = fz;
+                    } else {
+                        fx = g_lastFacing[0];
+                        fz = g_lastFacing[1];
+                    }
+                    const float level[12] = {-fz, 0, fx, 0, 0, -1, 0, 0, fx, 0, fz, 0};
+                    memcpy(cam, level, sizeof(level));
+                }
                 const float nearZ = *reinterpret_cast<float*>(main + 0x3f8), farZ = *reinterpret_cast<float*>(main + 0x3fc);
                 float jx = 0, jy = 0;
                 reinterpret_cast<JitterFn>(g_base + kJitter.rva)(main, &jx, &jy);
@@ -320,6 +332,7 @@ static void __fastcall HookRenderAll() {
                         eyePose[12 + i] = cam[12 + i] + offset[i] * scale;
                     }
                     eyePose[15] = 1;
+                    if (e == 0) XrTagPose(eyePose + 12);
                     reinterpret_cast<LensPerspFn>(g_base + kLensPersp.rva)(desc, nearZ, farZ, p.tanLeft, p.tanRight, p.tanDown, p.tanUp, 0, 0, jx, jy, 0, 0);
                     reinterpret_cast<LensPoseFn>(g_base + kLensPose.rva)(desc, eyePose);
                     g_origCameraSubmit(g_eyes[e], desc);
@@ -380,6 +393,17 @@ static void* __fastcall HookSceneSubmit(uint8_t* view, void* a, uint32_t mask, c
         std::lock_guard<std::mutex> l(g_statsLock);
         ++g_sceneSubmits[view];
         g_sceneMask[view] = mask;
+    }
+    // Eyes read the main view's Adapted Lum, so they have the exposure the game chose. The handle is only lent while
+    // the scene submit copies the view into its job: if it stayed, rebuilding an eye would free the main view's buffer.
+    uint8_t* main = g_shareLum ? ActiveView() : nullptr;
+    if (main && view != main && (view == g_eyeA.load() || view == g_eyeB.load())) {
+        uint8_t saved[0x38];
+        memcpy(saved, view + 0x1740, sizeof(saved));
+        memcpy(view + 0x1740, main + 0x1740, sizeof(saved));
+        void* r = g_origSceneSubmit(view, a, mask, b);
+        memcpy(view + 0x1740, saved, sizeof(saved));
+        return r;
     }
     return g_origSceneSubmit(view, a, mask, b);
 }
@@ -574,15 +598,17 @@ static std::atomic<int> g_uiCount{3};
 static void OnPresentForXr() {
     std::lock_guard<std::mutex> l(g_eyesLock);
     if (g_eyes.size() < 2) return;
-    void* res[2] = {EyeTexture(g_eyes[0]), EyeTexture(g_eyes[1])};
+    // The engine rebuilds eye textures when graphics settings change. Send nothing until that has settled.
+    const bool rebuilding = GetTickCount64() - g_rebuildTick.load() < 1500;
+    void* res[2] = {rebuilding ? nullptr : EyeTexture(g_eyes[0]), rebuilding ? nullptr : EyeTexture(g_eyes[1])};
     uint32_t st[2] = {};
     if (res[0] && res[1]) {
-        st[0] = *reinterpret_cast<uint32_t*>(EyeRecord(g_eyes[0]) + 0x28);
-        st[1] = *reinterpret_cast<uint32_t*>(EyeRecord(g_eyes[1]) + 0x28);
+        SafeCopy(&st[0], EyeRecord(g_eyes[0]) + 0x28, 4);
+        SafeCopy(&st[1], EyeRecord(g_eyes[1]) + 0x28, 4);
     }
     XrUiImage ui[3] = {};
     const int ids[3] = {0, 3, 4};  // UI views the size of the screen: 0 and 4 not yet identified, 3 the pause menu
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 3 && !rebuilding; ++i) {
         uint8_t* tex = UiTexture(ids[i], &ui[i].width, &ui[i].height);
         if (tex) ui[i].resource = TextureResource(tex, &ui[i].state);
     }
@@ -742,9 +768,9 @@ static void RunCommand(const std::string& c) {
     else if (sscanf(c.c_str(), "xr %u", &g_w) == 1) StartXr(g_w);
     else if (sscanf(c.c_str(), "pace %u", &g_w) == 1) g_pace = g_w != 0;
     else if (sscanf(c.c_str(), "sharelum %u", &g_w) == 1) g_shareLum = g_w != 0;
-    else if (sscanf(c.c_str(), "sharefog %u", &g_w) == 1) g_shareFog = g_w != 0;
     else if (sscanf(c.c_str(), "tonefix %u", &g_w) == 1) g_toneFix = g_w != 0;
     else if (sscanf(c.c_str(), "keepfocus %u", &g_w) == 1) g_keepFocus = g_w != 0;
+    else if (sscanf(c.c_str(), "level %u", &g_w) == 1) g_levelCamera = g_w != 0;
     else if (sscanf(c.c_str(), "uicount %u", &g_w) == 1) g_uiCount = static_cast<int>(g_w);
     else if (sscanf(c.c_str(), "restflat %u", &g_w) == 1) g_restFlat = g_w != 0;
     else if (sscanf(c.c_str(), "novsync %u", &g_w) == 1) CaptureNoVsync(g_w != 0);
@@ -786,8 +812,9 @@ static DWORD WINAPI ProbeThread(void*) {
     InstallHooks();
     const std::wstring ini = g_dir + L"RiftApartVR.ini";
     const bool autoStart = GetPrivateProfileIntW(L"VR", L"AutoStart", 1, ini.c_str()) != 0;
-    const int resolution = GetPrivateProfileIntW(L"VR", L"Resolution", 50, ini.c_str());
-    g_worldScale = GetPrivateProfileIntW(L"VR", L"WorldScalePercent", 100, ini.c_str()) / 100.0f;
+    const int resolution = GetPrivateProfileIntW(L"VR", L"Resolution", 100, ini.c_str());
+    g_worldScale = GetPrivateProfileIntW(L"VR", L"WorldScalePercent", 300, ini.c_str()) / 100.0f;
+    g_levelCamera = GetPrivateProfileIntW(L"VR", L"LevelCamera", 1, ini.c_str()) != 0;
     g_pace = GetPrivateProfileIntW(L"VR", L"Pace", 1, ini.c_str()) != 0;
     Log("INI AutoStart %d Resolution %d WorldScale %.2f Pace %d", autoStart ? 1 : 0, resolution, g_worldScale.load(), g_pace.load() ? 1 : 0);
     ULONGLONG inPlaySince = 0;

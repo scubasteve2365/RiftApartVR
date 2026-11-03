@@ -166,13 +166,39 @@ static uint64_t NowUs() {
     return static_cast<uint64_t>(c.QuadPart * 1000000 / f.QuadPart);
 }
 
+// Each game frame's head pose, kept until the image drawn from it reaches Present. The layer must carry the pose the
+// image was drawn with, or the runtime reprojects by the difference and the world swims.
 struct PendingPose {
     XrView views[2];
+    uint64_t serial;
+    float worldPos[3];
 };
-static const int kPoses = 8;
+static const int kPoses = 16;
 static PendingPose g_poses[kPoses];
-static int g_poseHead, g_poseCount;
+static uint64_t g_poseSerial;
+static uint64_t g_renderedSerial, g_usedSerial;
 static std::mutex g_poseLock;
+static std::atomic<uint64_t> g_unmatched{0}, g_ageSum{0};
+
+void XrTagPose(const float worldPos[3]) {
+    std::lock_guard<std::mutex> l(g_poseLock);
+    PendingPose& p = g_poses[g_poseSerial % kPoses];
+    p.worldPos[0] = worldPos[0];
+    p.worldPos[1] = worldPos[1];
+    p.worldPos[2] = worldPos[2];
+}
+
+void XrMarkRendered(const float worldPos[3]) {
+    std::lock_guard<std::mutex> l(g_poseLock);
+    for (uint64_t s = g_poseSerial; s > 0 && s + kPoses > g_poseSerial; --s) {
+        const PendingPose& p = g_poses[s % kPoses];
+        if (p.serial == s && p.worldPos[0] == worldPos[0] && p.worldPos[1] == worldPos[1] && p.worldPos[2] == worldPos[2]) {
+            if (s > g_renderedSerial) g_renderedSerial = s;
+            return;
+        }
+    }
+    ++g_unmatched;
+}
 
 bool XrLocate(XrEyePose out[2]) {
     const XrTime t = g_predicted;
@@ -200,11 +226,11 @@ bool XrLocate(XrEyePose out[2]) {
         out[e].tanDown = tanf(v[e].fov.angleDown);
     }
     std::lock_guard<std::mutex> l(g_poseLock);
-    const int slot = (g_poseHead + g_poseCount) % kPoses;
-    g_poses[slot].views[0] = v[0];
-    g_poses[slot].views[1] = v[1];
-    if (g_poseCount < kPoses) ++g_poseCount;
-    else g_poseHead = (g_poseHead + 1) % kPoses;
+    ++g_poseSerial;
+    PendingPose& p = g_poses[g_poseSerial % kPoses];
+    p.views[0] = v[0];
+    p.views[1] = v[1];
+    p.serial = g_poseSerial;
     return true;
 }
 
@@ -297,7 +323,7 @@ static DWORD WINAPI XrWorker(void*) {
             static uint64_t lastN = 0;
             const uint64_t dn = n - lastN ? n - lastN : 1;
             lastN = n;
-            Log("XRSTAT state %d period %.2f ms with images %llu empty %llu not ready %llu; per image us: wait frame %llu, image waits %llu, xrEndFrame %llu, whole present step %llu", g_state.load(), g_periodNs.load() / 1e6, n, g_endedEmpty.load(), g_notReady.load(), g_usWaitFrame.exchange(0) / dn, g_usWaitImage.exchange(0) / dn, g_usEnd.exchange(0) / dn, g_usPresent.exchange(0) / dn);
+            Log("XRSTAT state %d period %.2f ms with images %llu empty %llu not ready %llu unmatched %llu pose age x100 %llu; per image us: wait frame %llu, image waits %llu, xrEndFrame %llu, whole present step %llu", g_state.load(), g_periodNs.load() / 1e6, n, g_endedEmpty.load(), g_notReady.load(), g_unmatched.load(), g_ageSum.exchange(0) * 100 / dn, g_usWaitFrame.exchange(0) / dn, g_usWaitImage.exchange(0) / dn, g_usEnd.exchange(0) / dn, g_usPresent.exchange(0) / dn);
         }
     }
 }
@@ -440,14 +466,24 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
     bool havePose = false;
     {
         std::lock_guard<std::mutex> pl(g_poseLock);
-        if (g_poseCount > 0) {
-            pose = g_poses[g_poseHead];
-            g_poseHead = (g_poseHead + 1) % kPoses;
-            --g_poseCount;
+        if (g_renderedSerial > g_usedSerial && g_poses[g_renderedSerial % kPoses].serial == g_renderedSerial) {
+            pose = g_poses[g_renderedSerial % kPoses];
+            g_ageSum += g_poseSerial - g_renderedSerial;
+            g_usedSerial = g_renderedSerial;
             havePose = true;
         }
     }
-    if (!g_should || !havePose || !resources[0] || !resources[1]) {
+    if (!resources[0] || !resources[1]) {
+        EndEmpty(g_openTime);
+        g_open = false;
+        return;
+    }
+    if (!havePose) {
+        // No new image yet. Leave the frame open for the next Present: the worker ends it if nothing comes.
+        ++g_notReady;
+        return;
+    }
+    if (!g_should || !resources[0] || !resources[1]) {
         EndEmpty(g_openTime);
         g_open = false;
         return;
