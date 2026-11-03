@@ -62,16 +62,21 @@ static void WriteBmp(const std::wstring& path, const uint8_t* data, UINT pitch, 
     fwrite(&fh, sizeof(fh), 1, f);
     fwrite(&ih, sizeof(ih), 1, f);
     std::vector<uint8_t> line(row);
+    uint32_t alphaMax = 0;
+    uint64_t alphaSum = 0;
     for (UINT y = 0; y < h; ++y) {
         const uint8_t* s = data + y * pitch;
         for (UINT x = 0; x < w; ++x) {
             line[x * 3] = s[x * 4 + 2];
             line[x * 3 + 1] = s[x * 4 + 1];
             line[x * 3 + 2] = s[x * 4];
+            alphaMax = s[x * 4 + 3] > alphaMax ? s[x * 4 + 3] : alphaMax;
+            alphaSum += s[x * 4 + 3];
         }
         fwrite(line.data(), row, 1, f);
     }
     fclose(f);
+    Log("DUMP %ux%u alpha max %u mean %.2f", w, h, alphaMax, static_cast<double>(alphaSum) / (static_cast<double>(w) * h));
 }
 
 // On the Present thread, after the game has queued this frame's work, so the copies land after both eyes' draws.

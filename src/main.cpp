@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 10
+#define BUILD_NUMBER 15
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -119,6 +119,7 @@ static const Target kLensPersp{"LensPersp", 0x1213240, "\x48\x8b\xc4\x48\x89\x58
 static const Target kLensPose{"LensPose", 0x1214150, "\x40\x53\x48\x83\xec\x60\x0f\x10\x02\x48\x8b\xd9\x0f\x11"};
 static const Target kJitter{"Jitter", 0x1234030, "\x48\x89\x5c\x24\x08\x48\x89\x74\x24\x10\x48\x89\x7c\x24\x18\x41\x56"};
 static const Target kBufferSize{"BufferSize", 0x120c2e0, "\x48\x89\x5c\x24\x08\x48\x89\x74\x24\x10\x48\x89\x7c\x24\x18\x55\x41\x54"};
+static const Target kTone{"Tone", 0x11dc080, "\x48\x8b\xc4\x48\x89\x50\x10\x55\x53\x56\x57\x41"};
 static const size_t kManager = 0x6739a10;
     // ViewContextManager
 static const size_t kShowSlot = 0x5339598;   // the game draws this offscreen slot over the active view
@@ -179,6 +180,19 @@ static void __fastcall HookBufferSize(uint8_t* buffers, const char* name, uint32
     }
 }
 
+// The tone mapper gives views with a negative id (+0xf90, all offscreen views) a plainer treatment. Eyes want the main view's.
+using ToneFn = void*(__fastcall*)(void*, void*, void*, uint8_t*, void*, uint64_t);
+static ToneFn g_origTone;
+static std::atomic<bool> g_toneFix{true};
+static std::atomic<uint8_t*> g_eyeA{nullptr}, g_eyeB{nullptr};
+static void* __fastcall HookTone(void* a, void* b, void* c, uint8_t* view, void* e, uint64_t generic) {
+    if (g_toneFix && view) {
+        uint8_t* owner = *reinterpret_cast<uint8_t**>(view + 0x1ff8);
+        if (owner && (owner == g_eyeA.load() || owner == g_eyeB.load())) generic = 0;
+    }
+    return g_origTone(a, b, c, view, e, generic);
+}
+
 static SceneSubmitFn g_origSceneSubmit;
 static RenderAllFn g_origRenderAll;
 static CameraSubmitFn g_origCameraSubmit;
@@ -197,7 +211,7 @@ static std::mutex g_eyesLock;
 static std::atomic<bool> g_copyCamera{false};
 static std::atomic<bool> g_stereo{false};
 static std::atomic<float> g_ipd{0.064f};
-static std::atomic<bool> g_xrEyes{false}, g_wantRecenter{false}, g_pace{true};
+static std::atomic<bool> g_xrEyes{false}, g_wantRecenter{false}, g_pace{true}, g_shareLum{false}, g_shareFog{false};
 static std::atomic<float> g_worldScale{1.0f};
 static bool g_haveCentre = false;
 static float g_centre[3], g_centreYaw;
@@ -229,6 +243,8 @@ static void __fastcall HookRenderAll() {
         Log("EYE created %p %ux%u kind %u", eye, d.width, d.height, d.kind);
         if (eye) {
             std::lock_guard<std::mutex> l(g_eyesLock);
+            if (g_eyes.empty()) g_eyeA = eye;
+            else if (g_eyes.size() == 1) g_eyeB = eye;
             g_eyes.push_back(eye);
         }
     }
@@ -236,6 +252,19 @@ static void __fastcall HookRenderAll() {
         if (uint8_t* main = ActiveView()) {
             std::lock_guard<std::mutex> l(g_eyesLock);
             for (uint8_t* eye : g_eyes) g_origCameraSubmit(eye, main);
+        }
+    }
+    if (g_shareLum) {
+        if (uint8_t* main = ActiveView()) {
+            // The eyes read the main view's Adapted Lum, so both have the exposure the game chose for its own view.
+            std::lock_guard<std::mutex> l(g_eyesLock);
+            for (uint8_t* eye : g_eyes) memcpy(eye + 0x1740, main + 0x1740, 0x38);
+        }
+    }
+    if (g_shareFog) {
+        if (uint8_t* main = ActiveView()) {
+            std::lock_guard<std::mutex> l(g_eyesLock);
+            for (uint8_t* eye : g_eyes) memcpy(eye + 0x1030, main + 0x1030, 0x30);
         }
     }
     if (g_xrEyes) {
@@ -344,12 +373,13 @@ static void __fastcall HookCameraSubmit(uint8_t* view, const uint8_t* desc) {
 }
 
 static void InstallHooks() {
-    if (!Check(kOffscreenRenderAll) || !Check(kCameraSubmit) || !Check(kOffscreenCreate) || !Check(kSceneSubmit) || !Check(kViewCreate) || !Check(kLensPersp) || !Check(kLensPose) || !Check(kJitter) || !Check(kBufferSize)) return;
+    if (!Check(kOffscreenRenderAll) || !Check(kCameraSubmit) || !Check(kOffscreenCreate) || !Check(kSceneSubmit) || !Check(kViewCreate) || !Check(kLensPersp) || !Check(kLensPose) || !Check(kJitter) || !Check(kBufferSize) || !Check(kTone)) return;
     MH_Initialize();
     MH_CreateHook(g_base + kOffscreenRenderAll.rva, reinterpret_cast<void*>(&HookRenderAll), reinterpret_cast<void**>(&g_origRenderAll));
     MH_CreateHook(g_base + kSceneSubmit.rva, reinterpret_cast<void*>(&HookSceneSubmit), reinterpret_cast<void**>(&g_origSceneSubmit));
     MH_CreateHook(g_base + kCameraSubmit.rva, reinterpret_cast<void*>(&HookCameraSubmit), reinterpret_cast<void**>(&g_origCameraSubmit));
     MH_CreateHook(g_base + kViewCreate.rva, reinterpret_cast<void*>(&HookViewCreate), reinterpret_cast<void**>(&g_origViewCreate));
+    MH_CreateHook(g_base + kTone.rva, reinterpret_cast<void*>(&HookTone), reinterpret_cast<void**>(&g_origTone));
     MH_CreateHook(g_base + kBufferSize.rva, reinterpret_cast<void*>(&HookBufferSize), reinterpret_cast<void**>(&g_origBufferSize));
     const MH_STATUS st = MH_EnableHook(MH_ALL_HOOKS);
     Log("HOOKS %s", MH_StatusToString(st));
@@ -521,7 +551,8 @@ static DWORD WINAPI XrStartThread(void* arg) {
     Log("XR eye size %dx%d (%d percent of recommended)", w, h, percent);
     g_forceW = w;
     g_forceH = h;
-    g_createViewKind = 3;
+    g_createViewKind = 1;  // kinds 3 and up turn particles black. Kinds below 2 get occlusion culling.
+    g_shareLum = true;
     g_createW = w;
     g_createH = h;
     g_createKind = 1;
@@ -536,7 +567,7 @@ static DWORD WINAPI XrStartThread(void* arg) {
             Log("XR eyes not created");
             return 0;
         }
-        for (uint8_t* eye : g_eyes) *reinterpret_cast<uint32_t*>(eye + 0x16cd4) = 0x3fff;
+        for (uint8_t* eye : g_eyes) *reinterpret_cast<uint32_t*>(eye + 0x16cd4) = 0x3fff;  // the same passes as the main view
         void* r = EyeTexture(g_eyes[0]);
         if (!r) return 0;
         CaptureSetup(r);
@@ -551,6 +582,53 @@ static DWORD WINAPI XrStartThread(void* arg) {
     CaptureSetPresentCallback(&OnPresentForXr);
     Log("XR running");
     return 0;
+}
+
+// Coherent UI views: a table of 0x150 byte records. +0x20 render target data, whose first word is the colour texture.
+static const size_t kUiViews = 0x687d310;
+static uint8_t* UiTexture(int i, int* w, int* h) {
+    uint8_t* v = g_base + kUiViews + static_cast<size_t>(i) * 0x150;
+    uint8_t* rt = nullptr;
+    if (!SafeCopy(&rt, v + 0x20, 8) || !rt) return nullptr;
+    uint8_t* tex = nullptr;
+    if (!SafeCopy(&tex, rt, 8) || !tex) return nullptr;
+    SafeCopy(w, v + 300, 4);
+    SafeCopy(h, v + 0x130, 4);
+    return tex;
+}
+
+static void* TextureResource(uint8_t* tex, uint32_t* state) {
+    uint8_t* wrap = nullptr;
+    uint8_t* rec = nullptr;
+    void* res = nullptr;
+    if (!SafeCopy(&wrap, tex + 0x40, 8) || !wrap || !SafeCopy(&rec, wrap + 0x38, 8) || !rec || !SafeCopy(&res, rec, 8) || !res) return nullptr;
+    SafeCopy(state, rec + 0x28, 4);
+    return res;
+}
+
+static void UiList(bool dump, const std::string& name) {
+    std::vector<void*> res;
+    std::vector<uint32_t> states;
+    std::vector<std::wstring> paths;
+    for (int i = 0; i < 64; ++i) {
+        int w = 0, h = 0;
+        uint8_t* tex = UiTexture(i, &w, &h);
+        if (!tex) continue;
+        uint32_t st = 0;
+        void* r = TextureResource(tex, &st);
+        Log("UI view %d %dx%d texture %p resource %p state %x", i, w, h, tex, r, st);
+        if (dump && r) {
+            res.push_back(r);
+            states.push_back(st);
+            paths.push_back(g_dir + L"vrlab_shots\\" + std::wstring(name.begin(), name.end()) + L"_ui" + std::to_wstring(i) + L".bmp");
+        }
+    }
+    if (dump && !res.empty()) {
+        std::vector<const wchar_t*> ptrs;
+        for (auto& p : paths) ptrs.push_back(p.c_str());
+        CreateDirectoryW((g_dir + L"vrlab_shots").c_str(), nullptr);
+        Log("UI dump queued: %s", CaptureRequest(res.data(), states.data(), ptrs.data(), static_cast<int>(res.size())) ? "yes" : "no");
+    }
 }
 
 static uint32_t g_w, g_h, g_k;
@@ -571,6 +649,9 @@ static void RunCommand(const std::string& c) {
     } else if (sscanf(c.c_str(), "viewkind %u", &g_w) == 1) g_createViewKind = g_w;
     else if (sscanf(c.c_str(), "xr %u", &g_w) == 1) StartXr(g_w);
     else if (sscanf(c.c_str(), "pace %u", &g_w) == 1) g_pace = g_w != 0;
+    else if (sscanf(c.c_str(), "sharelum %u", &g_w) == 1) g_shareLum = g_w != 0;
+    else if (sscanf(c.c_str(), "sharefog %u", &g_w) == 1) g_shareFog = g_w != 0;
+    else if (sscanf(c.c_str(), "tonefix %u", &g_w) == 1) g_toneFix = g_w != 0;
     else if (c == "recenter") g_wantRecenter = true;
     else if (sscanf(c.c_str(), "scale %f", &g_f) == 1) g_worldScale = g_f;
     else if (c == "d3d") {
@@ -585,6 +666,8 @@ static void RunCommand(const std::string& c) {
         g_stereo = true;
     } else if (sscanf(c.c_str(), "dump %63s", g_text) == 1) DumpEyes(g_text);
     else if (c == "texinfo") TexInfo();
+    else if (c == "uilist") UiList(false, "");
+    else if (sscanf(c.c_str(), "uidump %63s", g_text) == 1) UiList(true, g_text);
     else if (c == "lens") {
         if (uint8_t* m = ActiveView()) {
             const float* v = reinterpret_cast<const float*>(m + 0x3f8);
