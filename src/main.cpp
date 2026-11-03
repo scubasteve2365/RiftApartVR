@@ -4,6 +4,7 @@
 // Build 2: logging hooks that change nothing, plus live test commands that do. No command runs by itself.
 #include <windows.h>
 #include <MinHook.h>
+#include "capture.h"
 #include <intrin.h>
 #include <algorithm>
 #include <atomic>
@@ -17,7 +18,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 3
+#define BUILD_NUMBER 6
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -32,7 +33,7 @@ static uint8_t* g_base = nullptr;
 static size_t g_textStart = 0, g_textSize = 0;
 static void** g_activeViewPtr = nullptr;
 
-static void Log(const char* fmt, ...) {
+void Log(const char* fmt, ...) {
     if (!g_log) return;
     char line[1024];
     va_list a;
@@ -113,7 +114,10 @@ static const Target kCameraSubmit{"CameraSubmit", 0x12324e0, "\x48\x3b\xd1\x74\x
 static const Target kOffscreenCreate{"OffscreenCreate", 0x1239af0, "\x48\x89\x5c\x24\x10\x48\x89\x6c\x24\x18\x57\x48\x83\xec\x60"};
 static const Target kSceneSubmit{"SceneSubmit", 0x12bb640, "\x44\x88\x4c\x24\x20\x48\x89\x54\x24\x10\x55\x53\x56\x57"};
 static const Target kViewCreate{"ViewCreate", 0x1238fb0, "\x48\x89\x5c\x24\x08\x48\x89\x6c\x24\x10\x48\x89\x74\x24\x18\x48\x89\x7c\x24\x20\x41\x56"};
-static const size_t kManager = 0x6739a10;    // ViewContextManager
+static const Target kLensEdges{"LensEdges", 0x1210810, "\x48\x8b\xc4\x48\x81\xec\x08\x01"};
+static const Target kJitter{"Jitter", 0x1234030, "\x48\x89\x5c\x24\x08\x48\x89\x74\x24\x10\x48\x89\x7c\x24\x18\x41\x56"};
+static const size_t kManager = 0x6739a10;
+    // ViewContextManager
 static const size_t kShowSlot = 0x5339598;   // the game draws this offscreen slot over the active view
 
 static bool Check(const Target& t) {
@@ -143,10 +147,10 @@ using ViewCreateFn = void(__fastcall*)(uint8_t*, const char*, void*, void*, void
 static ViewCreateFn g_origViewCreate;
 static uint8_t* ActiveView();
 static void __fastcall HookViewCreate(uint8_t* view, const char* name, void* buffers, void* a4, void* a5, uint64_t kind, void* parent, uint32_t a8) {
-    if (name == kEyeName && g_createViewKind == 3) {
-        parent = ActiveView();
-        kind = 3;
-        Log("EYE view %p made a child of %p", view, parent);
+    if (name == kEyeName && g_createViewKind != 0) {
+        kind = g_createViewKind == 9 ? 0 : g_createViewKind.load();
+        if (kind == 3) parent = ActiveView();
+        Log("EYE view %p ctor kind %llu parent %p", view, kind, parent);
     }
     g_origViewCreate(view, name, buffers, a4, a5, kind, parent, a8);
 }
@@ -167,6 +171,10 @@ static std::atomic<uint32_t> g_createW{1920}, g_createH{1080}, g_createKind{2};
 static std::vector<uint8_t*> g_eyes;
 static std::mutex g_eyesLock;
 static std::atomic<bool> g_copyCamera{false};
+static std::atomic<bool> g_stereo{false};
+static std::atomic<float> g_ipd{0.064f};
+using LensEdgesFn = void(__fastcall*)(void*, const float*, float, float, float, float, float, float, float, float, uint8_t);
+using JitterFn = void(__fastcall*)(uint8_t*, float*, float*);
 
 static uint8_t* ActiveView() {
     return g_activeViewPtr ? static_cast<uint8_t*>(*g_activeViewPtr) : nullptr;
@@ -198,6 +206,30 @@ static void __fastcall HookRenderAll() {
             for (uint8_t* eye : g_eyes) g_origCameraSubmit(eye, main);
         }
     }
+    if (g_stereo) {
+        if (uint8_t* main = ActiveView()) {
+            std::lock_guard<std::mutex> l(g_eyesLock);
+            if (g_eyes.size() >= 2) {
+                float pose[16];
+                memcpy(pose, main, sizeof(pose));
+                const float* noJitter = reinterpret_cast<const float*>(main + 0x1c0);
+                const float tanX = 1.0f / fabsf(noJitter[0]), tanY = 1.0f / fabsf(noJitter[5]);
+                const float nearZ = *reinterpret_cast<float*>(main + 0x3f8), farZ = *reinterpret_cast<float*>(main + 0x3fc);
+                float jx = 0, jy = 0;
+                reinterpret_cast<JitterFn>(g_base + kJitter.rva)(main, &jx, &jy);  // one phase for the pair
+                const float half = g_ipd.load() * 0.5f;
+                alignas(16) static uint8_t desc[0x600];
+                for (int e = 0; e < 2; ++e) {
+                    float eyePose[16];
+                    memcpy(eyePose, pose, sizeof(pose));
+                    const float side = e == 0 ? -half : half;
+                    for (int i = 0; i < 3; ++i) eyePose[12 + i] += pose[i] * side;
+                    reinterpret_cast<LensEdgesFn>(g_base + kLensEdges.rva)(desc, eyePose, nearZ, farZ, -tanX, tanX, tanY, -tanY, jx, jy, 0);
+                    g_origCameraSubmit(g_eyes[e], desc);
+                }
+            }
+        }
+    }
     g_origRenderAll();
 }
 
@@ -219,7 +251,7 @@ static void __fastcall HookCameraSubmit(uint8_t* view, const uint8_t* desc) {
 }
 
 static void InstallHooks() {
-    if (!Check(kOffscreenRenderAll) || !Check(kCameraSubmit) || !Check(kOffscreenCreate) || !Check(kSceneSubmit) || !Check(kViewCreate)) return;
+    if (!Check(kOffscreenRenderAll) || !Check(kCameraSubmit) || !Check(kOffscreenCreate) || !Check(kSceneSubmit) || !Check(kViewCreate) || !Check(kLensEdges) || !Check(kJitter)) return;
     MH_Initialize();
     MH_CreateHook(g_base + kOffscreenRenderAll.rva, reinterpret_cast<void*>(&HookRenderAll), reinterpret_cast<void**>(&g_origRenderAll));
     MH_CreateHook(g_base + kSceneSubmit.rva, reinterpret_cast<void*>(&HookSceneSubmit), reinterpret_cast<void**>(&g_origSceneSubmit));
@@ -256,7 +288,85 @@ static void LogStats() {
     g_sceneSubmits.clear();
 }
 
+// The engine's texture wraps the resource: view +0x2088 texture, +0x40 wrapper, +0x38 record, +0 the ID3D12Resource,
+// record +0x28 the state the engine tracks. Only trusted if its vtable is in D3D12Core.dll.
+static uint8_t* EyeRecord(uint8_t* eye) {
+    uint8_t* tex = *reinterpret_cast<uint8_t**>(eye + 0x2088);
+    uint8_t* wrap = tex ? *reinterpret_cast<uint8_t**>(tex + 0x40) : nullptr;
+    return wrap ? *reinterpret_cast<uint8_t**>(wrap + 0x38) : nullptr;
+}
+
+static void* EyeTexture(uint8_t* eye) {
+    uint8_t* rec = EyeRecord(eye);
+    void* res = nullptr;
+    if (!rec || !SafeCopy(&res, rec, 8) || !res) return nullptr;
+    void* vt = nullptr;
+    HMODULE core = GetModuleHandleW(L"D3D12Core.dll");
+    HMODULE owner = nullptr;
+    if (!core || !SafeCopy(&vt, res, 8) || !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(vt), &owner) || owner != core) {
+        Log("EYE resource not in D3D12Core: %p vtable %p", res, vt);
+        return nullptr;
+    }
+    return res;
+}
+
+static void DumpEyes(const std::string& name) {
+    std::lock_guard<std::mutex> l(g_eyesLock);
+    CreateDirectoryW((g_dir + L"vrlab_shots").c_str(), nullptr);
+    std::vector<void*> res;
+    std::vector<uint32_t> states;
+    std::vector<std::wstring> paths;
+    int i = 0;
+    for (uint8_t* eye : g_eyes) {
+        void* r = EyeTexture(eye);
+        if (!r) continue;
+        res.push_back(r);
+        states.push_back(*reinterpret_cast<uint32_t*>(EyeRecord(eye) + 0x28));
+        paths.push_back(g_dir + L"vrlab_shots\\" + std::wstring(name.begin(), name.end()) + (i == 0 ? L"_L.bmp" : i == 1 ? L"_R.bmp" : L"_X.bmp"));
+        ++i;
+    }
+    std::vector<const wchar_t*> ptrs;
+    for (auto& p : paths) ptrs.push_back(p.c_str());
+    const bool ok = !res.empty() && CaptureRequest(res.data(), states.data(), ptrs.data(), static_cast<int>(res.size()));
+    Log("DUMP queued %d images: %s", static_cast<int>(res.size()), ok ? "yes" : "no");
+}
+
+// Reads only: lists pointers in an engine texture object and which module each one's first word (a vtable) lies in.
+static void WalkObject(const char* label, const uint8_t* obj, size_t size) {
+    Log("WALK %s %p", label, obj);
+    for (size_t off = 0; off < size; off += 8) {
+        void* v = nullptr;
+        if (!SafeCopy(&v, obj + off, 8) || reinterpret_cast<uint64_t>(v) < 0x10000) continue;
+        void* vt = nullptr;
+        if (!SafeCopy(&vt, v, 8)) continue;
+        HMODULE own = nullptr, of = nullptr;
+        wchar_t a[64] = L"-", b[64] = L"-";
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(v), &own)) {
+            wchar_t full[MAX_PATH];
+            GetModuleFileNameW(own, full, MAX_PATH);
+            wcsncpy(a, wcsrchr(full, L'\\') + 1, 63);
+        }
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(vt), &of)) {
+            wchar_t full[MAX_PATH];
+            GetModuleFileNameW(of, full, MAX_PATH);
+            wcsncpy(b, wcsrchr(full, L'\\') + 1, 63);
+        }
+        Log("  +%#05zx %p in %ls first word %p in %ls", off, v, a, vt, b);
+    }
+}
+
+static void TexInfo() {
+    std::lock_guard<std::mutex> l(g_eyesLock);
+    if (g_eyes.empty()) return;
+    uint8_t* tex = *reinterpret_cast<uint8_t**>(g_eyes[0] + 0x2088);
+    WalkObject("texture", tex, 0x100);
+    uint8_t* inner = *reinterpret_cast<uint8_t**>(tex + 0x40);
+    WalkObject("inner", inner, 0x200);
+}
+
 static uint32_t g_w, g_h, g_k;
+static float g_f;
+static char g_text[64];
 static int g_show;
 
 static void RunCommand(const std::string& c) {
@@ -270,6 +380,23 @@ static void RunCommand(const std::string& c) {
         g_createKind = g_k;
         g_wantCreate = 1;
     } else if (sscanf(c.c_str(), "viewkind %u", &g_w) == 1) g_createViewKind = g_w;
+    else if (c == "d3d") {
+        std::lock_guard<std::mutex> l(g_eyesLock);
+        void* r = g_eyes.empty() ? nullptr : EyeTexture(g_eyes[0]);
+        Log("D3D start from %p", r);
+        if (r) CaptureSetup(r);
+    } else if (sscanf(c.c_str(), "stereo %f", &g_f) == 1) {
+        g_ipd = g_f;
+        g_copyCamera = false;
+        g_stereo = true;
+    } else if (sscanf(c.c_str(), "dump %63s", g_text) == 1) DumpEyes(g_text);
+    else if (c == "texinfo") TexInfo();
+    else if (c == "lens") {
+        if (uint8_t* m = ActiveView()) {
+            const float* v = reinterpret_cast<const float*>(m + 0x3f8);
+            Log("LENS near %.4f far %.4f edges %.5f %.5f %.5f %.5f fov %.4f %.4f %.4f aspect %.4f", v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9]);
+        }
+    }
     else if (c == "copy 1") g_copyCamera = true;
     else if (c == "copy 0") g_copyCamera = false;
     else if (sscanf(c.c_str(), "show %d", &g_show) == 1) *reinterpret_cast<int*>(g_base + kShowSlot) = g_show;
