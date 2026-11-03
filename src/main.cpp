@@ -471,6 +471,7 @@ static void OnPresentForXr() {
 }
 
 static bool g_xrStarted = false;
+static DWORD WINAPI XrStartThread(void* arg);
 static void StartXr(int percent) {
     if (g_xrStarted) return;
     g_xrStarted = true;
