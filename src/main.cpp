@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 33
+#define BUILD_NUMBER 34
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -1038,6 +1038,109 @@ static void InstallPadHooks() {
     }
 }
 
+// The game's real pad path is Windows.Gaming.Input, found by its log and by 0x16f9a3e. Both interfaces are hooked at
+// their code, reached through a controller of our own asking. Vtable slots: IGamepad +0x40, IRawGameController +0x68.
+struct GamepadReading {
+    uint64_t timestamp;
+    uint32_t buttons;
+    uint32_t pad;
+    double lt, rt, lx, ly, rx, ry;
+};
+using WgiGamepadReadFn = HRESULT(STDMETHODCALLTYPE*)(void*, GamepadReading*);
+using WgiRawReadFn = HRESULT(STDMETHODCALLTYPE*)(void*, UINT32, uint8_t*, UINT32, int*, UINT32, double*, uint64_t*);
+static WgiGamepadReadFn g_origWgiGamepad;
+static WgiRawReadFn g_origWgiRaw;
+static std::atomic<uint32_t> g_wgiGamepadCalls{0}, g_wgiRawCalls{0}, g_wgiBlocked{0};
+static HRESULT STDMETHODCALLTYPE HookWgiGamepad(void* self, GamepadReading* out) {
+    const HRESULT r = g_origWgiGamepad(self, out);
+    ++g_wgiGamepadCalls;
+    if (SUCCEEDED(r) && out && g_menuOpen) {
+        out->buttons = 0;
+        out->lt = out->rt = out->lx = out->ly = out->rx = out->ry = 0;
+        ++g_wgiBlocked;
+    }
+    return r;
+}
+static HRESULT STDMETHODCALLTYPE HookWgiRaw(void* self, UINT32 nb, uint8_t* b, UINT32 ns, int* sw, UINT32 na, double* a, uint64_t* t) {
+    const HRESULT r = g_origWgiRaw(self, nb, b, ns, sw, na, a, t);
+    ++g_wgiRawCalls;
+    // Rest values differ by controller, so axes hold what they read before the menu opened.
+    static double lastAxes[16];
+    if (SUCCEEDED(r)) {
+        if (g_menuOpen) {
+            if (b) memset(b, 0, nb);
+            if (sw) memset(sw, 0, ns * sizeof(int));
+            if (a) memcpy(a, lastAxes, std::min<UINT32>(na, 16) * sizeof(double));
+        } else if (a) {
+            memcpy(lastAxes, a, std::min<UINT32>(na, 16) * sizeof(double));
+        }
+    }
+    return r;
+}
+struct ComLike {
+    void** vt;
+};
+static void InstallWgiHooks() {
+    static bool gamepadDone = false, rawDone = false, failed = false;
+    if ((gamepadDone && rawDone) || failed) return;
+    HMODULE combase = LoadLibraryW(L"combase.dll");
+    using RoInitFn = HRESULT(WINAPI*)(int);
+    using RoGetFactoryFn = HRESULT(WINAPI*)(void*, const GUID&, void**);
+    using MakeStringFn = HRESULT(WINAPI*)(const wchar_t*, UINT32, void**);
+    auto roInit = combase ? reinterpret_cast<RoInitFn>(GetProcAddress(combase, "RoInitialize")) : nullptr;
+    auto roFactory = combase ? reinterpret_cast<RoGetFactoryFn>(GetProcAddress(combase, "RoGetActivationFactory")) : nullptr;
+    auto makeString = combase ? reinterpret_cast<MakeStringFn>(GetProcAddress(combase, "WindowsCreateString")) : nullptr;
+    if (!roInit || !roFactory || !makeString) {
+        failed = true;
+        Log("WGI combase functions missing");
+        return;
+    }
+    static bool inited = false;
+    if (!inited) {
+        roInit(1);  // multithreaded; a thread of this mod only
+        inited = true;
+    }
+    // get_Gamepads and get_RawGameControllers are both slot 10 of their statics; a vector view's GetAt is 6, Size 7.
+    auto firstOf = [&](const wchar_t* cls, const GUID& iid, const GUID* elementIid) -> ComLike* {
+        void* name = nullptr;
+        if (FAILED(makeString(cls, static_cast<UINT32>(wcslen(cls)), &name))) return nullptr;
+        ComLike* statics = nullptr;
+        if (FAILED(roFactory(name, iid, reinterpret_cast<void**>(&statics))) || !statics) return nullptr;
+        ComLike* vec = nullptr;
+        using GetVecFn = HRESULT(STDMETHODCALLTYPE*)(void*, ComLike**);
+        if (FAILED(reinterpret_cast<GetVecFn>(statics->vt[10])(statics, &vec)) || !vec) return nullptr;
+        UINT32 n = 0;
+        using SizeFn = HRESULT(STDMETHODCALLTYPE*)(void*, UINT32*);
+        reinterpret_cast<SizeFn>(vec->vt[7])(vec, &n);
+        if (!n) return nullptr;
+        ComLike* item = nullptr;
+        using GetAtFn = HRESULT(STDMETHODCALLTYPE*)(void*, UINT32, ComLike**);
+        if (FAILED(reinterpret_cast<GetAtFn>(vec->vt[6])(vec, 0, &item))) return nullptr;
+        (void)elementIid;
+        return item;
+    };
+    static const GUID kGamepadStatics{0x8BBCE529, 0xD49C, 0x39E9, {0x95, 0x60, 0xE4, 0x7D, 0xDE, 0x96, 0xB7, 0xC8}};
+    static const GUID kRawStatics{0xEB8D0792, 0xE95A, 0x4B19, {0xAF, 0xC7, 0x0A, 0x59, 0xF8, 0xBF, 0x75, 0x9E}};
+    if (!gamepadDone) {
+        if (ComLike* pad = firstOf(L"Windows.Gaming.Input.Gamepad", kGamepadStatics, nullptr)) {
+            void* f = pad->vt[8];
+            const MH_STATUS a = MH_CreateHook(f, reinterpret_cast<void*>(&HookWgiGamepad), reinterpret_cast<void**>(&g_origWgiGamepad));
+            const MH_STATUS b = MH_EnableHook(f);
+            Log("WGI gamepad hook %s %s", MH_StatusToString(a), MH_StatusToString(b));
+            gamepadDone = true;
+        }
+    }
+    if (!rawDone) {
+        if (ComLike* raw = firstOf(L"Windows.Gaming.Input.RawGameController", kRawStatics, nullptr)) {
+            void* f = raw->vt[13];
+            const MH_STATUS a = MH_CreateHook(f, reinterpret_cast<void*>(&HookWgiRaw), reinterpret_cast<void**>(&g_origWgiRaw));
+            const MH_STATUS b = MH_EnableHook(f);
+            Log("WGI raw hook %s %s", MH_StatusToString(a), MH_StatusToString(b));
+            rawDone = true;
+        }
+    }
+}
+
 // Runs every 16 ms: reads the pad underneath the hooks above.
 static void PollPad() {
     XInputGetStateFn get = g_origXInput14 ? g_origXInput14 : g_origXInput13 ? g_origXInput13 : g_origXInput910;
@@ -1105,9 +1208,15 @@ static void PollPad() {
 }
 
 static DWORD WINAPI PadThread(void*) {
+    ULONGLONG lastTry = 0;
     for (;;) {
         Sleep(16);
         PollPad();
+        const ULONGLONG now = GetTickCount64();
+        if (now - lastTry > 2000) {
+            lastTry = now;
+            InstallWgiHooks();
+        }
     }
 }
 
@@ -1438,6 +1547,7 @@ static void RunCommand(const std::string& c) {
     else if (sscanf(c.c_str(), "level %u", &g_w) == 1) g_levelCamera = g_w != 0;
     else if (sscanf(c.c_str(), "lensfix %u", &g_w) == 1) g_lensFix = g_w != 0;
     else if (c == "padinfo") {
+        Log("PADINFO WGI gamepad reads %u, raw reads %u, blocked %u", g_wgiGamepadCalls.load(), g_wgiRawCalls.load(), g_wgiBlocked.load());
         Log("PADINFO XInput calls: 1_4 %u, 1_3 %u, 9_1_0 %u, 1_4 Ex %u, 1_3 Ex %u", g_xinputCalls[0].load(), g_xinputCalls[1].load(), g_xinputCalls[2].load(), g_xinputCalls[3].load(), g_xinputCalls[4].load());
         for (const wchar_t* n : {L"sdl2.dll", L"sdl3.dll", L"libScePad.dll", L"GameInput.dll", L"hid.dll", L"dinput8.dll", L"Windows.Gaming.Input.dll", L"steam_api64.dll", L"nvapi64.dll"}) Log("PADINFO module %ls %p", n, GetModuleHandleW(n));
     } else if (c == "menu") {
