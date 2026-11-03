@@ -27,7 +27,7 @@ Click and hold both thumbsticks for half a second to open the VR menu. The game 
 |---|---|
 | Recenter view | Makes where you are facing now the front |
 | World scale | How much of a miniature the world looks |
-| Decoupled pitch | On: the world stays level, only the camera's turn moves you. Off: the camera's up and down tilt moves the world too |
+| Decoupled pitch | On: the world stays level, only the camera's turn moves you. Off: the camera's up and down tilt moves the world too. Auto: level, except on gravity walls |
 | HUD distance | How far away the HUD panel sits |
 | Resolution | Percent of what your headset asks for. Next launch |
 | DLSS scene size | How large each eye is drawn before DLSS: 50 Performance, 58 Balanced, 67 Quality, 77 Ultra Quality, 100 DLAA. Next launch |
@@ -36,6 +36,8 @@ Click and hold both thumbsticks for half a second to open the VR menu. The game 
 | Aim dot | Shows where you aim, as a ring in the world |
 
 Settings save to `RiftApartVR.ini` in the game's folder.
+
+In VR the game runs in a 2560x1440 window, whatever your settings say, and your monitor shows the left eye. Your saved settings are not changed by the mod, unless you save settings in the game's own menu while it runs.
 
 DLSS is used when DLSS is chosen in the game's graphics menu. With any other choice the eyes draw at full size.
 

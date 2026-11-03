@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 41
+#define BUILD_NUMBER 45
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -208,6 +208,9 @@ static std::atomic<bool> g_toneFix{true};
 // +0x98) when the view is not "generic". Eyes need that path for colour, not the UI: the UI goes on its own quads.
 // 0x678e710 is the game's own neutral stand-in, used when it runs without the overlay (0x11dc080).
 static std::atomic<bool> g_eyeNoUi{true};
+// The overlay is cleared every frame and drawn only in the game's own view's work. Set when that view reaches the tone map.
+static std::atomic<bool> g_overlayFresh{false};
+static std::atomic<int> g_wantHudShot{0};
 static const size_t kOverlayResource = 0x67334c0 + 0x230 + 0x98, kNeutralResource = 0x678e710;
 static std::atomic<uint8_t*> g_eyeA{nullptr}, g_eyeB{nullptr};
 static void* __fastcall HookTone(void* a, void* b, void* c, uint8_t* view, void* e, uint64_t generic) {
@@ -230,6 +233,8 @@ static void* __fastcall HookTone(void* a, void* b, void* c, uint8_t* view, void*
         // The render thread's copy of the view holds the camera this image was drawn with.
         uint8_t* owner = *reinterpret_cast<uint8_t**>(view + 0x1ff8);
         if (owner && owner == g_eyeA.load()) XrMarkRendered(reinterpret_cast<const float*>(view + 0x30));
+        // Offscreen views, eyes among them, have a negative id. The game's own view does not.
+        if (*reinterpret_cast<int*>(view + 0xf90) >= 0) g_overlayFresh = true;
     }
     return g_origTone(a, b, c, view, e, generic);
 }
@@ -338,7 +343,9 @@ static std::atomic<bool> g_stereo{false};
 static std::atomic<float> g_ipd{0.064f};
 static std::atomic<bool> g_wantRecenter{false}, g_pace{true}, g_shareLum{false};
 static std::atomic<float> g_worldScale{1.0f};
-static std::atomic<bool> g_levelCamera{true};
+// 0 off: the camera tilts the world. 1 on: level always. 2 auto: level, except while the camera itself leans over, as on gravity walls.
+static std::atomic<int> g_levelCamera{2};
+static float g_levelBlend = 0;
 // The engine's lens takes the top of the picture first, measured along its downward Y: minus OpenXR's up, then minus its down.
 static std::atomic<bool> g_lensFix{true};
 // Eye jitter: 0 none, 1 the game's value resized from the flat view's pixels to the eye's, 2 the flat view's value as it is.
@@ -393,6 +400,7 @@ static std::atomic<float> g_cinemaIpd{0.03f};
 // 0 off, 1 while aiming, 2 always.
 static std::atomic<int> g_aimDot{1};
 static float g_aimRoom[3];
+static std::atomic<ULONGLONG> g_lastTrigger{0};
 static void UpdateMode() {
     uint8_t* main = ActiveView();
     bool world = false;
@@ -518,7 +526,8 @@ static void __fastcall HookRenderAll() {
                 }
                 float cam[16];
                 memcpy(cam, main, sizeof(cam));
-                if (g_levelCamera) {
+                const int levelMode = g_levelCamera.load();
+                if (levelMode != 0) {
                     // A solid, level world: keep only the direction the camera faces. Its pitch and roll never reach the head.
                     float fx = cam[8], fz = cam[10];
                     const float len = sqrtf(fx * fx + fz * fz);
@@ -532,7 +541,32 @@ static void __fastcall HookRenderAll() {
                         fz = g_lastFacing[1];
                     }
                     const float level[12] = {-fz, 0, fx, 0, 0, -1, 0, 0, fx, 0, fz, 0};
-                    memcpy(cam, level, sizeof(level));
+                    // Auto: the camera's right row leaving level means gravity is sideways. Follow the camera there, smoothly.
+                    const float lean = fabsf(cam[1]);
+                    static bool leaning = false;
+                    if (levelMode == 2) {
+                        if (lean > 0.35f) leaning = true;
+                        else if (lean < 0.15f) leaning = false;
+                    } else {
+                        leaning = false;
+                    }
+                    g_levelBlend = std::clamp(g_levelBlend + (leaning ? 1.0f : -1.0f) / 45.0f, 0.0f, 1.0f);
+                    float rows[12];
+                    for (int i = 0; i < 12; ++i) rows[i] = level[i] + (cam[i] - level[i]) * g_levelBlend;
+                    // Square the rows up again: forward, then right against it, then down from both.
+                    float* F = rows + 8;
+                    float n = sqrtf(F[0] * F[0] + F[1] * F[1] + F[2] * F[2]);
+                    for (int i = 0; i < 3; ++i) F[i] /= n;
+                    float* R = rows;
+                    const float dot = R[0] * F[0] + R[1] * F[1] + R[2] * F[2];
+                    for (int i = 0; i < 3; ++i) R[i] -= F[i] * dot;
+                    n = sqrtf(R[0] * R[0] + R[1] * R[1] + R[2] * R[2]);
+                    for (int i = 0; i < 3; ++i) R[i] /= n;
+                    float* D = rows + 4;
+                    D[0] = F[1] * R[2] - F[2] * R[1];
+                    D[1] = F[2] * R[0] - F[0] * R[2];
+                    D[2] = F[0] * R[1] - F[1] * R[0];
+                    memcpy(cam, rows, sizeof(rows));
                 }
                 const float nearZ = *reinterpret_cast<float*>(main + 0x3f8), farZ = *reinterpret_cast<float*>(main + 0x3fc);
                 {
@@ -546,9 +580,12 @@ static void __fastcall HookRenderAll() {
                     const float room[3] = {yc * vx - ys * vz, vy, ys * vx + yc * vz};
                     const float* lensNow = reinterpret_cast<const float*>(main + 0x1c0);
                     const double lens = lensNow[5] != 0 ? 2.0 * atan(1.0 / fabs(lensNow[5])) * 57.29577951 : 0;
-                    const bool aiming = fabs(lens - 32.64) < 0.5;
+                    // Aiming lens, or a trigger touched in the last two seconds: the game's reticle is up.
+                    const bool aiming = fabs(lens - 32.64) < 0.5 || GetTickCount64() - g_lastTrigger.load() < 2000;
                     const int dot = g_aimDot.load();
-                    XrSetAimDot(!g_cinemaNow && (dot == 2 || (dot == 1 && aiming)) ? room : nullptr);
+                    const bool dotOn = !g_cinemaNow && (dot == 2 || (dot == 1 && aiming));
+                    XrSetAimDot(dotOn ? room : nullptr);
+                    XrSetHudHole(!g_cinemaNow && dot != 0 && aiming);
                     g_aimRoom[0] = room[0];
                     g_aimRoom[1] = room[1];
                     g_aimRoom[2] = room[2];
@@ -649,7 +686,7 @@ static void __fastcall HookRenderAll() {
 
 // Resting the flat view: the scene submit returns at once when view +0x11d8 is clear. Set again when not resting.
 static std::atomic<bool> g_restFlat{false};
-static std::atomic<int> g_skipMain{0};
+static std::atomic<int> g_skipMain{4};
 static std::atomic<uint64_t> g_mainSkipped{0};
 static void* __fastcall HookSceneSubmit(uint8_t* view, void* a, uint32_t mask, char b) {
     if (view == ActiveView()) {
@@ -677,20 +714,22 @@ static void* __fastcall HookSceneSubmit(uint8_t* view, void* a, uint32_t mask, c
     }
     // Eyes read the main view's Adapted Lum, so they have the exposure the game chose. The handle is only lent while
     // the scene submit copies the view into its job: if it stayed, rebuilding an eye would free the main view's buffer.
-    if (view == ActiveView() && g_skipMain.load() && g_xrEyes.load()) {
-        ++g_mainSkipped;
-        return nullptr;
-    }
-    // With the main view skipped, the left eye stands in for it: the game draws the UI overlay in the main view's work.
-    if (g_skipMain.load() == 2 && g_xrEyes.load() && view == g_eyeA.load()) {
-        int* id = reinterpret_cast<int*>(view + 0xf90);
-        const int saved = *id;
-        *id = 0;
-        void* r = nullptr;
-        if (g_shareLum.load() && false) {}
-        r = g_origSceneSubmit(view, a, mask, b);
-        *id = saved;
-        return r;
+    // The game's own view only feeds the HUD in VR: the eyes are the picture and the monitor shows an eye. It runs one
+    // frame in this many, because the UI overlay is drawn in its work. 0 every frame. 1 never, and the HUD freezes.
+    if (view == ActiveView() && g_xrEyes.load()) {
+        // A pause menu only draws if this view runs every frame, and pausing stills the camera. So a still camera runs it every frame.
+        static float lastPose[16];
+        static int stillFrames = 0;
+        if (memcmp(lastPose, view, sizeof(lastPose)) == 0) ++stillFrames;
+        else stillFrames = 0;
+        memcpy(lastPose, view, sizeof(lastPose));
+        const int every = stillFrames >= 8 ? 0 : g_skipMain.load();
+        static uint32_t count = 0;
+        ++count;
+        if (every == 1 || (every > 1 && count % static_cast<uint32_t>(every) != 0)) {
+            ++g_mainSkipped;
+            return nullptr;
+        }
     }
     uint8_t* main = g_shareLum ? ActiveView() : nullptr;
     if (main && view != main && (view == g_eyeA.load() || view == g_eyeB.load())) {
@@ -890,7 +929,8 @@ static void InstallFocusFix() {
 
 static uint8_t* UiTexture(int i, int* w, int* h);
 static void* TextureResource(uint8_t* tex, uint32_t* state);
-static std::atomic<int> g_uiCount{3};
+static std::atomic<int> g_uiCount{1};
+static std::atomic<bool> g_mirrorEye{true};
 
 static void OnPresentForXr(void* backBuffer, unsigned bbW, unsigned bbH, int bbFormat) {
     if (!g_xrEyes) {
@@ -908,11 +948,26 @@ static void OnPresentForXr(void* backBuffer, unsigned bbW, unsigned bbH, int bbF
         SafeCopy(&st[1], EyeRecord(g_eyes[1]) + 0x28, 4);
     }
     XrUiImage ui[3] = {};
-    const int ids[3] = {0, 3, 4};  // UI views the size of the screen: 0 and 4 not yet identified, 3 the pause menu
+    // 5 is the game's composite of its whole UI: HUD pieces from a parts sheet, reticle and menus. One image, so nothing doubles.
+    const int ids[3] = {5, 3, 4};
     for (int i = 0; i < 3 && !rebuilding; ++i) {
         uint8_t* tex = UiTexture(ids[i], &ui[i].width, &ui[i].height);
         if (tex) ui[i].resource = TextureResource(tex, &ui[i].state);
     }
+    ui[0].keepLast = g_skipMain.load() != 0 && !g_overlayFresh.exchange(false);
+    {
+        // Lab: dump the HUD image exactly when a fresh one is about to be copied.
+        static std::atomic<int>& want = g_wantHudShot;
+        if (!ui[0].keepLast && ui[0].resource && want.exchange(0)) {
+            void* r[1] = {ui[0].resource};
+            uint32_t st0[1] = {ui[0].state};
+            static std::wstring path;
+            path = g_dir + L"vrlab_shots\hudshot.bmp";
+            const wchar_t* paths[1] = {path.c_str()};
+            Log("HUD shot queued: %s", CaptureRequest(r, st0, paths, 1) ? "yes" : "no");
+        }
+    }
+    XrSetMirror(g_mirrorEye.load() ? backBuffer : nullptr);
     XrOnPresent(res, st, ui, g_uiCount.load());
 }
 
@@ -950,7 +1005,7 @@ static void MenuRowText(int row, wchar_t (&name)[64], wchar_t (&value)[32]) {
         break;
     case 2:
         wcscpy_s(name, L"Decoupled pitch");
-        wcscpy_s(value, g_levelCamera ? L"On" : L"Off");
+        wcscpy_s(value, g_levelCamera == 0 ? L"Off" : g_levelCamera == 1 ? L"On" : L"Auto");
         break;
     case 3:
         wcscpy_s(name, L"HUD distance");
@@ -1089,8 +1144,8 @@ static void MenuChange(int dir) {
         break;
     }
     case 2:
-        g_levelCamera = !g_levelCamera;
-        SaveSetting(L"LevelCamera", g_levelCamera ? 1 : 0);
+        g_levelCamera = (g_levelCamera.load() + (dir < 0 ? 2 : 1)) % 3;
+        SaveSetting(L"LevelCamera", g_levelCamera.load());
         break;
     case 3:
         g_hudDistanceSetting = std::clamp(g_hudDistanceSetting + dir * 0.25f, 1.0f, 5.0f);
@@ -1132,7 +1187,7 @@ static void MenuChange(int dir) {
         }
         break;
     }
-    Log("MENU row %d dir %d: scale %.2f pitch decoupled %d hud %.2f resolution %d dlss %d", g_menuRow, dir, g_worldScale.load(), g_levelCamera.load() ? 1 : 0, g_hudDistanceSetting, g_resolutionSetting, g_dlssPercentSetting);
+    Log("MENU row %d dir %d: scale %.2f pitch decoupled %d hud %.2f resolution %d dlss %d", g_menuRow, dir, g_worldScale.load(), g_levelCamera.load(), g_hudDistanceSetting, g_resolutionSetting, g_dlssPercentSetting);
     MenuDraw();
 }
 
@@ -1297,6 +1352,7 @@ static void PollPad() {
             buttons |= st.buttons;
             if (abs(st.ly) > abs(ly)) ly = st.ly;
             if (abs(st.lx) > abs(lx)) lx = st.lx;
+            if (st.lt > 40 || st.rt > 40) g_lastTrigger = GetTickCount64();
         }
     }
     const ULONGLONG now = GetTickCount64();
@@ -1509,12 +1565,27 @@ static void InstallSlProbe() {
 // ---- the eyes need the game's own anti-aliasing, which it turns off when an upscaler is chosen ----
 static std::atomic<bool> g_regForce{false};
 static std::atomic<bool> g_skipLauncher{true};
+static std::atomic<bool> g_smallFlat{true};
 static void OverrideSetting(const wchar_t* name, void* data) {
     if (!name || !data) return;
     if (g_skipLauncher && !_wcsicmp(name, L"ShowLauncher")) {
         Log("REG ShowLauncher was %d, the game is told 0", *static_cast<int*>(data));
         *static_cast<int*>(data) = 0;
         return;
+    }
+    if (g_smallFlat) {
+        // The window sets the HUD's layout and the size of the game's own view, which only draws the HUD now.
+        // 16 by 9 keeps HUD pieces in reach whatever the monitor. The monitor shows an eye.
+        int small = -1;
+        if (!_wcsicmp(name, L"Fullscreen") || !_wcsicmp(name, L"ExclusiveFullscreen") || !_wcsicmp(name, L"WindowMaximized")) small = 0;
+        else if (!_wcsicmp(name, L"WindowWidth") || !_wcsicmp(name, L"UserWindowWidth")) small = 2560;
+        else if (!_wcsicmp(name, L"WindowHeight") || !_wcsicmp(name, L"UserWindowHeight")) small = 1440;
+        else if (!_wcsicmp(name, L"DynamicResolutionTargetFPS")) small = 120;
+        if (small >= 0) {
+            if (*static_cast<int*>(data) != small) Log("REG %ls was %d, the game is told %d", name, *static_cast<int*>(data), small);
+            *static_cast<int*>(data) = small;
+            return;
+        }
     }
     if (!g_regForce) return;
     int value = -1;
@@ -1695,9 +1766,11 @@ static void RunCommand(const std::string& c) {
     else if (sscanf(c.c_str(), "sharelum %u", &g_w) == 1) g_shareLum = g_w != 0;
     else if (sscanf(c.c_str(), "tonefix %u", &g_w) == 1) g_toneFix = g_w != 0;
     else if (sscanf(c.c_str(), "keepfocus %u", &g_w) == 1) g_keepFocus = g_w != 0;
-    else if (sscanf(c.c_str(), "level %u", &g_w) == 1) g_levelCamera = g_w != 0;
+    else if (sscanf(c.c_str(), "level %u", &g_w) == 1) g_levelCamera = static_cast<int>(g_w);
     else if (sscanf(c.c_str(), "lensfix %u", &g_w) == 1) g_lensFix = g_w != 0;
     else if (sscanf(c.c_str(), "eyenoui %u", &g_w) == 1) g_eyeNoUi = g_w != 0;
+    else if (sscanf(c.c_str(), "mirror %u", &g_w) == 1) g_mirrorEye = g_w != 0;
+    else if (c == "hudshot") g_wantHudShot = 1;
     else if (sscanf(c.c_str(), "skipmain %u", &g_w) == 1) g_skipMain = static_cast<int>(g_w);
     else if (sscanf(c.c_str(), "cinemaipd %f", &g_f) == 1) g_cinemaIpd = g_f;
     else if (sscanf(c.c_str(), "aimdot %u", &g_w) == 1) g_aimDot = static_cast<int>(g_w);
@@ -1854,6 +1927,8 @@ static DWORD WINAPI ProbeThread(void*) {
         g_eyeRenderPercent = g_eyeDlss ? std::clamp(static_cast<int>(GetPrivateProfileIntW(L"VR", L"EyeDLSSPercent", 67, early.c_str())), 33, 100) : 100;
         g_regForce = !g_eyeDlss && GetPrivateProfileIntW(L"VR", L"ForceGameAA", 1, early.c_str()) != 0;
         g_skipLauncher = GetPrivateProfileIntW(L"VR", L"SkipLauncher", 1, early.c_str()) != 0;
+        g_smallFlat = GetPrivateProfileIntW(L"VR", L"SmallFlatView", 1, early.c_str()) != 0;
+        g_skipMain = static_cast<int>(GetPrivateProfileIntW(L"VR", L"HudEveryFrames", 4, early.c_str()));
         MH_Initialize();
         InstallRegHooks();
     }
@@ -1886,7 +1961,7 @@ static DWORD WINAPI ProbeThread(void*) {
     const bool autoStart = GetPrivateProfileIntW(L"VR", L"AutoStart", 1, ini.c_str()) != 0;
     const int resolution = GetPrivateProfileIntW(L"VR", L"Resolution", 100, ini.c_str());
     g_worldScale = GetPrivateProfileIntW(L"VR", L"WorldScalePercent", 300, ini.c_str()) / 100.0f;
-    g_levelCamera = GetPrivateProfileIntW(L"VR", L"LevelCamera", 1, ini.c_str()) != 0;
+    g_levelCamera = static_cast<int>(GetPrivateProfileIntW(L"VR", L"LevelCamera", 2, ini.c_str()));
     g_pace = GetPrivateProfileIntW(L"VR", L"Pace", 1, ini.c_str()) != 0;
     g_resolutionSetting = resolution;
     g_hudDistanceSetting = GetPrivateProfileIntW(L"VR", L"HudDistanceCm", 200, ini.c_str()) / 100.0f;

@@ -889,6 +889,83 @@ void XrOnPresentScreen(void* resource, int width, int height, int dxgiFormat) {
     g_open = false;
 }
 
+static std::atomic<bool> g_hudHole{false};
+static bool g_uiFilled[kUiSlots];
+void XrSetHudHole(bool on) { g_hudHole = on; }
+static ID3D12Resource* g_holeUpload;
+static void* g_mirror;
+void XrSetMirror(void* backBuffer) { g_mirror = backBuffer; }
+
+// Blank a box in the middle of a HUD image already holding its copy. dst is in the copy-dest state.
+static void HudHole(ID3D12GraphicsCommandList* list, ID3D12Resource* dst, int w, int h) {
+    const int hw = (w * 14 / 100 + 3) & ~3, hh = h * 24 / 100;
+    const UINT pitch = (hw * 4 + 255) & ~255;
+    if (!g_holeUpload) {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = static_cast<UINT64>(pitch) * hh;
+        rd.Height = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_holeUpload)))) return;
+        void* m = nullptr;
+        if (FAILED(g_holeUpload->Map(0, nullptr, &m))) return;
+        memset(m, 0, static_cast<size_t>(pitch) * hh);
+        g_holeUpload->Unmap(0, nullptr);
+    }
+    D3D12_TEXTURE_COPY_LOCATION d{}, s{};
+    d.pResource = dst;
+    d.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    s.pResource = g_holeUpload;
+    s.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    s.PlacedFootprint.Footprint.Format = static_cast<DXGI_FORMAT>(g_format);
+    s.PlacedFootprint.Footprint.Width = hw;
+    s.PlacedFootprint.Footprint.Height = hh;
+    s.PlacedFootprint.Footprint.Depth = 1;
+    s.PlacedFootprint.Footprint.RowPitch = pitch;
+    list->CopyTextureRegion(&d, (w - hw) / 2, (h - hh) / 2, 0, &s, nullptr);
+}
+
+// The left eye on the monitor: the middle of the eye at one to one, or centred if the window is larger.
+static void MirrorEye(ID3D12GraphicsCommandList* list, ID3D12Resource* eye, D3D12_RESOURCE_STATES eyeState) {
+    auto* bb = static_cast<ID3D12Resource*>(g_mirror);
+    if (!bb) return;
+    const D3D12_RESOURCE_DESC ed = eye->GetDesc(), bd = bb->GetDesc();
+    static bool told = false;
+    if (ed.Format != bd.Format) {
+        if (!told) Log("MIRROR formats differ, eye %d window %d: left as the game draws it", ed.Format, bd.Format);
+        told = true;
+        return;
+    }
+    const UINT cw = static_cast<UINT>(std::min<UINT64>(bd.Width, std::min<UINT64>(ed.Width, g_chainW))), ch = std::min<UINT>(bd.Height, std::min<UINT>(ed.Height, g_chainH));
+    D3D12_RESOURCE_BARRIER bar[2]{};
+    bar[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    bar[0].Transition.pResource = eye;
+    bar[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    bar[0].Transition.StateBefore = eyeState;
+    bar[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    bar[1] = bar[0];
+    bar[1].Transition.pResource = bb;
+    bar[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    bar[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    list->ResourceBarrier(2, bar);
+    D3D12_TEXTURE_COPY_LOCATION d{}, s{};
+    d.pResource = bb;
+    d.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    s.pResource = eye;
+    s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    const UINT sx = (std::min<UINT>(static_cast<UINT>(ed.Width), g_chainW) - cw) / 2, sy = (std::min<UINT>(ed.Height, g_chainH) - ch) / 2;
+    D3D12_BOX box{sx, sy, 0, sx + cw, sy + ch, 1};
+    list->CopyTextureRegion(&d, (static_cast<UINT>(bd.Width) - cw) / 2, (bd.Height - ch) / 2, 0, &s, &box);
+    std::swap(bar[0].Transition.StateBefore, bar[0].Transition.StateAfter);
+    std::swap(bar[1].Transition.StateBefore, bar[1].Transition.StateAfter);
+    list->ResourceBarrier(2, bar);
+}
+
 void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiImage* ui, int uiCount) {
     std::lock_guard<std::mutex> l(g_frameLock);
     if (!g_open) {
@@ -974,6 +1051,24 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
     bool uiAcquired[kUiSlots] = {};
     for (int i = 0; i < uiCount && i < kUiSlots; ++i) {
         if (!ui[i].resource || !EnsureUiChain(g_ui[i], ui[i].width, ui[i].height)) continue;
+        const auto addQuad = [&]() {
+            XrCompositionLayerQuad& q = quads[quadCount++];
+            q = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+            q.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;  // premultiplied, as Coherent draws it
+            q.space = g_space;
+            q.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+            q.subImage.swapchain = g_ui[i].chain;
+            q.subImage.imageRect.extent = {ui[i].width, ui[i].height};
+            q.pose.orientation = {0, sinf(g_hudYaw * 0.5f), 0, cosf(g_hudYaw * 0.5f)};
+            q.pose.position = {g_hudPos[0], g_hudPos[1], g_hudPos[2]};
+            const float width = g_hudWidth;
+            q.size = {width, width * ui[i].height / static_cast<float>(ui[i].width)};
+        };
+        if (ui[i].keepLast) {
+            if (g_uiFilled[i]) addQuad();
+            continue;
+        }
+        g_uiFilled[i] = true;
         uint32_t idx = 0;
         const uint64_t t0 = NowUs();
         p_xrAcquireSwapchainImage(g_ui[i].chain, nullptr, &idx);
@@ -1001,21 +1096,13 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
         s.pResource = src;
         s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         list->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
+        if (i == 0 && g_hudHole && !g_cinema) HudHole(list, dst, ui[i].width, ui[i].height);
         std::swap(bar[0].Transition.StateBefore, bar[0].Transition.StateAfter);
         std::swap(bar[1].Transition.StateBefore, bar[1].Transition.StateAfter);
         list->ResourceBarrier(2, bar);
-        XrCompositionLayerQuad& q = quads[quadCount++];
-        q = {XR_TYPE_COMPOSITION_LAYER_QUAD};
-        q.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;  // premultiplied, as Coherent draws it
-        q.space = g_space;
-        q.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-        q.subImage.swapchain = g_ui[i].chain;
-        q.subImage.imageRect.extent = {ui[i].width, ui[i].height};
-        q.pose.orientation = {0, sinf(g_hudYaw * 0.5f), 0, cosf(g_hudYaw * 0.5f)};
-        q.pose.position = {g_hudPos[0], g_hudPos[1], g_hudPos[2]};
-        const float width = g_hudWidth;
-        q.size = {width, width * ui[i].height / static_cast<float>(ui[i].width)};
+        addQuad();
     }
+    MirrorEye(list, static_cast<ID3D12Resource*>(resources[0]), static_cast<D3D12_RESOURCE_STATES>(states[0]));
     XrCompositionLayerQuad menuLayer{XR_TYPE_COMPOSITION_LAYER_QUAD};
     const bool haveMenu = MenuRecord(list, &menuLayer);
     XrCompositionLayerQuad dotLayer{XR_TYPE_COMPOSITION_LAYER_QUAD};

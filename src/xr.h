@@ -25,6 +25,7 @@ struct XrUiImage {
     void* resource;
     uint32_t state;
     int width, height;
+    bool keepLast;  // Nothing new to copy: show what the layer already holds.
 };
 void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiImage* ui, int uiCount);
 // Present thread: no 3D world now, so show this picture on a flat screen fixed in the room.
@@ -39,6 +40,10 @@ void XrMenuHide();
 void XrSetCinema(bool on);
 // Game thread: a small dot along this direction in room space, from the head, while aiming. Null hides it.
 void XrSetAimDot(const float* roomDir);
+// Game thread: cut the middle out of the first HUD image, where the game's reticle sits.
+void XrSetHudHole(bool on);
+// Present thread, before XrOnPresent: show the left eye in this back buffer, cropped to it. Null leaves the game's picture.
+void XrSetMirror(void* backBuffer);
 // Lab only: replace what the headset reports, so head movement and lens shape can be tested without a headset.
 // Degrees and metres. Positive yaw turns left, positive pitch looks up, as OpenXR rotates.
 void XrFakeHead(bool on, float yaw, float pitch, float roll, float x, float y, float z, float ipd);
