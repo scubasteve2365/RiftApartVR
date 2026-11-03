@@ -17,7 +17,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 2
+#define BUILD_NUMBER 3
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -112,6 +112,7 @@ static const Target kOffscreenRenderAll{"OffscreenRenderAll", 0x12bb1c0, "\x48\x
 static const Target kCameraSubmit{"CameraSubmit", 0x12324e0, "\x48\x3b\xd1\x74\x7c\x48\x8b\xc1\x41\xb8\x08"};
 static const Target kOffscreenCreate{"OffscreenCreate", 0x1239af0, "\x48\x89\x5c\x24\x10\x48\x89\x6c\x24\x18\x57\x48\x83\xec\x60"};
 static const Target kSceneSubmit{"SceneSubmit", 0x12bb640, "\x44\x88\x4c\x24\x20\x48\x89\x54\x24\x10\x55\x53\x56\x57"};
+static const Target kViewCreate{"ViewCreate", 0x1238fb0, "\x48\x89\x5c\x24\x08\x48\x89\x6c\x24\x10\x48\x89\x74\x24\x18\x48\x89\x7c\x24\x20\x41\x56"};
 static const size_t kManager = 0x6739a10;    // ViewContextManager
 static const size_t kShowSlot = 0x5339598;   // the game draws this offscreen slot over the active view
 
@@ -136,6 +137,20 @@ using SceneSubmitFn = void*(__fastcall*)(uint8_t*, void*, uint32_t, char);
 using RenderAllFn = void(__fastcall*)();
 using CameraSubmitFn = void(__fastcall*)(uint8_t*, const uint8_t*);
 using OffscreenCreateFn = uint8_t*(__fastcall*)(uint8_t*, OffscreenDesc*);
+static const char kEyeName[] = "RiftApartVR eye test";
+static std::atomic<uint32_t> g_createViewKind{0};  // 3 makes the engine treat the view as a child of the main view
+using ViewCreateFn = void(__fastcall*)(uint8_t*, const char*, void*, void*, void*, uint64_t, void*, uint32_t);
+static ViewCreateFn g_origViewCreate;
+static uint8_t* ActiveView();
+static void __fastcall HookViewCreate(uint8_t* view, const char* name, void* buffers, void* a4, void* a5, uint64_t kind, void* parent, uint32_t a8) {
+    if (name == kEyeName && g_createViewKind == 3) {
+        parent = ActiveView();
+        kind = 3;
+        Log("EYE view %p made a child of %p", view, parent);
+    }
+    g_origViewCreate(view, name, buffers, a4, a5, kind, parent, a8);
+}
+
 static SceneSubmitFn g_origSceneSubmit;
 static RenderAllFn g_origRenderAll;
 static CameraSubmitFn g_origCameraSubmit;
@@ -149,7 +164,8 @@ static std::map<void*, uint32_t> g_sceneMask;
 // Test commands set these, and the game's own thread acts on them at the top of the offscreen pass.
 static std::atomic<int> g_wantCreate{0};
 static std::atomic<uint32_t> g_createW{1920}, g_createH{1080}, g_createKind{2};
-static uint8_t* g_eye = nullptr;
+static std::vector<uint8_t*> g_eyes;
+static std::mutex g_eyesLock;
 static std::atomic<bool> g_copyCamera{false};
 
 static uint8_t* ActiveView() {
@@ -160,7 +176,7 @@ static void __fastcall HookRenderAll() {
     ++g_frames;
     if (g_wantCreate.exchange(0)) {
         OffscreenDesc d{};
-        d.name = "RiftApartVR eye test";
+        d.name = kEyeName;
         d.nearZ = 0.1f;
         d.farZ = 100000.f;
         d.fovDegrees = 47.45f;
@@ -169,11 +185,18 @@ static void __fastcall HookRenderAll() {
         d.format = 28;
         d.kind = g_createKind;
         d.unknown = -1;
-        g_eye = reinterpret_cast<OffscreenCreateFn>(g_base + kOffscreenCreate.rva)(g_base + kManager, &d);
-        Log("EYE created %p %ux%u kind %u", g_eye, d.width, d.height, d.kind);
+        uint8_t* eye = reinterpret_cast<OffscreenCreateFn>(g_base + kOffscreenCreate.rva)(g_base + kManager, &d);
+        Log("EYE created %p %ux%u kind %u", eye, d.width, d.height, d.kind);
+        if (eye) {
+            std::lock_guard<std::mutex> l(g_eyesLock);
+            g_eyes.push_back(eye);
+        }
     }
-    if (g_eye && g_copyCamera) {
-        if (uint8_t* main = ActiveView()) g_origCameraSubmit(g_eye, main);
+    if (g_copyCamera) {
+        if (uint8_t* main = ActiveView()) {
+            std::lock_guard<std::mutex> l(g_eyesLock);
+            for (uint8_t* eye : g_eyes) g_origCameraSubmit(eye, main);
+        }
     }
     g_origRenderAll();
 }
@@ -196,11 +219,12 @@ static void __fastcall HookCameraSubmit(uint8_t* view, const uint8_t* desc) {
 }
 
 static void InstallHooks() {
-    if (!Check(kOffscreenRenderAll) || !Check(kCameraSubmit) || !Check(kOffscreenCreate) || !Check(kSceneSubmit)) return;
+    if (!Check(kOffscreenRenderAll) || !Check(kCameraSubmit) || !Check(kOffscreenCreate) || !Check(kSceneSubmit) || !Check(kViewCreate)) return;
     MH_Initialize();
     MH_CreateHook(g_base + kOffscreenRenderAll.rva, reinterpret_cast<void*>(&HookRenderAll), reinterpret_cast<void**>(&g_origRenderAll));
     MH_CreateHook(g_base + kSceneSubmit.rva, reinterpret_cast<void*>(&HookSceneSubmit), reinterpret_cast<void**>(&g_origSceneSubmit));
     MH_CreateHook(g_base + kCameraSubmit.rva, reinterpret_cast<void*>(&HookCameraSubmit), reinterpret_cast<void**>(&g_origCameraSubmit));
+    MH_CreateHook(g_base + kViewCreate.rva, reinterpret_cast<void*>(&HookViewCreate), reinterpret_cast<void**>(&g_origViewCreate));
     const MH_STATUS st = MH_EnableHook(MH_ALL_HOOKS);
     Log("HOOKS %s", MH_StatusToString(st));
 }
@@ -245,9 +269,14 @@ static void RunCommand(const std::string& c) {
         g_createH = g_h;
         g_createKind = g_k;
         g_wantCreate = 1;
-    } else if (c == "copy 1") g_copyCamera = true;
+    } else if (sscanf(c.c_str(), "viewkind %u", &g_w) == 1) g_createViewKind = g_w;
+    else if (c == "copy 1") g_copyCamera = true;
     else if (c == "copy 0") g_copyCamera = false;
     else if (sscanf(c.c_str(), "show %d", &g_show) == 1) *reinterpret_cast<int*>(g_base + kShowSlot) = g_show;
+    else if (sscanf(c.c_str(), "emask %x", &g_w) == 1) {
+        std::lock_guard<std::mutex> l(g_eyesLock);
+        for (uint8_t* eye : g_eyes) *reinterpret_cast<uint32_t*>(eye + 0x16cd4) = g_w;
+    }
 }
 
 static DWORD WINAPI ProbeThread(void*) {
