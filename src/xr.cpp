@@ -18,6 +18,7 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include "xr.h"
+#include "capture.h"
 
 extern void Log(const char* fmt, ...);
 
@@ -281,13 +282,19 @@ bool XrLocate(XrEyePose out[2]) {
     return true;
 }
 
+static HANDLE FrameEvent() {
+    static HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    return e;
+}
+
 void XrPaceWait() {
     static XrTime seen = 0;
     const int64_t period = g_periodNs;
     if (!period) return;
     const ULONGLONG limitMs = static_cast<ULONGLONG>(period * 3 / 2 / 1000000) + 1;
     const ULONGLONG start = GetTickCount64();
-    while (g_predicted.load() == seen && GetTickCount64() - start < limitMs) Sleep(0);
+    // Sleeps until the frame thread has a new frame. A polling loop here used about two whole CPU cores.
+    while (g_predicted.load() == seen && GetTickCount64() - start < limitMs) WaitForSingleObject(FrameEvent(), 2);
     seen = g_predicted.load();
 }
 
@@ -629,13 +636,13 @@ static bool MenuRecord(ID3D12GraphicsCommandList* list, XrCompositionLayerQuad* 
 static const int kDotSize = 64;
 static const float kDotDistance = 8.0f, kDotWidth = 0.16f;
 static std::atomic<bool> g_dotOn{false};
-static float g_dotDir[3];
+static float g_dotDir[3], g_dotFrom[3];
 static std::mutex g_dotLock;
 static UiChain g_dot;
 static ID3D12Resource* g_dotUpload;
 static bool g_dotAcquired, g_dotReady;
 
-void XrSetAimDot(const float* roomDir) {
+void XrSetAimDot(const float* roomDir, const float* roomFrom) {
     if (!roomDir) {
         g_dotOn = false;
         return;
@@ -645,6 +652,11 @@ void XrSetAimDot(const float* roomDir) {
         g_dotDir[0] = roomDir[0];
         g_dotDir[1] = roomDir[1];
         g_dotDir[2] = roomDir[2];
+        if (roomFrom) {
+            g_dotFrom[0] = roomFrom[0];
+            g_dotFrom[1] = roomFrom[1];
+            g_dotFrom[2] = roomFrom[2];
+        }
     }
     g_dotOn = true;
 }
@@ -713,20 +725,20 @@ static bool DotRecord(ID3D12GraphicsCommandList* list, XrCompositionLayerQuad* o
         list->ResourceBarrier(1, &bar);
         g_dotReady = true;
     }
-    float dir[3];
+    float dir[3], from[3];
     {
         std::lock_guard<std::mutex> l(g_dotLock);
         memcpy(dir, g_dotDir, sizeof(dir));
+        memcpy(from, g_dotFrom, sizeof(from));
     }
-    const XrPosef& a = pose.views[0].pose;
-    const XrPosef& b = pose.views[1].pose;
     *out = {XR_TYPE_COMPOSITION_LAYER_QUAD};
     out->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
     out->space = g_space;
     out->eyeVisibility = XR_EYE_VISIBILITY_BOTH;
     out->subImage.swapchain = g_dot.chain;
     out->subImage.imageRect.extent = {kDotSize, kDotSize};
-    out->pose.position = {(a.position.x + b.position.x) * 0.5f + dir[0] * kDotDistance, (a.position.y + b.position.y) * 0.5f + dir[1] * kDotDistance, (a.position.z + b.position.z) * 0.5f + dir[2] * kDotDistance};
+    // The aim line starts at the game's camera, which is the centred head position in the room, not the head as it leans.
+    out->pose.position = {from[0] + dir[0] * kDotDistance, from[1] + dir[1] * kDotDistance, from[2] + dir[2] * kDotDistance};
     // Faces back along the line: yaw first, then pitch.
     const float yaw = atan2f(-dir[0], -dir[2]), pitch = asinf(std::clamp(dir[1], -1.0f, 1.0f));
     const float cy = cosf(yaw * 0.5f), sy = sinf(yaw * 0.5f), cp = cosf(pitch * 0.5f), sp = sinf(pitch * 0.5f);
@@ -742,6 +754,13 @@ static void DotRelease() {
     g_dotAcquired = false;
 }
 
+void XrRecenterScreen() {
+    // Everything placed in the room comes round with the head.
+    g_screenPlaced = false;
+    g_menuPlaced = false;
+    g_hudPlaced = false;
+}
+
 static void MenuRelease() {
     if (!g_menuAcquired) return;
     XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
@@ -752,7 +771,7 @@ static XrPosef g_screenPose{{0, 0, 0, 1}, {0, 0, -2.5f}};
 static std::atomic<bool> g_cinema{false};
 void XrSetCinema(bool on) { g_cinema = on; }
 static const float kScreenWidth = 3.2f, kScreenDistance = 2.5f;
-void XrRecenterScreen() { g_screenPlaced = false; }
+void XrRecenterScreen();
 
 static int64_t ScreenFormatFor(int dxgi) {
     // Same family as the back buffer so a plain copy works. The sRGB form because the bytes are already gamma encoded.
@@ -890,7 +909,14 @@ void XrOnPresentScreen(void* resource, int width, int height, int dxgiFormat) {
 }
 
 static std::atomic<bool> g_hudHole{false};
+static std::wstring g_hudAfterPath;
+static std::atomic<bool> g_hudAfterWanted{false};
+void XrDumpHudAfter(const wchar_t* path) {
+    g_hudAfterPath = path;
+    g_hudAfterWanted = true;
+}
 static bool g_uiFilled[kUiSlots];
+static void* g_uiLastDst;
 void XrSetHudHole(bool on) { g_hudHole = on; }
 static ID3D12Resource* g_holeUpload;
 static void* g_mirror;
@@ -1078,6 +1104,7 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
         g_usWaitImage += NowUs() - t0;
         uiAcquired[i] = true;
         ID3D12Resource* dst = g_ui[i].images[idx].texture;
+        if (i == 0) g_uiLastDst = dst;
         auto* src = static_cast<ID3D12Resource*>(ui[i].resource);
         D3D12_RESOURCE_BARRIER bar[2]{};
         bar[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1123,6 +1150,12 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
         if (uiAcquired[i]) {
             XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
             p_xrReleaseSwapchainImage(g_ui[i].chain, &ri);
+            if (i == 0 && g_hudAfterWanted.exchange(false)) {
+                void* r[1] = {g_uiLastDst};
+                uint32_t st[1] = {D3D12_RESOURCE_STATE_RENDER_TARGET};
+                const wchar_t* paths[1] = {g_hudAfterPath.c_str()};
+                CaptureRequest(r, st, paths, 1);
+            }
         }
     }
     XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};

@@ -6,6 +6,10 @@
 #include <MinHook.h>
 #include "capture.h"
 #include "xr.h"
+#include <wincodec.h>
+#pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "ole32.lib")
+#undef small
 #include <intrin.h>
 #include <algorithm>
 #include <atomic>
@@ -19,7 +23,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 45
+#define BUILD_NUMBER 48
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -170,7 +174,8 @@ static void __fastcall HookViewCreate(uint8_t* view, const char* name, void* buf
 using BufferSizeFn = void(__fastcall*)(uint8_t*, const char*, uint32_t, uint32_t, int, char);
 static BufferSizeFn g_origBufferSize;
 // Percent of the eye's size that the scene is drawn at, DLSS making up the rest. 100 is DLAA.
-static std::atomic<int> g_eyeRenderPercent{67};
+// -1: the size the game's own DLSS choice gives its own view.
+static std::atomic<int> g_eyeRenderPercent{-1};
 static std::atomic<uint32_t> g_eyeRenderW{0}, g_eyeRenderH{0};
 static std::atomic<uint32_t> g_forceW{0}, g_forceH{0};
 static void __fastcall HookBufferSize(uint8_t* buffers, const char* name, uint32_t w, uint32_t h, int kind, char align) {
@@ -182,7 +187,23 @@ static void __fastcall HookBufferSize(uint8_t* buffers, const char* name, uint32
         outH = g_forceH;
         // Only DLSS can make up the difference. With any other choice in the game's menu the eyes draw at full size.
         const int aaType = *reinterpret_cast<int*>(g_base + 0x533959c);
-        const int percent = aaType == 0 ? g_eyeRenderPercent.load() : 100;
+        int percent = g_eyeRenderPercent.load();
+        if (percent < 0) {
+            // The game's quality setting, live: settings object +0xc0, 0 Ultra Performance, 1 Performance, 2 Balanced, 3 Quality
+            // (read from the game's log per registry value). Other values log as Quality too.
+            static const int kRatios[] = {33, 50, 58, 67};
+            percent = 67;
+            uint8_t* app = *reinterpret_cast<uint8_t**>(g_base + 0x684bda0);
+            uint8_t* obj = app ? *reinterpret_cast<uint8_t**>(app) : nullptr;
+            if (obj) {
+                using GetSettingsFn = uint8_t*(__fastcall*)(uint8_t*);
+                uint8_t* settings = (*reinterpret_cast<GetSettingsFn**>(obj))[0x130 / 8](obj);
+                const int q = settings ? *reinterpret_cast<int*>(settings + 0xc0) : 3;
+                if (q >= 0 && q < 4) percent = kRatios[q];
+                Log("EYE game DLSS quality %d", q);
+            }
+        }
+        if (aaType != 0) percent = 100;
         Log("EYE scene percent %d (setting %d, game aa type %d)", percent, g_eyeRenderPercent.load(), aaType);
         w = (outW * percent / 100 + 7) & ~7u;
         h = (outH * percent / 100 + 7) & ~7u;
@@ -401,6 +422,11 @@ static std::atomic<float> g_cinemaIpd{0.03f};
 static std::atomic<int> g_aimDot{1};
 static float g_aimRoom[3];
 static std::atomic<ULONGLONG> g_lastTrigger{0};
+// 1 while the pause menu is up. Found by comparing .data, tools\\flag_watch.py. Beside the frame counter 0x6794fe8.
+static const size_t kPausedFlag = 0x6794fd0;
+static const size_t kPausedOthers[] = {0x51628f8, 0x5162e98, 0x5f3a478, 0x5f3e324, 0x5f5c2d1, 0x628bb30, 0x679b214};
+// Logging and counters that only help development. LabProbes=0 in the ini, or `probes 0`, turns them off.
+static std::atomic<bool> g_labProbes{true};
 static void UpdateMode() {
     uint8_t* main = ActiveView();
     bool world = false;
@@ -424,7 +450,23 @@ static void UpdateMode() {
         if (onFrames >= 3) steady = true;
         if (offFrames >= 15) steady = false;
         const bool cine = g_cinemaOn && steady;
-        {
+        if (g_labProbes) {
+            static uint8_t seenPause[7] = {};
+            static int seenMain = 0;
+            char pauseChanges[160];
+            int pn = 0;
+            for (int i = 0; i < 7; ++i) {
+                const uint8_t v = *(g_base + kPausedOthers[i]);
+                if (v != seenPause[i]) {
+                    pn += sprintf_s(pauseChanges + pn, sizeof(pauseChanges) - pn, " %zx=%u", kPausedOthers[i], v);
+                    seenPause[i] = v;
+                }
+            }
+            const int paused = *reinterpret_cast<int*>(g_base + kPausedFlag);
+            if (pn || paused != seenMain) {
+                Log("PAUSEFLAGS chosen %d%s", paused, pn ? pauseChanges : "");
+                seenMain = paused;
+            }
             static uint8_t seen[8] = {};
             char changes[160];
             int n = 0;
@@ -584,8 +626,9 @@ static void __fastcall HookRenderAll() {
                     const bool aiming = fabs(lens - 32.64) < 0.5 || GetTickCount64() - g_lastTrigger.load() < 2000;
                     const int dot = g_aimDot.load();
                     const bool dotOn = !g_cinemaNow && (dot == 2 || (dot == 1 && aiming));
-                    XrSetAimDot(dotOn ? room : nullptr);
-                    XrSetHudHole(!g_cinemaNow && dot != 0 && aiming);
+                    XrSetAimDot(dotOn ? room : nullptr, g_centre);
+                    // Paused or in a cutscene the HUD image holds menus: otherwise the game's reticle never shows, aiming or not.
+                    XrSetHudHole(!g_cinemaNow && dot != 0 && *reinterpret_cast<int*>(g_base + kPausedFlag) == 0);
                     g_aimRoom[0] = room[0];
                     g_aimRoom[1] = room[1];
                     g_aimRoom[2] = room[2];
@@ -708,9 +751,11 @@ static void* __fastcall HookSceneSubmit(uint8_t* view, void* a, uint32_t mask, c
         }
     }
     {
-        std::lock_guard<std::mutex> l(g_statsLock);
-        ++g_sceneSubmits[view];
-        g_sceneMask[view] = mask;
+        if (g_labProbes) {
+            std::lock_guard<std::mutex> l(g_statsLock);
+            ++g_sceneSubmits[view];
+            g_sceneMask[view] = mask;
+        }
     }
     // Eyes read the main view's Adapted Lum, so they have the exposure the game chose. The handle is only lent while
     // the scene submit copies the view into its job: if it stayed, rebuilding an eye would free the main view's buffer.
@@ -744,7 +789,7 @@ static void* __fastcall HookSceneSubmit(uint8_t* view, void* a, uint32_t mask, c
 }
 
 static void __fastcall HookCameraSubmit(uint8_t* view, const uint8_t* desc) {
-    {
+    if (g_labProbes) {
         std::lock_guard<std::mutex> l(g_statsLock);
         ++g_cameraSubmits[{static_cast<size_t>(reinterpret_cast<uint8_t*>(_ReturnAddress()) - g_base), view}];
     }
@@ -985,11 +1030,11 @@ static std::atomic<bool> g_menuOpen{false};
 static int g_menuRow = 0;
 static int g_resolutionSetting = 100;
 static bool g_skipLauncherSetting = true;
-static int g_dlssPercentSetting = 67;  // 0 means no DLSS in the eyes: the game's own anti-aliasing
+static int g_dlssPercentSetting = -1;  // -1 the game's choice, 0 no DLSS in the eyes, otherwise a fixed size
 static float g_hudDistanceSetting = 2.0f;
 static std::wstring g_iniPath;
 static std::vector<uint32_t> g_menuImage;
-static const int kMenuW = 1024, kMenuH = 912, kMenuRows = 10;
+static const int kMenuW = 1024, kMenuH = 984, kMenuRows = 11;
 
 static void SaveSetting(const wchar_t* name, int value) {
     WritePrivateProfileStringW(L"VR", name, std::to_wstring(value).c_str(), g_iniPath.c_str());
@@ -1016,8 +1061,9 @@ static void MenuRowText(int row, wchar_t (&name)[64], wchar_t (&value)[32]) {
         swprintf_s(value, L"%d%%", g_resolutionSetting);
         break;
     case 5:
-        wcscpy_s(name, L"DLSS scene size (next launch)");
+        wcscpy_s(name, L"DLSS in the eyes (next launch)");
         if (g_dlssPercentSetting == 0) wcscpy_s(value, L"DLSS off");
+        else if (g_dlssPercentSetting < 0) wcscpy_s(value, L"Game's setting");
         else swprintf_s(value, L"%d%%", g_dlssPercentSetting);
         break;
     case 6:
@@ -1031,6 +1077,9 @@ static void MenuRowText(int row, wchar_t (&name)[64], wchar_t (&value)[32]) {
     case 8:
         wcscpy_s(name, L"Aim dot");
         wcscpy_s(value, g_aimDot == 0 ? L"Off" : g_aimDot == 1 ? L"While aiming" : L"Always");
+        break;
+    case 9:
+        wcscpy_s(name, L"Snapshot in 2 seconds");
         break;
     default: wcscpy_s(name, L"Close"); break;
     }
@@ -1127,6 +1176,7 @@ static void MenuOpen() {
     Log("MENU open");
 }
 
+static DWORD WINAPI SnapshotThread(void*);
 // dir: -1 or 1 changes the value, 0 is A.
 static void MenuChange(int dir) {
     switch (g_menuRow) {
@@ -1158,14 +1208,14 @@ static void MenuChange(int dir) {
         break;
     case 5:
     {
-        // Off, Performance, Balanced, Quality, Ultra Quality, DLAA.
-        static const int steps[] = {0, 50, 58, 67, 77, 100};
-        int i = 3;
-        for (int k = 0; k < 6; ++k) if (steps[k] == g_dlssPercentSetting) i = k;
-        i = std::clamp(i + (dir == 0 ? 1 : dir), 0, 5);
+        // The game's own choice, off, then fixed sizes.
+        static const int steps[] = {-1, 0, 50, 58, 67, 77, 100};
+        int i = 0;
+        for (int k = 0; k < 7; ++k) if (steps[k] == g_dlssPercentSetting) i = k;
+        i = std::clamp(i + (dir == 0 ? 1 : dir), 0, 6);
         g_dlssPercentSetting = steps[i];
         SaveSetting(L"EyeDLSS", g_dlssPercentSetting ? 1 : 0);
-        if (g_dlssPercentSetting) SaveSetting(L"EyeDLSSPercent", g_dlssPercentSetting);
+        SaveSetting(L"EyeDLSSScene", g_dlssPercentSetting);
         break;
     }
     case 6:
@@ -1180,6 +1230,13 @@ static void MenuChange(int dir) {
         g_aimDot = (g_aimDot.load() + (dir < 0 ? 2 : 1)) % 3;
         SaveSetting(L"AimDot", g_aimDot.load());
         break;
+    case 9:
+        if (dir == 0) {
+            CreateThread(nullptr, 0, SnapshotThread, nullptr, 0, nullptr);
+            MenuClose();
+            return;
+        }
+        break;
     default:
         if (dir == 0) {
             MenuClose();
@@ -1189,6 +1246,100 @@ static void MenuChange(int dir) {
     }
     Log("MENU row %d dir %d: scale %.2f pitch decoupled %d hud %.2f resolution %d dlss %d", g_menuRow, dir, g_worldScale.load(), g_levelCamera.load(), g_hudDistanceSetting, g_resolutionSetting, g_dlssPercentSetting);
     MenuDraw();
+}
+
+// ---- snapshot: what the mod has in hand, for showing a problem from the headset. Two seconds to close the menu. ----
+static std::atomic<int> g_snapNumber{0};
+static bool BmpToJpeg(const std::wstring& bmp, const std::wstring& jpg) {
+    IWICImagingFactory* f = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&f)))) return false;
+    bool ok = false;
+    IWICBitmapDecoder* dec = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    IWICStream* stream = nullptr;
+    IWICBitmapEncoder* enc = nullptr;
+    IWICBitmapFrameEncode* out = nullptr;
+    IPropertyBag2* props = nullptr;
+    if (SUCCEEDED(f->CreateDecoderFromFilename(bmp.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec)) && SUCCEEDED(dec->GetFrame(0, &frame)) && SUCCEEDED(f->CreateStream(&stream)) && SUCCEEDED(stream->InitializeFromFilename(jpg.c_str(), GENERIC_WRITE)) && SUCCEEDED(f->CreateEncoder(GUID_ContainerFormatJpeg, nullptr, &enc)) && SUCCEEDED(enc->Initialize(stream, WICBitmapEncoderNoCache)) && SUCCEEDED(enc->CreateNewFrame(&out, &props)) && SUCCEEDED(out->Initialize(props))) {
+        UINT w = 0, h = 0;
+        frame->GetSize(&w, &h);
+        WICPixelFormatGUID fmt = GUID_WICPixelFormat24bppBGR;
+        out->SetSize(w, h);
+        out->SetPixelFormat(&fmt);
+        ok = SUCCEEDED(out->WriteSource(frame, nullptr)) && SUCCEEDED(out->Commit()) && SUCCEEDED(enc->Commit());
+    }
+    for (IUnknown* u : std::initializer_list<IUnknown*>{props, out, enc, stream, frame, dec, f}) {
+        if (u) u->Release();
+    }
+    return ok;
+}
+static uint8_t* UiTexture(int i, int* w, int* h);
+static void* TextureResource(uint8_t* tex, uint32_t* state);
+static DWORD WINAPI SnapshotThread(void*) {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    Sleep(2000);
+    const int n = g_snapNumber.fetch_add(1) + 1;
+    const std::wstring dir = g_dir + L"vrlab_snaps\\";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    wchar_t stamp[32];
+    swprintf_s(stamp, L"%02d%02d%02d_%d", t.wHour, t.wMinute, t.wSecond, n);
+    std::vector<void*> res;
+    std::vector<uint32_t> states;
+    std::vector<std::wstring> bases;
+    {
+        std::lock_guard<std::mutex> l(g_eyesLock);
+        int e = 0;
+        for (uint8_t* eye : g_eyes) {
+            if (void* r = EyeTexture(eye)) {
+                res.push_back(r);
+                states.push_back(*reinterpret_cast<uint32_t*>(EyeRecord(eye) + 0x28));
+                bases.push_back(std::wstring(stamp) + (e == 0 ? L"_left" : L"_right"));
+            }
+            ++e;
+        }
+    }
+    for (int i : {5, 0, 1, 2, 3, 4}) {
+        int w = 0, h = 0;
+        uint8_t* tex = UiTexture(i, &w, &h);
+        uint32_t st = 0;
+        void* r = tex ? TextureResource(tex, &st) : nullptr;
+        if (r) {
+            res.push_back(r);
+            states.push_back(st);
+            bases.push_back(std::wstring(stamp) + (i == 5 ? L"_hud" : L"_ui" + std::to_wstring(i)));
+        }
+    }
+    std::vector<std::wstring> paths;
+    std::vector<const wchar_t*> ptrs;
+    for (auto& b : bases) paths.push_back(dir + b + L".bmp");
+    for (auto& p : paths) ptrs.push_back(p.c_str());
+    const bool queued = !res.empty() && CaptureRequest(res.data(), states.data(), ptrs.data(), static_cast<int>(res.size()));
+    char state[256] = "";
+    if (uint8_t* v = ActiveView()) {
+        const float* c = reinterpret_cast<const float*>(v);
+        const float* proj = reinterpret_cast<const float*>(v + 0x1c0);
+        sprintf_s(state, "cam %.2f %.2f %.2f fwd %.3f %.3f %.3f lens %.2f cinematic %d paused %d pitch %d", c[12], c[13], c[14], c[8], c[9], c[10], proj[5] != 0 ? 2.0 * atan(1.0 / fabs(proj[5])) * 57.29577951 : 0.0, g_cinemaNow.load() ? 1 : 0, *reinterpret_cast<int*>(g_base + kPausedFlag), g_levelCamera.load());
+    }
+    Log("SNAP %d queued %d: %s %s", n, static_cast<int>(res.size()), queued ? "yes" : "no", state);
+    // Written by the capture code as files appear. Each becomes a JPEG, listed in the index the lab reads.
+    FILE* index = nullptr;
+    for (size_t i = 0; i < paths.size(); ++i) {
+        for (int w = 0; w < 200 && GetFileAttributesW(paths[i].c_str()) == INVALID_FILE_ATTRIBUTES; ++w) Sleep(100);
+        Sleep(400);
+        const std::wstring jpg = dir + bases[i] + L".jpg";
+        if (BmpToJpeg(paths[i], jpg)) {
+            DeleteFileW(paths[i].c_str());
+            if (_wfopen_s(&index, (dir + L"index.txt").c_str(), L"a") == 0 && index) {
+                fwprintf(index, L"%ls.jpg\n", bases[i].c_str());
+                fclose(index);
+            }
+        }
+    }
+    Log("SNAP %d done", n);
+    CoUninitialize();
+    return 0;
 }
 
 // The game must not see the pad while the menu is open.
@@ -1394,7 +1545,7 @@ static void PollPad() {
         } else if (i == kLeft || i == kRight) {
             MenuChange(i == kLeft ? -1 : 1);
         } else if (i == kA) {
-            if (g_menuRow == 0 || g_menuRow == 2 || g_menuRow == 6 || g_menuRow == 7 || g_menuRow == 8 || g_menuRow == kMenuRows - 1) MenuChange(0);
+            if (g_menuRow == 0 || g_menuRow == 2 || g_menuRow == 6 || g_menuRow == 7 || g_menuRow == 8 || g_menuRow == 9 || g_menuRow == kMenuRows - 1) MenuChange(0);
         } else {
             MenuClose();
         }
@@ -1580,7 +1731,6 @@ static void OverrideSetting(const wchar_t* name, void* data) {
         if (!_wcsicmp(name, L"Fullscreen") || !_wcsicmp(name, L"ExclusiveFullscreen") || !_wcsicmp(name, L"WindowMaximized")) small = 0;
         else if (!_wcsicmp(name, L"WindowWidth") || !_wcsicmp(name, L"UserWindowWidth")) small = 2560;
         else if (!_wcsicmp(name, L"WindowHeight") || !_wcsicmp(name, L"UserWindowHeight")) small = 1440;
-        else if (!_wcsicmp(name, L"DynamicResolutionTargetFPS")) small = 120;
         if (small >= 0) {
             if (*static_cast<int*>(data) != small) Log("REG %ls was %d, the game is told %d", name, *static_cast<int*>(data), small);
             *static_cast<int*>(data) = small;
@@ -1771,6 +1921,13 @@ static void RunCommand(const std::string& c) {
     else if (sscanf(c.c_str(), "eyenoui %u", &g_w) == 1) g_eyeNoUi = g_w != 0;
     else if (sscanf(c.c_str(), "mirror %u", &g_w) == 1) g_mirrorEye = g_w != 0;
     else if (c == "hudshot") g_wantHudShot = 1;
+    else if (c == "snapshot") CreateThread(nullptr, 0, SnapshotThread, nullptr, 0, nullptr);
+    else if (sscanf(c.c_str(), "probes %u", &g_w) == 1) g_labProbes = g_w != 0;
+    else if (sscanf(c.c_str(), "hudafter %63s", g_text) == 1) {
+        static std::wstring p;
+        p = g_dir + L"vrlab_shots\\" + std::wstring(g_text, g_text + strlen(g_text)) + L".bmp";
+        XrDumpHudAfter(p.c_str());
+    }
     else if (sscanf(c.c_str(), "skipmain %u", &g_w) == 1) g_skipMain = static_cast<int>(g_w);
     else if (sscanf(c.c_str(), "cinemaipd %f", &g_f) == 1) g_cinemaIpd = g_f;
     else if (sscanf(c.c_str(), "aimdot %u", &g_w) == 1) g_aimDot = static_cast<int>(g_w);
@@ -1924,7 +2081,10 @@ static DWORD WINAPI ProbeThread(void*) {
     {
         const std::wstring early = g_dir + L"RiftApartVR.ini";
         g_eyeDlss = GetPrivateProfileIntW(L"VR", L"EyeDLSS", 1, early.c_str()) != 0;
-        g_eyeRenderPercent = g_eyeDlss ? std::clamp(static_cast<int>(GetPrivateProfileIntW(L"VR", L"EyeDLSSPercent", 67, early.c_str())), 33, 100) : 100;
+        {
+            const int v = static_cast<int>(GetPrivateProfileIntW(L"VR", L"EyeDLSSScene", -1, early.c_str()));
+            g_eyeRenderPercent = !g_eyeDlss ? 100 : v < 0 ? -1 : std::clamp(v, 33, 100);
+        }
         g_regForce = !g_eyeDlss && GetPrivateProfileIntW(L"VR", L"ForceGameAA", 1, early.c_str()) != 0;
         g_skipLauncher = GetPrivateProfileIntW(L"VR", L"SkipLauncher", 1, early.c_str()) != 0;
         g_smallFlat = GetPrivateProfileIntW(L"VR", L"SmallFlatView", 1, early.c_str()) != 0;
@@ -1941,6 +2101,7 @@ static DWORD WINAPI ProbeThread(void*) {
     g_dlssPercentSetting = g_eyeDlss ? g_eyeRenderPercent.load() : 0;
     g_cinemaOn = GetPrivateProfileIntW(L"VR", L"CutsceneScreen", 1, ini.c_str()) != 0;
     g_aimDot = static_cast<int>(GetPrivateProfileIntW(L"VR", L"AimDot", 1, ini.c_str()));
+    g_labProbes = GetPrivateProfileIntW(L"VR", L"LabProbes", 1, ini.c_str()) != 0;
     g_skipLauncher = g_skipLauncherSetting;
     InstallSlProbe();
     if (GetPrivateProfileIntW(L"VR", L"VtProbe", 0, ini.c_str())) {
@@ -1995,7 +2156,7 @@ static DWORD WINAPI ProbeThread(void*) {
         {
             // Gravity boots: does the game's camera lean? Logged once a second when its right row leaves the level.
             static ULONGLONG lastRow = 0;
-            if (now - lastRow >= 1000) {
+            if (g_labProbes && now - lastRow >= 1000) {
                 lastRow = now;
                 if (uint8_t* v = ActiveView()) {
                     float m[16];
@@ -2021,7 +2182,7 @@ static DWORD WINAPI ProbeThread(void*) {
                 }
             }
         }
-        if (now - lastView >= 5000) {
+        if (g_labProbes && now - lastView >= 5000) {
             lastView = now;
             LogView();
         }
