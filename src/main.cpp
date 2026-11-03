@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 23
+#define BUILD_NUMBER 26
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -120,6 +120,7 @@ static const Target kLensPose{"LensPose", 0x1214150, "\x40\x53\x48\x83\xec\x60\x
 static const Target kJitter{"Jitter", 0x1234030, "\x48\x89\x5c\x24\x08\x48\x89\x74\x24\x10\x48\x89\x7c\x24\x18\x41\x56"};
 static const Target kBufferSize{"BufferSize", 0x120c2e0, "\x48\x89\x5c\x24\x08\x48\x89\x74\x24\x10\x48\x89\x7c\x24\x18\x55\x41\x54"};
 static const Target kTone{"Tone", 0x11dc080, "\x48\x8b\xc4\x48\x89\x50\x10\x55\x53\x56\x57\x41"};
+static const Target kCameraPush{"CameraPush", 0xfc7110, "\x40\x53\x57\x41\x56\x48\x81\xec\x30\x05"};
 static const size_t kManager = 0x6739a10;
     // ViewContextManager
 static const size_t kShowSlot = 0x5339598;   // the game draws this offscreen slot over the active view
@@ -200,6 +201,87 @@ static void* __fastcall HookTone(void* a, void* b, void* c, uint8_t* view, void*
     return g_origTone(a, b, c, view, e, generic);
 }
 
+// ---- what kind of camera is the game using? MSVC RTTI names the class. ----
+static std::string RttiName(void* obj) {
+    uint8_t* vt = nullptr;
+    if (!SafeCopy(&vt, obj, 8) || !vt) return "?";
+    uint8_t* col = nullptr;
+    if (!SafeCopy(&col, vt - 8, 8) || !col) return "?";
+    int32_t td = 0;
+    if (!SafeCopy(&td, col + 0xc, 4)) return "?";
+    char name[96] = {};
+    if (!SafeCopy(name, g_base + td + 0x10, sizeof(name) - 1)) return "?";
+    return name;
+}
+using CameraPushFn = void(__fastcall*)(int64_t*, int);
+static CameraPushFn g_origCameraPush;
+static std::mutex g_camLock;
+static void* g_lastCamVt[8];
+static std::string g_camClass;
+static uint8_t* MainCameraObject(int64_t* sys, int slot) {
+    int64_t cam = 0;
+    int64_t list = 0;
+    if (SafeCopy(&list, sys + 0xf, 8) && list) SafeCopy(&cam, reinterpret_cast<int64_t*>(list) + slot, 8);
+    if (!cam) {
+        SafeCopy(&list, sys, 8);
+        if (list) SafeCopy(&cam, reinterpret_cast<int64_t*>(list) + slot, 8);
+    }
+    return reinterpret_cast<uint8_t*>(cam);
+}
+static std::atomic<bool> g_wantCamTree{false};
+// Lists fields of a camera object that point at objects with RTTI, following those in the Camera2 family.
+static void WalkCam(uint8_t* obj, int depth) {
+    if (depth > 3) return;
+    for (size_t off = 8; off < 0x400; off += 8) {
+        uint8_t* p = nullptr;
+        if (!SafeCopy(&p, obj + off, 8) || reinterpret_cast<uint64_t>(p) < 0x10000 || p == obj) continue;
+        uint8_t* vt = nullptr;
+        if (!SafeCopy(&vt, p, 8)) continue;
+        if (vt < g_base + 0x2e37000 || vt >= g_base + 0x512c000) continue;  // vtables live in .rdata
+        const std::string n = RttiName(p);
+        if (n.size() < 4 || n[0] != '.' || n[1] != '?') continue;
+        if (n.find("Camera") == std::string::npos && n.find("Cine") == std::string::npos && n.find("Hero") == std::string::npos) continue;
+        Log("CAMTREE %*s+%zx %p %s", depth * 2, "", off, p, n.c_str());
+        if (n.find("Camera2") != std::string::npos) WalkCam(p, depth + 1);
+    }
+}
+static void __fastcall HookCameraPush(int64_t* sys, int slot) {
+    if (slot >= 0 && slot < 8) {
+        if (uint8_t* cam = MainCameraObject(sys, slot)) {
+            void* vt = nullptr;
+            if (SafeCopy(&vt, cam, 8) && vt != g_lastCamVt[slot]) {
+                g_lastCamVt[slot] = vt;
+                const std::string n = RttiName(cam);
+                Log("CAMCLASS slot %d %s", slot, n.c_str());
+                if (slot == 0) {
+                    std::lock_guard<std::mutex> l(g_camLock);
+                    g_camClass = n;
+                }
+            }
+        }
+    }
+    if (slot == 0 && g_wantCamTree.exchange(false)) {
+        Log("CAMTREE system %p %s", sys, RttiName(sys).c_str());
+        // Report every RTTI object reachable from the camera system: fields, and pointer arrays in its fields.
+        for (size_t off = 0; off < 0x300; off += 8) {
+            uint8_t* p = nullptr;
+            if (!SafeCopy(&p, reinterpret_cast<uint8_t*>(sys) + off, 8) || reinterpret_cast<uint64_t>(p) < 0x10000) continue;
+            const std::string n = RttiName(p);
+            if (n.size() > 4 && n[0] == '.') Log("CAMTREE +%zx %p %s", off, p, n.c_str());
+            for (size_t j = 0; j < 12; ++j) {
+                uint8_t* q = nullptr;
+                if (!SafeCopy(&q, p + j * 8, 8) || reinterpret_cast<uint64_t>(q) < 0x10000) continue;
+                const std::string m = RttiName(q);
+                if (m.size() > 4 && m[0] == '.') {
+                    Log("CAMTREE +%zx[%zu] %p %s", off, j, q, m.c_str());
+                    if (m.find("Camera2") != std::string::npos) WalkCam(q, 1);
+                }
+            }
+        }
+    }
+    g_origCameraPush(sys, slot);
+}
+
 static SceneSubmitFn g_origSceneSubmit;
 static RenderAllFn g_origRenderAll;
 static CameraSubmitFn g_origCameraSubmit;
@@ -211,18 +293,20 @@ static std::map<void*, uint64_t> g_sceneSubmits;
 static std::map<void*, uint32_t> g_sceneMask;
 
 // Test commands set these, and the game's own thread acts on them at the top of the offscreen pass.
+static bool g_haveCentre = false;
+static std::atomic<bool> g_xrEyes{false};
 static std::atomic<int> g_wantCreate{0};
 static std::atomic<uint32_t> g_createW{1920}, g_createH{1080}, g_createKind{2};
+static void CreateEyeImpl();
 static std::vector<uint8_t*> g_eyes;
 static std::mutex g_eyesLock;
 static std::atomic<bool> g_copyCamera{false};
 static std::atomic<bool> g_stereo{false};
 static std::atomic<float> g_ipd{0.064f};
-static std::atomic<bool> g_xrEyes{false}, g_wantRecenter{false}, g_pace{true}, g_shareLum{false};
+static std::atomic<bool> g_wantRecenter{false}, g_pace{true}, g_shareLum{false};
 static std::atomic<float> g_worldScale{1.0f};
 static std::atomic<bool> g_levelCamera{true};
 static float g_lastFacing[2] = {0, 1};
-static bool g_haveCentre = false;
 static float g_centre[3], g_centreYaw;
 // Off-centre perspective from edges, then the pose: the same two steps the game's own camera builders end with.
 // Edges are tangents: left, right, bottom, top, as OpenXR gives them.
@@ -234,10 +318,80 @@ static uint8_t* ActiveView() {
     return g_activeViewPtr ? static_cast<uint8_t*>(*g_activeViewPtr) : nullptr;
 }
 
+static void CreateEyeImpl() {
+    OffscreenDesc d{};
+    d.name = kEyeName;
+    d.nearZ = 0.1f;
+    d.farZ = 100000.f;
+    d.fovDegrees = 47.45f;
+    d.width = g_createW;
+    d.height = g_createH;
+    d.format = 28;
+    d.kind = g_createKind;
+    d.unknown = -1;
+    uint8_t* eye = reinterpret_cast<OffscreenCreateFn>(g_base + kOffscreenCreate.rva)(g_base + kManager, &d);
+    Log("EYE created %p %ux%u kind %u", eye, d.width, d.height, d.kind);
+    if (eye) {
+        std::lock_guard<std::mutex> l(g_eyesLock);
+        *reinterpret_cast<uint32_t*>(eye + 0x16cd4) = 0x3fff;  // the same passes as the main view
+        if (g_eyes.empty()) g_eyeA = eye;
+        else if (g_eyes.size() == 1) g_eyeB = eye;
+        g_eyes.push_back(eye);
+    }
+}
+
+// ---- flat screen or 3D world ----
+// The title sits at the origin with a 39.43 degree lens. Anything else that lasts a second is treated as the world.
+static std::atomic<bool> g_xrSession{false};
+static void CreateEyeNow();
+static void UpdateMode() {
+    uint8_t* main = ActiveView();
+    bool world = false;
+    if (main) {
+        const float* cam = reinterpret_cast<const float*>(main);
+        const float* proj = reinterpret_cast<const float*>(main + 0x1c0);
+        const bool atOrigin = fabsf(cam[12]) + fabsf(cam[13]) + fabsf(cam[14]) < 1.0f;
+        const double vfov = proj[5] != 0 ? 2.0 * atan(1.0 / fabs(proj[5])) * 57.29577951 : 0;
+        // The title's fly-by holds one spot with a 33.3 degree lens.
+        const bool titleSpot = fabsf(cam[12] + 17.55f) + fabsf(cam[13] - 39.476f) + fabsf(cam[14] + 223.651f) < 1.0f;
+        world = !atOrigin && !titleSpot && fabs(vfov - 39.43) > 0.05;
+    }
+    static ULONGLONG since = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (!world) {
+        since = 0;
+    } else if (!since) {
+        since = now;
+    }
+    const bool wantEyes = world && now - since >= 1000;
+    if (wantEyes && g_eyes.size() < 2) {
+        CreateEyeNow();
+        return;
+    }
+    if (wantEyes != g_xrEyes.load()) {
+        Log("MODE %s", wantEyes ? "3D world" : "flat screen");
+        std::lock_guard<std::mutex> l(g_eyesLock);
+        for (uint8_t* eye : g_eyes) {
+            // Flag bit 0 makes the engine skip an offscreen view: the eyes cost nothing on the flat screen.
+            uint32_t& flags = *reinterpret_cast<uint32_t*>(eye + 0x16ccc);
+            flags = wantEyes ? (flags & ~1u) : (flags | 1u);
+        }
+        g_haveCentre = wantEyes && g_haveCentre;
+        g_xrEyes = wantEyes;
+    }
+}
+
+static void CreateEyeNow() { CreateEyeImpl(); }
+
 static void __fastcall HookRenderAll() {
     ++g_frames;
-    if (g_xrEyes && g_pace) XrPaceWait();
-    if (g_wantCreate.exchange(0)) {
+    if (g_xrSession && g_pace) XrPaceWait();
+    if (g_xrSession) UpdateMode();
+    if (g_wantCreate.exchange(0)) CreateEyeNow();
+    {
+        // Moved below: placeholder kept empty.
+    }
+    if (false) {
         OffscreenDesc d{};
         d.name = kEyeName;
         d.nearZ = 0.1f;
@@ -417,12 +571,13 @@ static void __fastcall HookCameraSubmit(uint8_t* view, const uint8_t* desc) {
 }
 
 static void InstallHooks() {
-    if (!Check(kOffscreenRenderAll) || !Check(kCameraSubmit) || !Check(kOffscreenCreate) || !Check(kSceneSubmit) || !Check(kViewCreate) || !Check(kLensPersp) || !Check(kLensPose) || !Check(kJitter) || !Check(kBufferSize) || !Check(kTone)) return;
+    if (!Check(kOffscreenRenderAll) || !Check(kCameraSubmit) || !Check(kOffscreenCreate) || !Check(kSceneSubmit) || !Check(kViewCreate) || !Check(kLensPersp) || !Check(kLensPose) || !Check(kJitter) || !Check(kBufferSize) || !Check(kTone) || !Check(kCameraPush)) return;
     MH_Initialize();
     MH_CreateHook(g_base + kOffscreenRenderAll.rva, reinterpret_cast<void*>(&HookRenderAll), reinterpret_cast<void**>(&g_origRenderAll));
     MH_CreateHook(g_base + kSceneSubmit.rva, reinterpret_cast<void*>(&HookSceneSubmit), reinterpret_cast<void**>(&g_origSceneSubmit));
     MH_CreateHook(g_base + kCameraSubmit.rva, reinterpret_cast<void*>(&HookCameraSubmit), reinterpret_cast<void**>(&g_origCameraSubmit));
     MH_CreateHook(g_base + kViewCreate.rva, reinterpret_cast<void*>(&HookViewCreate), reinterpret_cast<void**>(&g_origViewCreate));
+    MH_CreateHook(g_base + kCameraPush.rva, reinterpret_cast<void*>(&HookCameraPush), reinterpret_cast<void**>(&g_origCameraPush));
     MH_CreateHook(g_base + kTone.rva, reinterpret_cast<void*>(&HookTone), reinterpret_cast<void**>(&g_origTone));
     MH_CreateHook(g_base + kBufferSize.rva, reinterpret_cast<void*>(&HookBufferSize), reinterpret_cast<void**>(&g_origBufferSize));
     const MH_STATUS st = MH_EnableHook(MH_ALL_HOOKS);
@@ -595,7 +750,11 @@ static uint8_t* UiTexture(int i, int* w, int* h);
 static void* TextureResource(uint8_t* tex, uint32_t* state);
 static std::atomic<int> g_uiCount{3};
 
-static void OnPresentForXr() {
+static void OnPresentForXr(void* backBuffer, unsigned bbW, unsigned bbH, int bbFormat) {
+    if (!g_xrEyes) {
+        XrOnPresentScreen(backBuffer, static_cast<int>(bbW), static_cast<int>(bbH), bbFormat);
+        return;
+    }
     std::lock_guard<std::mutex> l(g_eyesLock);
     if (g_eyes.size() < 2) return;
     // The engine rebuilds eye textures when graphics settings change. Send nothing until that has settled.
@@ -630,7 +789,7 @@ static void PollPad() {
         HMODULE m = LoadLibraryW(L"xinput1_4.dll");
         return m ? reinterpret_cast<GetStateFn>(GetProcAddress(m, "XInputGetState")) : nullptr;
     }();
-    if (!get || !g_xrEyes) return;
+    if (!get || !g_xrSession) return;
     static ULONGLONG since = 0;
     static bool fired = false;
     bool held = false;
@@ -651,6 +810,7 @@ static void PollPad() {
     } else if (!fired && now - since >= 500) {
         fired = true;
         g_wantRecenter = true;
+        XrRecenterScreen();
         Log("PAD both sticks: recenter");
     }
 }
@@ -671,20 +831,19 @@ static DWORD WINAPI XrStartThread(void* arg) {
     g_createW = w;
     g_createH = h;
     g_createKind = 1;
-    for (int i = 0; i < 2; ++i) {
-        g_wantCreate = 1;
-        while (g_wantCreate.load()) Sleep(20);
-        Sleep(1500);
-    }
     {
-        std::lock_guard<std::mutex> l(g_eyesLock);
-        if (g_eyes.size() < 2) {
-            Log("XR eyes not created");
+        // Any texture the game has made leads to its device.
+        void* r = nullptr;
+        for (int i = 0; i < 600 && !r; ++i) {
+            int tw = 0, th = 0;
+            uint32_t st = 0;
+            if (uint8_t* tex = UiTexture(0, &tw, &th)) r = TextureResource(tex, &st);
+            if (!r) Sleep(50);
+        }
+        if (!r) {
+            Log("XR no game texture found");
             return 0;
         }
-        for (uint8_t* eye : g_eyes) *reinterpret_cast<uint32_t*>(eye + 0x16cd4) = 0x3fff;  // the same passes as the main view
-        void* r = EyeTexture(g_eyes[0]);
-        if (!r) return 0;
         CaptureSetup(r);
     }
     for (int i = 0; i < 500 && !CaptureReady(); ++i) Sleep(20);
@@ -695,8 +854,8 @@ static DWORD WINAPI XrStartThread(void* arg) {
     if (!XrStartSession(CaptureDevice(), CaptureQueue(), w, h)) return 0;
     InstallFocusFix();
     CaptureNoVsync(true);
-    g_xrEyes = true;
     CaptureSetPresentCallback(&OnPresentForXr);
+    g_xrSession = true;
     Log("XR running");
     return 0;
 }
@@ -790,6 +949,7 @@ static void RunCommand(const std::string& c) {
     } else if (sscanf(c.c_str(), "dump %63s", g_text) == 1) DumpEyes(g_text);
     else if (c == "texinfo") TexInfo();
     else if (c == "uilist") UiList(false, "");
+    else if (c == "camtree") g_wantCamTree = true;
     else if (sscanf(c.c_str(), "uidump %63s", g_text) == 1) UiList(true, g_text);
     else if (c == "lens") {
         if (uint8_t* m = ActiveView()) {
@@ -817,7 +977,6 @@ static DWORD WINAPI ProbeThread(void*) {
     g_levelCamera = GetPrivateProfileIntW(L"VR", L"LevelCamera", 1, ini.c_str()) != 0;
     g_pace = GetPrivateProfileIntW(L"VR", L"Pace", 1, ini.c_str()) != 0;
     Log("INI AutoStart %d Resolution %d WorldScale %.2f Pace %d", autoStart ? 1 : 0, resolution, g_worldScale.load(), g_pace.load() ? 1 : 0);
-    ULONGLONG inPlaySince = 0;
     const std::wstring cmdPath = g_dir + L"vrlab_command.txt";
     DeleteFileW(cmdPath.c_str());
     long pos = 0;
@@ -837,19 +996,22 @@ static DWORD WINAPI ProbeThread(void*) {
         }
         const ULONGLONG now = GetTickCount64();
         PollPad();
-        if (autoStart && !g_xrStarted && g_activeViewPtr) {
-            // Start once the game camera has been away from the origin (title and loading sit at 0) for three seconds.
-            void* view = nullptr;
-            float pos[3] = {};
-            const bool read = SafeCopy(&view, g_activeViewPtr, 8) && view && SafeCopy(pos, static_cast<uint8_t*>(view) + 0x30, sizeof(pos));
-            const bool away = read && fabsf(pos[0]) + fabsf(pos[1]) + fabsf(pos[2]) > 1.0f;
-            if (!away) {
-                inPlaySince = 0;
-            } else if (!inPlaySince) {
-                inPlaySince = now;
-            } else if (now - inPlaySince >= 3000) {
-                Log("AUTOSTART camera away from origin for 3 s");
-                StartXr(resolution);
+        {
+            // When do the first game textures exist? Log once.
+            static bool seenUi = false;
+            if (!seenUi) {
+                int w = 0, h = 0;
+                if (uint8_t* tex = UiTexture(0, &w, &h)) {
+                    uint32_t st = 0;
+                    if (void* r = TextureResource(tex, &st)) {
+                        seenUi = true;
+                        Log("UI first texture %dx%d resource %p", w, h, r);
+                        if (autoStart) {
+                            Log("AUTOSTART at the first game texture");
+                            StartXr(resolution);
+                        }
+                    }
+                }
             }
         }
         if (now - lastView >= 5000) {

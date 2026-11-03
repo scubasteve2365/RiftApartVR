@@ -9,7 +9,7 @@ bool CaptureRequest(void* const* resources, const uint32_t* states, const wchar_
 bool CaptureReady();
 void* CaptureDevice();
 void* CaptureQueue();
-// Called on the Present thread, before the game's Present.
-void CaptureSetPresentCallback(void (*fn)());
+// Called on the Present thread, before the game's Present, with the back buffer: resource, width, height, DXGI format.
+void CaptureSetPresentCallback(void (*fn)(void*, unsigned, unsigned, int));
 // While VR runs the flat window must not hold the game to the monitor's rate.
 void CaptureNoVsync(bool on);

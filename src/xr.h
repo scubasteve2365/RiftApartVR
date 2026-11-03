@@ -27,5 +27,8 @@ struct XrUiImage {
     int width, height;
 };
 void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiImage* ui, int uiCount);
+// Present thread: no 3D world now, so show this picture on a flat screen fixed in the room.
+void XrOnPresentScreen(void* resource, int width, int height, int dxgiFormat);
+void XrRecenterScreen();
 // HUD panel in metres.
 void XrSetHud(float width, float distance, float drop);

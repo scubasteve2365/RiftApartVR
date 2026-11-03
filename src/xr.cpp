@@ -51,6 +51,7 @@ XRFN(xrEndFrame)
 XRFN(xrLocateViews)
 XRFN(xrEnumerateSwapchainFormats)
 XRFN(xrCreateSwapchain)
+XRFN(xrDestroySwapchain)
 XRFN(xrEnumerateSwapchainImages)
 XRFN(xrAcquireSwapchainImage)
 XRFN(xrWaitSwapchainImage)
@@ -94,7 +95,7 @@ bool XrInit(const wchar_t* dir) {
         !Fn("xrCreateSession", p_xrCreateSession) || !Fn("xrCreateReferenceSpace", p_xrCreateReferenceSpace) || !Fn("xrPollEvent", p_xrPollEvent) ||
         !Fn("xrBeginSession", p_xrBeginSession) || !Fn("xrEndSession", p_xrEndSession) || !Fn("xrWaitFrame", p_xrWaitFrame) || !Fn("xrBeginFrame", p_xrBeginFrame) ||
         !Fn("xrEndFrame", p_xrEndFrame) || !Fn("xrLocateViews", p_xrLocateViews) || !Fn("xrEnumerateSwapchainFormats", p_xrEnumerateSwapchainFormats) ||
-        !Fn("xrCreateSwapchain", p_xrCreateSwapchain) || !Fn("xrEnumerateSwapchainImages", p_xrEnumerateSwapchainImages) || !Fn("xrAcquireSwapchainImage", p_xrAcquireSwapchainImage) ||
+        !Fn("xrCreateSwapchain", p_xrCreateSwapchain) || !Fn("xrDestroySwapchain", p_xrDestroySwapchain) || !Fn("xrEnumerateSwapchainImages", p_xrEnumerateSwapchainImages) || !Fn("xrAcquireSwapchainImage", p_xrAcquireSwapchainImage) ||
         !Fn("xrWaitSwapchainImage", p_xrWaitSwapchainImage) || !Fn("xrReleaseSwapchainImage", p_xrReleaseSwapchainImage) || !Fn("xrGetD3D12GraphicsRequirementsKHR", p_xrGetD3D12GraphicsRequirementsKHR))
         return false;
     XrSystemGetInfo si{XR_TYPE_SYSTEM_GET_INFO};
@@ -157,7 +158,7 @@ static std::mutex g_frameLock;
 static bool g_open;
 static bool g_should;
 static XrTime g_openTime;
-static std::atomic<uint64_t> g_endedWithImages{0}, g_endedEmpty{0}, g_notReady{0};
+static std::atomic<uint64_t> g_endedWithImages{0}, g_endedEmpty{0}, g_notReady{0}, g_endedScreen{0};
 static std::atomic<uint64_t> g_usWaitImage{0}, g_usEnd{0}, g_usPresent{0}, g_usWaitFrame{0};
 static uint64_t NowUs() {
     LARGE_INTEGER f, c;
@@ -323,7 +324,7 @@ static DWORD WINAPI XrWorker(void*) {
             static uint64_t lastN = 0;
             const uint64_t dn = n - lastN ? n - lastN : 1;
             lastN = n;
-            Log("XRSTAT state %d period %.2f ms with images %llu empty %llu not ready %llu unmatched %llu pose age x100 %llu; per image us: wait frame %llu, image waits %llu, xrEndFrame %llu, whole present step %llu", g_state.load(), g_periodNs.load() / 1e6, n, g_endedEmpty.load(), g_notReady.load(), g_unmatched.load(), g_ageSum.exchange(0) * 100 / dn, g_usWaitFrame.exchange(0) / dn, g_usWaitImage.exchange(0) / dn, g_usEnd.exchange(0) / dn, g_usPresent.exchange(0) / dn);
+            Log("XRSTAT state %d period %.2f ms screen %llu with images %llu empty %llu not ready %llu unmatched %llu pose age x100 %llu; per image us: wait frame %llu, image waits %llu, xrEndFrame %llu, whole present step %llu", g_state.load(), g_periodNs.load() / 1e6, g_endedScreen.load(), n, g_endedEmpty.load(), g_notReady.load(), g_unmatched.load(), g_ageSum.exchange(0) * 100 / dn, g_usWaitFrame.exchange(0) / dn, g_usWaitImage.exchange(0) / dn, g_usEnd.exchange(0) / dn, g_usPresent.exchange(0) / dn);
         }
     }
 }
@@ -453,6 +454,146 @@ static void PlaceHud(const PendingPose& pose) {
     g_hudPos[0] = hx - sinf(g_hudYaw) * dist;
     g_hudPos[1] = hy - g_hudDrop.load();
     g_hudPos[2] = hz - cosf(g_hudYaw) * dist;
+}
+
+// ---- the flat virtual screen: splash, menus, anything that is not the 3D world ----
+static UiChain g_screen;
+static int64_t g_screenFormat;
+static std::atomic<bool> g_screenPlaced{false};
+static XrPosef g_screenPose{{0, 0, 0, 1}, {0, 0, -2.5f}};
+static const float kScreenWidth = 3.2f, kScreenDistance = 2.5f;
+void XrRecenterScreen() { g_screenPlaced = false; }
+
+static int64_t ScreenFormatFor(int dxgi) {
+    // Same family as the back buffer so a plain copy works. The sRGB form because the bytes are already gamma encoded.
+    switch (dxgi) {
+        case DXGI_FORMAT_R8G8B8A8_UNORM:
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+            return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+            return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        default:
+            return 0;
+    }
+}
+
+void XrOnPresentScreen(void* resource, int width, int height, int dxgiFormat) {
+    std::lock_guard<std::mutex> l(g_frameLock);
+    if (!g_open) {
+        ++g_notReady;
+        return;
+    }
+    const int64_t fmt = ScreenFormatFor(dxgiFormat);
+    if (!g_should || !resource || !fmt) {
+        static bool told = false;
+        if (!fmt && !told) {
+            told = true;
+            Log("XR screen: back buffer format %d not handled", dxgiFormat);
+        }
+        EndEmpty(g_openTime);
+        g_open = false;
+        return;
+    }
+    if (g_screen.chain && (g_screen.w != width || g_screen.h != height || g_screenFormat != fmt)) {
+        p_xrDestroySwapchain(g_screen.chain);
+        g_screen = UiChain{};
+    }
+    if (!g_screen.chain) {
+        const int64_t saved = g_format;
+        g_format = fmt;
+        const bool ok = EnsureUiChain(g_screen, width, height);
+        g_format = saved;
+        g_screenFormat = fmt;
+        if (!ok) {
+            EndEmpty(g_openTime);
+            g_open = false;
+            return;
+        }
+        Log("XR screen %dx%d format %d", width, height, dxgiFormat);
+    }
+    if (!g_screenPlaced.exchange(true)) {
+        // Straight ahead of the head now, level, fixed in the room.
+        XrViewLocateInfo li{XR_TYPE_VIEW_LOCATE_INFO};
+        li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+        li.displayTime = g_openTime;
+        li.space = g_space;
+        XrViewState vs{XR_TYPE_VIEW_STATE};
+        uint32_t n = 0;
+        XrView v[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+        if (XR_SUCCEEDED(p_xrLocateViews(g_sess, &li, &vs, 2, &n, v)) && n == 2 && (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
+            const XrQuaternionf& q = v[0].pose.orientation;
+            const float fx = -2 * (q.x * q.z + q.w * q.y), fz = -(1 - 2 * (q.x * q.x + q.y * q.y));
+            const float yaw = atan2f(-fx, -fz);
+            g_screenPose.orientation = {0, sinf(yaw * 0.5f), 0, cosf(yaw * 0.5f)};
+            g_screenPose.position = {(v[0].pose.position.x + v[1].pose.position.x) * 0.5f - sinf(yaw) * kScreenDistance, (v[0].pose.position.y + v[1].pose.position.y) * 0.5f, (v[0].pose.position.z + v[1].pose.position.z) * 0.5f - cosf(yaw) * kScreenDistance};
+            Log("XR screen placed yaw %.3f at %.2f %.2f %.2f", yaw, g_screenPose.position.x, g_screenPose.position.y, g_screenPose.position.z);
+        } else {
+            g_screenPlaced = false;
+        }
+    }
+    if (g_fence->GetCompletedValue() < g_ringValue[g_ringIndex]) {
+        g_fence->SetEventOnCompletion(g_ringValue[g_ringIndex], g_fenceEvent);
+        WaitForSingleObject(g_fenceEvent, 500);
+    }
+    ID3D12CommandAllocator* alloc = g_alloc[g_ringIndex];
+    ID3D12GraphicsCommandList* list = g_list[g_ringIndex];
+    alloc->Reset();
+    list->Reset(alloc, nullptr);
+    uint32_t idx = 0;
+    p_xrAcquireSwapchainImage(g_screen.chain, nullptr, &idx);
+    XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wi.timeout = 100000000;
+    p_xrWaitSwapchainImage(g_screen.chain, &wi);
+    ID3D12Resource* dst = g_screen.images[idx].texture;
+    auto* src = static_cast<ID3D12Resource*>(resource);
+    D3D12_RESOURCE_BARRIER bar[2]{};
+    bar[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    bar[0].Transition.pResource = src;
+    bar[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    bar[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    bar[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    bar[1] = bar[0];
+    bar[1].Transition.pResource = dst;
+    bar[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    bar[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    list->ResourceBarrier(2, bar);
+    D3D12_TEXTURE_COPY_LOCATION d{}, s{};
+    d.pResource = dst;
+    d.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    s.pResource = src;
+    s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    list->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
+    std::swap(bar[0].Transition.StateBefore, bar[0].Transition.StateAfter);
+    std::swap(bar[1].Transition.StateBefore, bar[1].Transition.StateAfter);
+    list->ResourceBarrier(2, bar);
+    list->Close();
+    ID3D12CommandList* lists[] = {list};
+    g_queue->ExecuteCommandLists(1, lists);
+    g_queue->Signal(g_fence, ++g_fenceValue);
+    g_ringValue[g_ringIndex] = g_fenceValue;
+    g_ringIndex = (g_ringIndex + 1) % kRing;
+    XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    p_xrReleaseSwapchainImage(g_screen.chain, &ri);
+    XrCompositionLayerQuad q{XR_TYPE_COMPOSITION_LAYER_QUAD};
+    q.space = g_space;
+    q.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+    q.subImage.swapchain = g_screen.chain;
+    q.subImage.imageRect.extent = {width, height};
+    q.pose = g_screenPose;
+    q.size = {kScreenWidth, kScreenWidth * height / static_cast<float>(width)};
+    const XrCompositionLayerBaseHeader* layers[] = {reinterpret_cast<XrCompositionLayerBaseHeader*>(&q)};
+    XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
+    ei.displayTime = g_openTime;
+    ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    ei.layerCount = 1;
+    ei.layers = layers;
+    const XrResult r = p_xrEndFrame(g_sess, &ei);
+    if (XR_FAILED(r)) Log("XR xrEndFrame failed %d (screen)", static_cast<int>(r));
+    ++g_endedScreen;
+    g_open = false;
 }
 
 void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiImage* ui, int uiCount) {

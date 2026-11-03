@@ -158,27 +158,46 @@ static void RunJob(DumpJob* job) {
     Log("DUMP done");
 }
 
-static std::atomic<void (*)()> g_callback{nullptr};
+static std::atomic<void (*)(void*, unsigned, unsigned, int)> g_callback{nullptr};
 
 static thread_local int t_depth = 0;
 
-static void OnPresent() {
+static void OnPresent(IDXGISwapChain* chain) {
     ++g_presents;
     if (DumpJob* job = g_job.exchange(nullptr)) RunJob(job);
-    if (auto fn = g_callback.load()) fn();
+    auto fn = g_callback.load();
+    if (!fn) return;
+    // The picture about to be shown: the flat screen in the headset uses it.
+    void* buffer = nullptr;
+    unsigned w = 0, h = 0;
+    int format = 0;
+    IDXGISwapChain3* c3 = nullptr;
+    ID3D12Resource* res = nullptr;
+    if (SUCCEEDED(chain->QueryInterface(IID_PPV_ARGS(&c3)))) {
+        if (SUCCEEDED(c3->GetBuffer(c3->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&res)))) {
+            const D3D12_RESOURCE_DESC d = res->GetDesc();
+            buffer = res;
+            w = static_cast<unsigned>(d.Width);
+            h = d.Height;
+            format = d.Format;
+        }
+    }
+    fn(buffer, w, h, format);
+    if (res) res->Release();
+    if (c3) c3->Release();
 }
 
 bool CaptureReady() { return g_ready.load(); }
 void* CaptureDevice() { return g_device; }
 void* CaptureQueue() { return g_queue.load(); }
-void CaptureSetPresentCallback(void (*fn)()) { g_callback = fn; }
+void CaptureSetPresentCallback(void (*fn)(void*, unsigned, unsigned, int)) { g_callback = fn; }
 
 static std::atomic<bool> g_noVsync{false};
 void CaptureNoVsync(bool on) { g_noVsync = on; }
 
 static HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* s, UINT a, UINT b) {
     if (g_noVsync) a = 0;
-    if (t_depth++ == 0) OnPresent();
+    if (t_depth++ == 0) OnPresent(s);
     const HRESULT r = g_origPresent(s, a, b);
     --t_depth;
     return r;
@@ -186,7 +205,7 @@ static HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* s, UINT a, UINT b) 
 
 static HRESULT STDMETHODCALLTYPE HookPresent1(IDXGISwapChain1* s, UINT a, UINT b, const DXGI_PRESENT_PARAMETERS* p) {
     if (g_noVsync) a = 0;
-    if (t_depth++ == 0) OnPresent();
+    if (t_depth++ == 0) OnPresent(s);
     const HRESULT r = g_origPresent1(s, a, b, p);
     --t_depth;
     return r;
