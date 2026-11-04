@@ -9,6 +9,7 @@
 #include <d3d12.h>
 #include <wincodec.h>
 #include <psapi.h>
+#include <tlhelp32.h>
 #include <dxgi1_4.h>
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "ole32.lib")
@@ -26,7 +27,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 88
+#define BUILD_NUMBER 89
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -606,6 +607,68 @@ static void LogMemory() {
     Log("MEM system commit %llu of %llu MB, RAM free %llu of %llu MB; game private %llu, working set %llu MB; card %llu of %llu MB", mb(m.ullTotalPageFile - m.ullAvailPageFile), mb(m.ullTotalPageFile), mb(m.ullAvailPhys), mb(m.ullTotalPhys), mb(pc.PrivateUsage), mb(pc.WorkingSetSize), mb(local.CurrentUsage), mb(local.Budget));
 }
 
+// ---- Where the CPU time goes: every thread of the game, whole machine, at each PERF report. Lab probe. ----
+static std::atomic<DWORD> g_gameThreadId{0}, g_presentThreadId{0};
+static void LogThreads() {
+    static std::map<DWORD, uint64_t> last;
+    static uint64_t lastWall = 0, lastBusy = 0, lastIdle = 0;
+    FILETIME wallFt{};
+    GetSystemTimeAsFileTime(&wallFt);
+    const uint64_t wall = (static_cast<uint64_t>(wallFt.dwHighDateTime) << 32) | wallFt.dwLowDateTime;
+    FILETIME idleFt{}, kernelFt{}, userFt{};
+    GetSystemTimes(&idleFt, &kernelFt, &userFt);
+    const auto u64 = [](const FILETIME& f) { return (static_cast<uint64_t>(f.dwHighDateTime) << 32) | f.dwLowDateTime; };
+    const uint64_t idle = u64(idleFt), busy = u64(kernelFt) + u64(userFt) - idle;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    std::vector<std::pair<uint64_t, DWORD>> delta;
+    uint64_t total = 0;
+    std::map<DWORD, uint64_t> now;
+    THREADENTRY32 te{};
+    te.dwSize = sizeof(te);
+    const DWORD pid = GetCurrentProcessId();
+    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid) continue;
+        HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+        if (!h) continue;
+        FILETIME a, b, k, us;
+        if (GetThreadTimes(h, &a, &b, &k, &us)) {
+            const uint64_t t = u64(k) + u64(us);
+            now[te.th32ThreadID] = t;
+            auto it = last.find(te.th32ThreadID);
+            if (it != last.end() && t >= it->second) {
+                delta.push_back({t - it->second, te.th32ThreadID});
+                total += t - it->second;
+            }
+        }
+        CloseHandle(h);
+    }
+    CloseHandle(snap);
+    last.swap(now);
+    const uint64_t span = wall - lastWall;
+    const uint64_t sysBusy = busy - lastBusy, sysIdle = idle - lastIdle;
+    const bool have = lastWall != 0 && span > 0;
+    lastWall = wall;
+    lastBusy = busy;
+    lastIdle = idle;
+    if (!have) return;
+    std::sort(delta.rbegin(), delta.rend());
+    char line[300];
+    int w = 0;
+    const DWORD game = g_gameThreadId.load(), present = g_presentThreadId.load();
+    for (size_t i = 0; i < delta.size() && i < 8 && w < 240; ++i) {
+        const double pct = 100.0 * static_cast<double>(delta[i].first) / static_cast<double>(span);
+        w += sprintf_s(line + w, sizeof(line) - w, "%s%.0f ", delta[i].second == game ? "game=" : delta[i].second == present ? "render=" : "", pct);
+    }
+    double gamePct = 0, presentPct = 0;
+    for (const auto& d : delta) {
+        const double pct = 100.0 * static_cast<double>(d.first) / static_cast<double>(span);
+        if (d.second == game) gamePct = pct;
+        if (d.second == present) presentPct = pct;
+    }
+    Log("CPU game thread %.0f%%, render thread %.0f%%, process %.2f cores, whole PC %.0f%% busy; top threads %s", gamePct, presentPct, static_cast<double>(total) / static_cast<double>(span), 100.0 * static_cast<double>(sysBusy) / static_cast<double>(sysBusy + sysIdle), line);
+}
+
 // ---- When the GPU hangs: D3D12's own recorder says which command list and which operation it stopped in. ----
 // Must be turned on before the game makes its device. DeviceDiagnostics=0 in the ini turns it off.
 static void DredEnable() {
@@ -618,6 +681,9 @@ static void DredEnable() {
         settings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
         settings->Release();
         Log("DRED on");
+        char cpu[128] = {};
+        DWORD size = sizeof(cpu);
+        if (RegGetValueA(HKEY_LOCAL_MACHINE, "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", "ProcessorNameString", RRF_RT_REG_SZ, nullptr, cpu, &size) == ERROR_SUCCESS) Log("CPU %s, %u logical", cpu, GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
     } else {
         Log("DRED not available");
     }
@@ -682,6 +748,7 @@ static uint64_t PerfNow() {
 static std::atomic<uint64_t> g_usFrame{0}, g_usPace{0}, g_usOffscreen{0}, g_usEyeSubmit{0}, g_usMainSubmit{0}, g_usGamePart{0}, g_perfFrames{0};
 static void __fastcall HookRenderAll() {
     ++g_frames;
+    g_gameThreadId = GetCurrentThreadId();
     {
         // Whole frame: from one arrival here to the next.
         static uint64_t last = 0;
@@ -950,6 +1017,7 @@ static void __fastcall HookModelQueue(uint8_t* ctx, uint8_t* inst, char flag) {
 // Resting the flat view: the scene submit returns at once when view +0x11d8 is clear. Set again when not resting.
 static std::atomic<bool> g_restFlat{false};
 static std::atomic<int> g_skipMain{4};
+static std::atomic<bool> g_mainEveryOverride{false};  // lab
 static std::atomic<uint64_t> g_mainSkipped{0};
 static std::atomic<bool> g_eyeDefer{false}, g_eyeShare{false};
 static void* __fastcall HookSceneSubmit(uint8_t* view, void* a, uint32_t mask, char b) {
@@ -983,13 +1051,10 @@ static void* __fastcall HookSceneSubmit(uint8_t* view, void* a, uint32_t mask, c
     // The game's own view only feeds the HUD in VR: the eyes are the picture and the monitor shows an eye. It runs one
     // frame in this many, because the UI overlay is drawn in its work. 0 every frame. 1 never, and the HUD freezes.
     if (view == ActiveView() && g_xrEyes.load()) {
-        // A pause menu only draws if this view runs every frame, and pausing stills the camera. So a still camera runs it every frame.
-        static float lastPose[16];
-        static int stillFrames = 0;
-        if (memcmp(lastPose, view, sizeof(lastPose)) == 0) ++stillFrames;
-        else stillFrames = 0;
-        memcpy(lastPose, view, sizeof(lastPose));
-        const int every = stillFrames >= 8 ? 0 : g_skipMain.load();
+        // A pause menu only draws if this view runs every frame. So does the vendor screen's menu. In VR a still game camera says
+        // nothing about that: standing still and looking around is normal, so it is not a reason to run this view.
+        const bool menuUp = *reinterpret_cast<int*>(g_base + kPausedFlag) != 0 || g_vendorNow.load();
+        const int every = menuUp || g_mainEveryOverride.load() ? 0 : g_skipMain.load();
         static uint32_t count = 0;
         ++count;
         if (every == 1 || (every > 1 && count % static_cast<uint32_t>(every) != 0)) {
@@ -1246,6 +1311,7 @@ static void OnPresentForXr(void* backBuffer, unsigned bbW, unsigned bbH, int bbF
         }
     }
     XrSetMirror(g_mirrorEye.load() ? backBuffer : nullptr);
+    g_presentThreadId = GetCurrentThreadId();
     XrOnPresent(res, st, ui, g_uiCount.load());
     if (!g_rbShotName.empty() && XrRebuildResult() && res[0] && res[1]) {
         // Lab: the real eyes and the rebuilt one from the same frame, to compare.
@@ -2556,6 +2622,7 @@ static void RunCommand(const std::string& c) {
         ID3D12Device5* d5 = nullptr;
         if (CaptureDevice() && SUCCEEDED(static_cast<ID3D12Device*>(CaptureDevice())->QueryInterface(IID_PPV_ARGS(&d5))) && d5) d5->RemoveDevice();
     }
+    else if (sscanf(c.c_str(), "maineveryframe %u", &g_w) == 1) g_mainEveryOverride = g_w != 0;
     else if (c == "fgstate") OfxrLogState("now");
     else if (sscanf(c.c_str(), "mirror %u", &g_w) == 1) g_mirrorEye = g_w != 0;
     else if (sscanf(c.c_str(), "eyeskip %u", &g_w) == 1) {
@@ -2881,6 +2948,7 @@ static DWORD WINAPI ProbeThread(void*) {
                         Log("PERF GPU ms: DLSS game's view %.2f, left %.2f, right %.2f; right eye whole %.2f; mod's copies %.2f; between frame ends %.2f", ms[0], ms[1], ms[2], spanMs, copyMs, betweenMs);
                     }
                     LogMemory();
+                    LogThreads();
                     Log("PERF frames %llu, ms per frame: whole %.2f, pacing wait %.2f, all offscreen %.2f, eye submits %.2f, main submit %.2f", static_cast<unsigned long long>(n), g_usFrame.exchange(0) / f, g_usPace.exchange(0) / f, g_usOffscreen.exchange(0) / f, g_usEyeSubmit.exchange(0) / f, g_usMainSubmit.exchange(0) / f);
                 }
             }
