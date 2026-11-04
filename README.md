@@ -35,8 +35,9 @@ Click and hold both thumbsticks for half a second to open the VR menu. The game 
 | Vendor screen up close | Shop screens fill your view when the game zooms onto one. Off leaves them in the world |
 | Aim dot | Shows where you aim, as a ring in the world |
 | Frame generation | Off, 2X or 3X. Off by default. Uses OFXR-BRIDGE from the `ofxr` folder, which loads at launch once a mode is chosen, then changes apply at once, including Off. Close the OFXR tray program first |
-| Frame generation quality | Fast, Medium or Slow optical flow |
-| Frame generation detail | Optical flow size, 25 to 100 percent |
+| Frame generation type | Optical flow, DLSS-G, or Hybrid (next launch). FSR 3.1 is listed but makes no frames yet |
+| Optical flow quality | Fast, Medium or Slow |
+| Optical flow detail | 25 to 100 percent |
 
 Settings save to `RiftApartVR.ini` in the game's folder.
 

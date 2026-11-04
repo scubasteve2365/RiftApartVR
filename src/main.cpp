@@ -24,7 +24,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 70
+#define BUILD_NUMBER 73
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -1077,6 +1077,8 @@ static bool g_skipLauncherSetting = true;
 static int g_fgMode = 0;      // 0 off, 1 2X, 2 3X
 static int g_fgPreset = 1;    // OFXR's numbers: 0 slow, 1 medium, 2 fast
 static int g_fgScale = 2;     // OFXR's numbers: 0 full, 1 three quarters, 2 half, 3 quarter
+static int g_fgType = 0;      // 0 optical flow, 1 FSR 3.1, 2 DLSS-G, 3 Hybrid
+static int g_fgTypeAtLaunch = 0;
 struct OfxrSettingsV2 {
     uint32_t structSize;
     int32_t enabled, backend, preset, scale, backward, motionVectors, frameGeneration;
@@ -1088,6 +1090,13 @@ struct OfxrSnapshotV2 {
     uint32_t sessions, pending, bypass, ready, errors;
     int32_t lastError;
     uint32_t providers;
+};
+struct OfxrGuideStats {
+    uint32_t structSize, apiVersion;
+    uint64_t published, depthPublications, invalidPublications, snapshotCopies, snapshotFailures, resolveCalls, resolveMissingStreams, resolveStalePairs, resolveQueueMismatches, matched, temporalRejections, invalidRejections, used, lastUsedPublication;
+    uint32_t status;
+    uint64_t fsrAttempts, fsrUsed, fsrFailures;
+    uint32_t fsrStatus;
 };
 static HMODULE OfxrModule() { return GetModuleHandleW(L"XR_APILAYER_XRFrameBridge_diagnostic.dll"); }
 static bool OfxrSnapshot(OfxrSnapshotV2* out) {
@@ -1106,7 +1115,13 @@ static void OfxrLogState(const char* when) {
         Log("FRAMEGEN %s: not loaded", when);
         return;
     }
-    Log("FRAMEGEN %s: enabled %d backend %d preset %d scale %d, revision %llu sessions %u pending %u bypass %u ready %u errors %u last error %d", when, v.desired.enabled, v.desired.backend, v.desired.preset, v.desired.scale, static_cast<unsigned long long>(v.revision), v.sessions, v.pending, v.bypass, v.ready, v.errors, v.lastError);
+    Log("FRAMEGEN %s: enabled %d type %d backend %d preset %d scale %d, revision %llu sessions %u pending %u bypass %u ready %u errors %u last error %d", when, v.desired.enabled, v.desired.frameGeneration, v.desired.backend, v.desired.preset, v.desired.scale, static_cast<unsigned long long>(v.revision), v.sessions, v.pending, v.bypass, v.ready, v.errors, v.lastError);
+    if (const auto stats = reinterpret_cast<int(*)(OfxrGuideStats*)>(GetProcAddress(OfxrModule(), "OFXR_GetDlssGuideStatisticsV2"))) {
+        OfxrGuideStats g{};
+        g.structSize = sizeof(g);
+        g.apiVersion = 2;
+        if (stats(&g)) Log("FRAMEGEN guides: published %llu with depth %llu invalid %llu, resolve calls %llu missing %llu stale %llu, matched %llu used %llu, status %u, fsr attempts %llu used %llu failures %llu status %u", g.published, g.depthPublications, g.invalidPublications, g.resolveCalls, g.resolveMissingStreams, g.resolveStalePairs, g.matched, g.used, g.status, g.fsrAttempts, g.fsrUsed, g.fsrFailures, g.fsrStatus);
+    }
 }
 // Live when OFXR is loaded. 3X only exists on its 0.2.14 route, backend 3, so the mode picks the route too.
 static void OfxrApply() {
@@ -1116,29 +1131,36 @@ static void OfxrApply() {
         Log("FRAMEGEN mode %d saved for next launch: OFXR is not loaded", g_fgMode);
         return;
     }
+    // Hybrid can only be chosen or left at a launch: OFXR's control functions do not carry it.
+    if (g_fgType == 3 || g_fgTypeAtLaunch == 3) {
+        Log("FRAMEGEN Hybrid involved, saved for next launch");
+        if (g_fgTypeAtLaunch != 3 || g_fgType != 3) return;
+    }
+    const bool triple = g_fgMode == 2 && (g_fgType == 0 || g_fgType == 2);
     const std::wstring ini = g_dir + L"ofxr\\ofxr_bridge.ini";
     WritePrivateProfileStringW(L"ofxr", L"deep_pipeline", L"1", ini.c_str());
-    WritePrivateProfileStringW(L"ofxr", L"triple_frame_gen", g_fgMode == 2 ? L"1" : L"0", ini.c_str());
+    WritePrivateProfileStringW(L"ofxr", L"triple_frame_gen", triple ? L"1" : L"0", ini.c_str());
     OfxrSettingsV2 c{};
     c.structSize = sizeof(c);
     c.enabled = g_fgMode != 0;
-    c.backend = g_fgMode == 2 ? 3 : 2;
+    c.backend = g_fgType == 3 ? 0 : triple ? 3 : 2;
+    c.frameGeneration = g_fgType == 1 ? 1 : g_fgType == 2 ? 2 : 0;
     c.preset = g_fgPreset;
     c.scale = g_fgScale;
     const int ok = request(&c);
-    Log("FRAMEGEN asked mode %d preset %d scale %d, accepted %d", g_fgMode, g_fgPreset, g_fgScale, ok);
+    Log("FRAMEGEN asked mode %d type %d preset %d scale %d, accepted %d", g_fgMode, g_fgType, g_fgPreset, g_fgScale, ok);
 }
 static int g_dlssPercentSetting = -1;  // -1 the game's choice, 0 no DLSS in the eyes, otherwise a fixed size
 static float g_hudDistanceSetting = 2.0f;
 static std::wstring g_iniPath;
 static std::vector<uint32_t> g_menuImage;
-static const int kMenuW = 1024, kMenuH = 1200, kMenuRows = 14;
+static const int kMenuW = 1024, kMenuH = 1272, kMenuRows = 15;
 
 static void SaveSetting(const wchar_t* name, int value) {
     WritePrivateProfileStringW(L"VR", name, std::to_wstring(value).c_str(), g_iniPath.c_str());
 }
 
-static void MenuRowText(int row, wchar_t (&name)[64], wchar_t (&value)[32]) {
+static void MenuRowText(int row, wchar_t (&name)[64], wchar_t (&value)[64]) {
     value[0] = 0;
     switch (row) {
     case 0: wcscpy_s(name, L"Recenter view"); break;
@@ -1184,15 +1206,24 @@ static void MenuRowText(int row, wchar_t (&name)[64], wchar_t (&value)[32]) {
         wcscpy_s(name, L"Frame generation");
         OfxrSnapshotV2 v;
         const bool loaded = OfxrSnapshot(&v);
-        swprintf_s(value, L"%ls%ls", g_fgMode == 0 ? L"Off" : g_fgMode == 1 ? L"2X" : L"3X", !loaded && g_fgMode != 0 ? L" next launch" : loaded && v.errors ? L" failed" : L"");
+        const bool threeX = g_fgMode == 2 && g_fgType != 1 && g_fgType != 3;
+        swprintf_s(value, L"%ls%ls", g_fgMode == 0 ? L"Off" : threeX ? L"3X" : L"2X", !loaded && g_fgMode != 0 ? L" next launch" : loaded && v.errors ? L" failed" : L"");
         break;
     }
-    case 11:
-        wcscpy_s(name, L"Frame generation quality");
+    case 11: {
+        static const wchar_t* const types[4] = {L"Optical flow", L"FSR 3.1 (no frames)", L"DLSS-G", L"Hybrid"};
+        wcscpy_s(name, L"Frame generation type");
+        OfxrSnapshotV2 v;
+        const bool notLive = !OfxrSnapshot(&v) || g_fgType != g_fgTypeAtLaunch && (g_fgType == 3 || g_fgTypeAtLaunch == 3);
+        swprintf_s(value, L"%ls%ls", types[g_fgType], notLive && g_fgMode != 0 ? L" next launch" : L"");
+        break;
+    }
+    case 12:
+        wcscpy_s(name, L"Optical flow quality");
         wcscpy_s(value, g_fgPreset == 2 ? L"Fast" : g_fgPreset == 1 ? L"Medium" : L"Slow");
         break;
-    case 12:
-        wcscpy_s(name, L"Frame generation detail");
+    case 13:
+        wcscpy_s(name, L"Optical flow detail");
         wcscpy_s(value, g_fgScale == 0 ? L"100%" : g_fgScale == 1 ? L"75%" : g_fgScale == 2 ? L"50%" : L"25%");
         break;
     default: wcscpy_s(name, L"Close"); break;
@@ -1250,7 +1281,7 @@ static void MenuDraw() {
         const int top = 116 + i * 72;
         if (i == g_menuRow) fill(28, top, kMenuW - 28, top + 66, RGB(40, 216, 232));
         else fill(48, top + 68, kMenuW - 48, top + 69, RGB(40, 78, 130));
-        wchar_t name[64], value[32];
+        wchar_t name[64], value[64];
         MenuRowText(i, name, value);
         SetTextColor(dc, i == g_menuRow ? RGB(8, 22, 52) : RGB(214, 228, 245));
         RECT a{48, top, kMenuW - 48, top + 66};
@@ -1357,11 +1388,16 @@ static void MenuChange(int dir) {
         OfxrApply();
         break;
     case 11:
+        g_fgType = (g_fgType + (dir < 0 ? 3 : 1)) % 4;
+        SaveSetting(L"FrameGenType", g_fgType);
+        if (g_fgMode) OfxrApply();
+        break;
+    case 12:
         g_fgPreset = (g_fgPreset + (dir < 0 ? 1 : 2)) % 3;
         SaveSetting(L"FrameGenQuality", g_fgPreset);
         if (g_fgMode) OfxrApply();
         break;
-    case 12:
+    case 13:
         g_fgScale = (g_fgScale + (dir < 0 ? 1 : 3)) % 4;
         SaveSetting(L"FrameGenDetail", g_fgScale);
         if (g_fgMode) OfxrApply();
@@ -1674,7 +1710,7 @@ static void PollPad() {
         } else if (i == kLeft || i == kRight) {
             MenuChange(i == kLeft ? -1 : 1);
         } else if (i == kA) {
-            if (g_menuRow == 0 || g_menuRow == 2 || g_menuRow == 6 || g_menuRow == 7 || g_menuRow == 8 || g_menuRow == 9 || g_menuRow == 10 || g_menuRow == 11 || g_menuRow == 12 || g_menuRow == kMenuRows - 1) MenuChange(0);
+            if (g_menuRow == 0 || g_menuRow == 2 || g_menuRow == 6 || g_menuRow == 7 || g_menuRow == 8 || g_menuRow == 9 || g_menuRow == 10 || g_menuRow == 11 || g_menuRow == 12 || g_menuRow == 13 || g_menuRow == kMenuRows - 1) MenuChange(0);
         } else {
             MenuClose();
         }
@@ -2137,6 +2173,10 @@ static void RunCommand(const std::string& c) {
         g_fgScale = static_cast<int>(g_k) % 4;
         OfxrApply();
     }
+    else if (sscanf(c.c_str(), "fgtype %u", &g_w) == 1) {
+        g_fgType = static_cast<int>(g_w) % 4;
+        OfxrApply();
+    }
     else if (c == "fgstate") OfxrLogState("now");
     else if (sscanf(c.c_str(), "mirror %u", &g_w) == 1) g_mirrorEye = g_w != 0;
     else if (sscanf(c.c_str(), "eyeskip %u", &g_w) == 1) {
@@ -2331,6 +2371,8 @@ static DWORD WINAPI ProbeThread(void*) {
     g_fgMode = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"VR", L"FrameGen", 0, ini.c_str())), 0, 2);
     g_fgPreset = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"VR", L"FrameGenQuality", 1, ini.c_str())), 0, 2);
     g_fgScale = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"VR", L"FrameGenDetail", 2, ini.c_str())), 0, 3);
+    g_fgType = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"VR", L"FrameGenType", 0, ini.c_str())), 0, 3);
+    g_fgTypeAtLaunch = g_fgType;
     g_aimDot = static_cast<int>(GetPrivateProfileIntW(L"VR", L"AimDot", 1, ini.c_str()));
     g_labProbes = GetPrivateProfileIntW(L"VR", L"LabProbes", 1, ini.c_str()) != 0;
     g_skipLauncher = g_skipLauncherSetting;

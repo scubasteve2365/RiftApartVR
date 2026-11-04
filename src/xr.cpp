@@ -87,8 +87,13 @@ bool XrInit(const wchar_t* dir) {
                 const int preset = static_cast<int>(GetPrivateProfileIntW(L"VR", L"FrameGenQuality", 1, ini.c_str()));
                 const int scale = static_cast<int>(GetPrivateProfileIntW(L"VR", L"FrameGenDetail", 2, ini.c_str()));
                 const int diagnostics = static_cast<int>(GetPrivateProfileIntW(L"VR", L"FrameGenLog", 0, ini.c_str()));
+                const int fgType = static_cast<int>(GetPrivateProfileIntW(L"VR", L"FrameGenType", 0, ini.c_str()));
+                const bool triple = fgMode == 2 && (fgType == 0 || fgType == 2);
+                // FSR and DLSS-G run on the game's own copies of AMD's and NVIDIA's files, so the mod ships neither.
+                CopyFileW((std::wstring(dir) + L"amd_fidelityfx_dx12.dll").c_str(), (folder + L"\\ofxr_amd_fidelityfx_framegeneration_dx12.dll").c_str(), TRUE);
+                CopyFileW((std::wstring(dir) + L"nvngx_dlssg.dll").c_str(), (folder + L"\\nvngx_dlssg.dll").c_str(), TRUE);
                 char profile[400];
-                sprintf_s(profile, "[ofxr]\r\nenabled=1\r\nframe_generation=0\r\nbackend=%d\r\nmotion_vectors=0\r\noverlay_position=0\r\nlower_vram=1\r\npacing_mode=0\r\npreset=%d\r\nscale=%d\r\ntriple_frame_gen=%d\r\ndiagnostics=%d\r\n", fgMode == 2 ? 3 : 2, preset, scale, fgMode == 2 ? 1 : 0, diagnostics);
+                sprintf_s(profile, "[ofxr]\r\nenabled=1\r\nframe_generation=%d\r\nbackend=%d\r\nmotion_vectors=0\r\noverlay_position=0\r\nlower_vram=1\r\npacing_mode=0\r\npreset=%d\r\nscale=%d\r\ntriple_frame_gen=%d\r\ndiagnostics=%d\r\n", fgType, triple ? 3 : 2, preset, scale, triple ? 1 : 0, diagnostics);
                 const std::wstring profilePath = folder + L"\\settings\\Profiles\\RiftApart.exe.ini";
                 if (FILE* f = _wfopen(profilePath.c_str(), L"wb")) {
                     fputs(profile, f);
@@ -98,7 +103,7 @@ bool XrInit(const wchar_t* dir) {
                 SetEnvironmentVariableW(L"XR_ENABLE_API_LAYERS", L"XR_APILAYER_OFXRBridge");
                 // Its settings stay in its own folder, apart from a tray install's.
                 SetEnvironmentVariableW(L"OFXR_BRIDGE_PROFILE_DIR", (folder + L"\\settings").c_str());
-                Log("XR frame generation on, mode %d, layer in the ofxr folder", fgMode);
+                Log("XR frame generation on, mode %d type %d, layer in the ofxr folder", fgMode, fgType);
             } else {
                 Log("XR frame generation chosen, but the ofxr folder has no layer: running without it");
             }
