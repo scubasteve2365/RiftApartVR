@@ -26,7 +26,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 83
+#define BUILD_NUMBER 84
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -1938,6 +1938,8 @@ static UINT64 g_dlssFreq;
 static std::atomic<uint32_t> g_dlssFrame[kDlssSlots];
 static std::atomic<uint64_t> g_dlssTicks[kDlssSlots], g_dlssCount[kDlssSlots];
 static std::atomic<uint64_t> g_eyeSpanTicks{0}, g_eyeSpanCount{0};
+static std::atomic<uint64_t> g_splitBetweenTicks{0}, g_splitBetweenCount{0}, g_rightEndCount{0};
+static UINT64 g_rightEnds[32];
 static bool DlssTimerBegin(ID3D12GraphicsCommandList* list, int vp, UINT* index) {
     if (!g_labProbes.load() || vp < 0 || vp >= static_cast<int>(kDlssSlots) || !list) return false;
     if (!g_dlssHeap) {
@@ -1976,6 +1978,15 @@ static bool DlssTimerBegin(ID3D12GraphicsCommandList* list, int vp, UINT* index)
                 g_dlssTicks[vp] += b - a;
                 ++g_dlssCount[vp];
                 static UINT64 leftEnd = 0;
+                // Split of an eye. Left's DLSS end to right's DLSS start: left's work after DLSS plus right's scene.
+                // Right's DLSS end to the mod's copies: right's work after DLSS, at output size.
+                if (vp == 2) {
+                    if (leftEnd && a > leftEnd) {
+                        g_splitBetweenTicks += a - leftEnd;
+                        ++g_splitBetweenCount;
+                    }
+                    g_rightEnds[g_rightEndCount.fetch_add(1) % 32] = b;
+                }
                 if (vp == 1) leftEnd = b;
                 if (vp == 2 && leftEnd && b > leftEnd) {
                     g_eyeSpanTicks += b - leftEnd;
@@ -2768,6 +2779,25 @@ static DWORD WINAPI ProbeThread(void*) {
                         XrCopyTimes(&copyMs, &betweenMs);
                         const uint64_t spanCount = g_eyeSpanCount.exchange(0), spanTicks = g_eyeSpanTicks.exchange(0);
                         const double spanMs = spanCount && g_dlssFreq ? static_cast<double>(spanTicks) / static_cast<double>(spanCount) * 1000.0 / static_cast<double>(g_dlssFreq) : 0;
+                        {
+                            // Pair each copy's start with the last right eye DLSS end before it.
+                            UINT64 begins[32];
+                            const int nb = XrCopyBegins(begins, 32);
+                            double postSum = 0;
+                            int postN = 0;
+                            for (int bi = 0; bi < nb; ++bi) {
+                                UINT64 best = 0;
+                                for (const UINT64 re : g_rightEnds) if (re < begins[bi] && re > best) best = re;
+                                if (best && begins[bi] - best < g_dlssFreq / 10) {
+                                    postSum += static_cast<double>(begins[bi] - best);
+                                    ++postN;
+                                }
+                            }
+                            const double post = postN ? postSum / postN * 1000.0 / static_cast<double>(g_dlssFreq) : 0;
+                            const uint64_t bc = g_splitBetweenCount.exchange(0), bt = g_splitBetweenTicks.exchange(0);
+                            const double between = bc ? static_cast<double>(bt) / static_cast<double>(bc) * 1000.0 / static_cast<double>(g_dlssFreq) : 0;
+                            Log("SPLIT ms: after DLSS, at output size %.2f; before right's DLSS, its scene plus left's after DLSS %.2f; so scene %.2f; DLSS %.2f", post, between, between - post, ms[2]);
+                        }
                         Log("PERF GPU ms: DLSS game's view %.2f, left %.2f, right %.2f; right eye whole %.2f; mod's copies %.2f; between frame ends %.2f", ms[0], ms[1], ms[2], spanMs, copyMs, betweenMs);
                     }
                     LogMemory();

@@ -20,6 +20,8 @@ void XrTagPose(int eye, const float worldPos[3]);
 void XrMarkRendered(int eye, const float worldPos[3]);
 // Alternate eye: only the eye drawn this tick is copied. The other keeps its last image and the pose it was drawn with.
 void XrSetAlternate(bool on);
+// Lab: GPU timestamps of when the mod's copies began, newest kept.
+int XrCopyBegins(unsigned long long* out, int max);
 // Depth rebuild of the eye not drawn. Mode 0 off, 1 on. Camera of both eyes for this tick, in the game's world.
 void XrRebuildSetMode(int mode);
 void XrRebuildCopyDepth(int eye, void* cmd, void* depth);

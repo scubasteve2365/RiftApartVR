@@ -1078,6 +1078,13 @@ static std::atomic<uint64_t> g_copyTicks{0}, g_copyCount{0};
 static uint64_t g_lastEndTick;
 static std::atomic<uint64_t> g_frameTicks{0}, g_frameCount{0};
 static const UINT kCopyRing = 16;
+static UINT64 g_copyBegins[32];
+static uint32_t g_copyBeginCount;
+int XrCopyBegins(unsigned long long* out, int max) {
+    const int n = static_cast<int>(std::min<uint32_t>(g_copyBeginCount, 32));
+    for (int i = 0; i < n && i < max; ++i) out[i] = g_copyBegins[i];
+    return std::min(n, max);
+}
 static bool CopyTimerBegin(ID3D12GraphicsCommandList* list, UINT* index) {
     if (!g_copyHeap) {
         D3D12_QUERY_HEAP_DESC qd{};
@@ -1105,6 +1112,7 @@ static bool CopyTimerBegin(ID3D12GraphicsCommandList* list, UINT* index) {
             D3D12_RANGE none{0, 0};
             g_copyRead->Unmap(0, &none);
             if (b > a) {
+                g_copyBegins[g_copyBeginCount++ % 32] = a;
                 g_copyTicks += b - a;
                 ++g_copyCount;
                 if (g_lastEndTick && b > g_lastEndTick) {
