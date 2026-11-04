@@ -24,7 +24,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 73
+#define BUILD_NUMBER 75
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -409,6 +409,8 @@ static void CreateEyeImpl() {
 // ---- flat screen or 3D world ----
 // The title sits at the origin with a 39.43 degree lens. Anything else that lasts a second is treated as the world.
 static std::atomic<bool> g_xrSession{false};
+static void OfxrPacingUpdate();
+static void OfxrPacingTick();
 static void CreateEyeNow();
 // A vendor: the game zooms onto the vendor's screen and holds. Lens 10.87 in Steve's log. A boss fight's zoom also went to
 // 9 to 10, but moving, so it takes a very narrow lens and a held camera. Off in the menu means never.
@@ -464,6 +466,7 @@ static void UpdateMode() {
             Log("MODE vendor screen %s, lens %.2f", vendor ? "starts" : "ends", vfov);
             g_vendorNow = vendor;
             XrSetCinema(vendor);
+            OfxrPacingUpdate();
         }
         // Only the title's own spots are flat. A rule on its 39.43 lens used to be here, and gameplay's aim zoom can pass through
         // that lens: Steve's log has it at 39.41, the flat screen came on, and no menu option could stop it.
@@ -474,6 +477,7 @@ static void UpdateMode() {
             seenWorld = world;
         }
     }
+    OfxrPacingTick();
     static ULONGLONG since = 0;
     const ULONGLONG now = GetTickCount64();
     if (!world) {
@@ -496,6 +500,7 @@ static void UpdateMode() {
         }
         g_haveCentre = wantEyes && g_haveCentre;
         g_xrEyes = wantEyes;
+        OfxrPacingUpdate();
     }
 }
 
@@ -1079,6 +1084,7 @@ static int g_fgPreset = 1;    // OFXR's numbers: 0 slow, 1 medium, 2 fast
 static int g_fgScale = 2;     // OFXR's numbers: 0 full, 1 three quarters, 2 half, 3 quarter
 static int g_fgType = 0;      // 0 optical flow, 1 FSR 3.1, 2 DLSS-G, 3 Hybrid
 static int g_fgTypeAtLaunch = 0;
+static bool g_fgDirector = false;
 struct OfxrSettingsV2 {
     uint32_t structSize;
     int32_t enabled, backend, preset, scale, backward, motionVectors, frameGeneration;
@@ -1123,6 +1129,36 @@ static void OfxrLogState(const char* when) {
         if (stats(&g)) Log("FRAMEGEN guides: published %llu with depth %llu invalid %llu, resolve calls %llu missing %llu stale %llu, matched %llu used %llu, status %u, fsr attempts %llu used %llu failures %llu status %u", g.published, g.depthPublications, g.invalidPublications, g.resolveCalls, g.resolveMissingStreams, g.resolveStalePairs, g.matched, g.used, g.status, g.fsrAttempts, g.fsrUsed, g.fsrFailures, g.fsrStatus);
     }
 }
+// Director pacing hung the render thread for good on RigB: at the title if on from launch, and seconds after a switch in the world.
+// RigB's null driver may be why: not known. So every launch starts on Framework, Director is only asked for in the world, and the
+// menu's choice is saved only after it has run for 30 s, so a freeze cannot bring itself back at the next launch.
+static void OfxrPacingUpdate() {
+    const HMODULE m = OfxrModule();
+    const auto request = m ? reinterpret_cast<int(*)(int)>(GetProcAddress(m, "OFXR_RequestPacingV1")) : nullptr;
+    if (!request) return;
+    const int want = g_fgDirector && g_xrEyes.load() && !g_vendorNow.load() ? 1 : 0;
+    static int current = -1;
+    if (want == current) return;
+    current = want;
+    Log("FRAMEGEN pacing %s, accepted %d", want ? "Director" : "Framework", request(want));
+}
+static void SaveSetting(const wchar_t* name, int value);
+static void OfxrPacingTick() {
+    static ULONGLONG since = 0;
+    static bool saved = false;
+    const bool on = g_fgDirector && OfxrModule() && g_xrEyes.load() && !g_vendorNow.load();
+    if (!on) {
+        since = 0;
+        return;
+    }
+    const ULONGLONG now = GetTickCount64();
+    if (!since) since = now;
+    if (!saved && now - since > 30000) {
+        saved = true;
+        SaveSetting(L"FrameGenDirector", 1);
+        Log("FRAMEGEN Director ran 30 s, saved");
+    }
+}
 // Live when OFXR is loaded. 3X only exists on its 0.2.14 route, backend 3, so the mode picks the route too.
 static void OfxrApply() {
     const HMODULE m = OfxrModule();
@@ -1154,7 +1190,7 @@ static int g_dlssPercentSetting = -1;  // -1 the game's choice, 0 no DLSS in the
 static float g_hudDistanceSetting = 2.0f;
 static std::wstring g_iniPath;
 static std::vector<uint32_t> g_menuImage;
-static const int kMenuW = 1024, kMenuH = 1272, kMenuRows = 15;
+static const int kMenuW = 1024, kMenuH = 1344, kMenuRows = 16;
 
 static void SaveSetting(const wchar_t* name, int value) {
     WritePrivateProfileStringW(L"VR", name, std::to_wstring(value).c_str(), g_iniPath.c_str());
@@ -1225,6 +1261,10 @@ static void MenuRowText(int row, wchar_t (&name)[64], wchar_t (&value)[64]) {
     case 13:
         wcscpy_s(name, L"Optical flow detail");
         wcscpy_s(value, g_fgScale == 0 ? L"100%" : g_fgScale == 1 ? L"75%" : g_fgScale == 2 ? L"50%" : L"25%");
+        break;
+    case 14:
+        wcscpy_s(name, L"Frame generation pacing");
+        wcscpy_s(value, g_fgDirector ? L"Director" : L"Framework");
         break;
     default: wcscpy_s(name, L"Close"); break;
     }
@@ -1401,6 +1441,11 @@ static void MenuChange(int dir) {
         g_fgScale = (g_fgScale + (dir < 0 ? 1 : 3)) % 4;
         SaveSetting(L"FrameGenDetail", g_fgScale);
         if (g_fgMode) OfxrApply();
+        break;
+    case 14:
+        g_fgDirector = !g_fgDirector;
+        if (!g_fgDirector) SaveSetting(L"FrameGenDirector", 0);
+        OfxrPacingUpdate();
         break;
     default:
         if (dir == 0) {
@@ -1710,7 +1755,7 @@ static void PollPad() {
         } else if (i == kLeft || i == kRight) {
             MenuChange(i == kLeft ? -1 : 1);
         } else if (i == kA) {
-            if (g_menuRow == 0 || g_menuRow == 2 || g_menuRow == 6 || g_menuRow == 7 || g_menuRow == 8 || g_menuRow == 9 || g_menuRow == 10 || g_menuRow == 11 || g_menuRow == 12 || g_menuRow == 13 || g_menuRow == kMenuRows - 1) MenuChange(0);
+            if (g_menuRow == 0 || g_menuRow == 2 || g_menuRow == 6 || g_menuRow == 7 || g_menuRow == 8 || g_menuRow == 9 || g_menuRow == 10 || g_menuRow == 11 || g_menuRow == 12 || g_menuRow == 13 || g_menuRow == 14 || g_menuRow == kMenuRows - 1) MenuChange(0);
         } else {
             MenuClose();
         }
@@ -2177,6 +2222,10 @@ static void RunCommand(const std::string& c) {
         g_fgType = static_cast<int>(g_w) % 4;
         OfxrApply();
     }
+    else if (sscanf(c.c_str(), "fgpace %u", &g_w) == 1) {
+        g_fgDirector = g_w != 0;
+        OfxrPacingUpdate();
+    }
     else if (c == "fgstate") OfxrLogState("now");
     else if (sscanf(c.c_str(), "mirror %u", &g_w) == 1) g_mirrorEye = g_w != 0;
     else if (sscanf(c.c_str(), "eyeskip %u", &g_w) == 1) {
@@ -2373,6 +2422,7 @@ static DWORD WINAPI ProbeThread(void*) {
     g_fgScale = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"VR", L"FrameGenDetail", 2, ini.c_str())), 0, 3);
     g_fgType = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"VR", L"FrameGenType", 0, ini.c_str())), 0, 3);
     g_fgTypeAtLaunch = g_fgType;
+    g_fgDirector = GetPrivateProfileIntW(L"VR", L"FrameGenDirector", 0, ini.c_str()) != 0;
     g_aimDot = static_cast<int>(GetPrivateProfileIntW(L"VR", L"AimDot", 1, ini.c_str()));
     g_labProbes = GetPrivateProfileIntW(L"VR", L"LabProbes", 1, ini.c_str()) != 0;
     g_skipLauncher = g_skipLauncherSetting;
