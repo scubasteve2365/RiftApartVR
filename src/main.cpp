@@ -24,7 +24,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 68
+#define BUILD_NUMBER 69
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {

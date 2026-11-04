@@ -75,14 +75,16 @@ bool XrInit(const wchar_t* dir) {
     if (g_inst) return true;
     {
         // OFXR frame generation, off unless chosen. An OpenXR layer in its own folder, turned on for this process only, the
-        // way a launcher would, with no tray program. LGPL, so it stays a separate DLL the player can replace.
+        // way a launcher would, with no tray program. GPL-3.0, so it stays a separate program in its own folder, with its licence and source link.
         const std::wstring ini = std::wstring(dir) + L"RiftApartVR.ini";
         const std::wstring folder = std::wstring(dir) + L"ofxr";
-        const std::wstring manifest = folder + L"\\XR_APILAYER_XRFrameBridge_diagnostic.json";
+        const std::wstring manifest = folder + L"\\XR_APILAYER_OFXRBridge.json";
         if (GetPrivateProfileIntW(L"VR", L"FrameGen", 0, ini.c_str()) != 0) {
             if (GetFileAttributesW(manifest.c_str()) != INVALID_FILE_ATTRIBUTES) {
                 SetEnvironmentVariableW(L"XR_API_LAYER_PATH", folder.c_str());
-                SetEnvironmentVariableW(L"XR_ENABLE_API_LAYERS", L"XR_APILAYER_XRFrameBridge_diagnostic");
+                SetEnvironmentVariableW(L"XR_ENABLE_API_LAYERS", L"XR_APILAYER_OFXRBridge");
+                // Its settings stay in its own folder, apart from a tray install's.
+                SetEnvironmentVariableW(L"OFXR_BRIDGE_PROFILE_DIR", (folder + L"\\settings").c_str());
                 Log("XR frame generation on, layer in the ofxr folder");
             } else {
                 Log("XR frame generation chosen, but the ofxr folder has no layer: running without it");
