@@ -38,6 +38,7 @@ Click and hold both thumbsticks for half a second to open the VR menu. The game 
 | Frame generation type | Optical flow, DLSS-G, or Hybrid (next launch). FSR 3.1 is listed but makes no frames yet |
 | Optical flow quality | Fast, Medium or Slow |
 | Optical flow detail | 25 to 100 percent |
+| Stereo | Native draws both eyes each tick and is the default. Alternate eye draws one per tick for a higher frame rate, turns frame generation off, and moving things can look doubled |
 | Frame generation pacing | Framework or Director. Director can lower latency but has frozen the game on one test PC. If it freezes, close the game: it goes back to Framework next launch |
 
 Settings save to `RiftApartVR.ini` in the game's folder.

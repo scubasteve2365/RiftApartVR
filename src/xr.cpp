@@ -211,7 +211,7 @@ static uint64_t NowUs() {
 struct PendingPose {
     XrView views[2];
     uint64_t serial;
-    float worldPos[3];
+    float worldPos[2][3];
 };
 static const int kPoses = 16;
 static PendingPose g_poses[kPoses];
@@ -220,20 +220,30 @@ static uint64_t g_renderedSerial, g_usedSerial;
 static std::mutex g_poseLock;
 static std::atomic<uint64_t> g_unmatched{0}, g_ageSum{0};
 
-void XrTagPose(const float worldPos[3]) {
+static std::atomic<bool> g_alternate{false};
+static int g_renderedEye = 0;   // g_poseLock
+static bool g_held[2];          // g_poseLock: the eye has an image in its swapchain, drawn at g_heldView
+static XrView g_heldView[2];
+void XrSetAlternate(bool on) {
     std::lock_guard<std::mutex> l(g_poseLock);
-    PendingPose& p = g_poses[g_poseSerial % kPoses];
-    p.worldPos[0] = worldPos[0];
-    p.worldPos[1] = worldPos[1];
-    p.worldPos[2] = worldPos[2];
+    if (g_alternate.exchange(on) != on) g_held[0] = g_held[1] = false;
 }
 
-void XrMarkRendered(const float worldPos[3]) {
+void XrTagPose(int eye, const float worldPos[3]) {
+    std::lock_guard<std::mutex> l(g_poseLock);
+    PendingPose& p = g_poses[g_poseSerial % kPoses];
+    memcpy(p.worldPos[eye], worldPos, 12);
+}
+
+void XrMarkRendered(int eye, const float worldPos[3]) {
     std::lock_guard<std::mutex> l(g_poseLock);
     for (uint64_t s = g_poseSerial; s > 0 && s + kPoses > g_poseSerial; --s) {
         const PendingPose& p = g_poses[s % kPoses];
-        if (p.serial == s && p.worldPos[0] == worldPos[0] && p.worldPos[1] == worldPos[1] && p.worldPos[2] == worldPos[2]) {
-            if (s > g_renderedSerial) g_renderedSerial = s;
+        if (p.serial == s && memcmp(p.worldPos[eye], worldPos, 12) == 0) {
+            if (s > g_renderedSerial) {
+                g_renderedSerial = s;
+                g_renderedEye = eye;
+            }
             return;
         }
     }
@@ -1095,6 +1105,7 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
     const uint64_t present0 = NowUs();
     PendingPose pose;
     bool havePose = false;
+    bool copyEye[2] = {true, true};
     {
         std::lock_guard<std::mutex> pl(g_poseLock);
         if (g_renderedSerial > g_usedSerial && g_poses[g_renderedSerial % kPoses].serial == g_renderedSerial) {
@@ -1102,6 +1113,19 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
             g_ageSum += g_poseSerial - g_renderedSerial;
             g_usedSerial = g_renderedSerial;
             havePose = true;
+            if (g_alternate.load()) {
+                const int fresh = g_renderedEye;
+                // Until an eye has been drawn once in this mode, send both as they are.
+                if (g_held[1 - fresh]) copyEye[1 - fresh] = false;
+                else {
+                    g_held[1 - fresh] = true;
+                    g_heldView[1 - fresh] = pose.views[1 - fresh];
+                }
+                g_held[fresh] = true;
+                g_heldView[fresh] = pose.views[fresh];
+                pose.views[0] = g_heldView[0];
+                pose.views[1] = g_heldView[1];
+            }
         }
     }
     if (!resources[0] || !resources[1]) {
@@ -1131,6 +1155,11 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
     const bool copyTimed = CopyTimerBegin(list, &copyIndex);
     XrCompositionLayerProjectionView pv[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
     for (int e = 0; e < 2; ++e) {
+        pv[e].pose = pose.views[e].pose;
+        pv[e].fov = pose.views[e].fov;
+        pv[e].subImage.swapchain = g_chain[e];
+        pv[e].subImage.imageRect.extent = {g_chainW, g_chainH};
+        if (!copyEye[e]) continue;  // the runtime keeps showing this swapchain's last released image
         uint32_t idx = 0;
         const uint64_t t0 = NowUs();
         p_xrAcquireSwapchainImage(g_chain[e], nullptr, &idx);
@@ -1162,10 +1191,6 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
         std::swap(bar[0].Transition.StateBefore, bar[0].Transition.StateAfter);
         std::swap(bar[1].Transition.StateBefore, bar[1].Transition.StateAfter);
         list->ResourceBarrier(2, bar);
-        pv[e].pose = pose.views[e].pose;
-        pv[e].fov = pose.views[e].fov;
-        pv[e].subImage.swapchain = g_chain[e];
-        pv[e].subImage.imageRect.extent = {g_chainW, g_chainH};
     }
     XrCompositionLayerQuad quads[kUiSlots];
     uint32_t quadCount = 0;
@@ -1243,6 +1268,7 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
     MenuRelease();
     DotRelease();
     for (int e = 0; e < 2; ++e) {
+        if (!copyEye[e]) continue;
         XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         p_xrReleaseSwapchainImage(g_chain[e], &ri);
     }

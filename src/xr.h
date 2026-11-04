@@ -15,9 +15,11 @@ bool XrStartSession(void* device, void* queue, int eyeW, int eyeH);
 // Game thread: newest head pose for this frame's eyes. False until the runtime gives a frame.
 bool XrLocate(XrEyePose out[2]);
 // Game thread: the left eye's world position just computed from that pose, so the pose can be found again later.
-void XrTagPose(const float worldPos[3]);
+void XrTagPose(int eye, const float worldPos[3]);
 // Render thread: this world position is what is being drawn now.
-void XrMarkRendered(const float worldPos[3]);
+void XrMarkRendered(int eye, const float worldPos[3]);
+// Alternate eye: only the eye drawn this tick is copied. The other keeps its last image and the pose it was drawn with.
+void XrSetAlternate(bool on);
 // Game thread: wait for the headset's next frame, at most one and a half periods.
 void XrPaceWait();
 // Present thread: copy both eye images to the swapchains and end the open frame.

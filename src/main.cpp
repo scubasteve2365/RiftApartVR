@@ -24,7 +24,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 75
+#define BUILD_NUMBER 76
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -235,13 +235,16 @@ static std::atomic<bool> g_overlayFresh{false};
 static std::atomic<int> g_wantHudShot{0};
 static const size_t kOverlayResource = 0x67334c0 + 0x230 + 0x98, kNeutralResource = 0x678e710;
 static std::atomic<uint8_t*> g_eyeA{nullptr}, g_eyeB{nullptr};
+// Alternate eye, a menu option on top of native stereo: one eye drawn per tick. Off on the vendor screen and flat screens.
+static std::atomic<bool> g_alternateSetting{false}, g_alternateNow{false};
 static void* __fastcall HookTone(void* a, void* b, void* c, uint8_t* view, void* e, uint64_t generic) {
     if (g_toneFix && view) {
         uint8_t* owner = *reinterpret_cast<uint8_t**>(view + 0x1ff8);
         if (owner && (owner == g_eyeA.load() || owner == g_eyeB.load())) {
             generic = 0;
             if (g_eyeNoUi) {
-                if (owner == g_eyeA.load()) XrMarkRendered(reinterpret_cast<const float*>(view + 0x30));
+                if (owner == g_eyeA.load()) XrMarkRendered(0, reinterpret_cast<const float*>(view + 0x30));
+                else if (g_alternateNow.load()) XrMarkRendered(1, reinterpret_cast<const float*>(view + 0x30));
                 uint64_t* overlay = reinterpret_cast<uint64_t*>(g_base + kOverlayResource);
                 const uint64_t saved = *overlay;
                 *overlay = *reinterpret_cast<uint64_t*>(g_base + kNeutralResource);
@@ -254,7 +257,8 @@ static void* __fastcall HookTone(void* a, void* b, void* c, uint8_t* view, void*
     if (view) {
         // The render thread's copy of the view holds the camera this image was drawn with.
         uint8_t* owner = *reinterpret_cast<uint8_t**>(view + 0x1ff8);
-        if (owner && owner == g_eyeA.load()) XrMarkRendered(reinterpret_cast<const float*>(view + 0x30));
+        if (owner && owner == g_eyeA.load()) XrMarkRendered(0, reinterpret_cast<const float*>(view + 0x30));
+        else if (owner && owner == g_eyeB.load() && g_alternateNow.load()) XrMarkRendered(1, reinterpret_cast<const float*>(view + 0x30));
         // Offscreen views, eyes among them, have a negative id. The game's own view does not.
         if (*reinterpret_cast<int*>(view + 0xf90) >= 0) g_overlayFresh = true;
     }
@@ -410,6 +414,7 @@ static void CreateEyeImpl() {
 // The title sits at the origin with a 39.43 degree lens. Anything else that lasts a second is treated as the world.
 static std::atomic<bool> g_xrSession{false};
 static void OfxrPacingUpdate();
+static void OfxrApply();
 static void OfxrPacingTick();
 static void CreateEyeNow();
 // A vendor: the game zooms onto the vendor's screen and holds. Lens 10.87 in Steve's log. A boss fight's zoom also went to
@@ -653,6 +658,21 @@ static void __fastcall HookRenderAll() {
                 }
                 float jx = 0, jy = 0;
                 reinterpret_cast<JitterFn>(g_base + kJitter.rva)(main, &jx, &jy);
+                // Flag bit 0 makes the engine skip an offscreen view. The skipped eye also gets no new camera, so its
+                // motion vectors still run from the tick it was last drawn.
+                const bool alternate = g_alternateSetting.load() && !g_vendorNow.load();
+                static int freshEye = 0;
+                if (alternate) freshEye ^= 1;
+                if (alternate != g_alternateNow.load()) {
+                    g_alternateNow = alternate;
+                    XrSetAlternate(alternate);
+                    Log("MODE alternate eye %s", alternate ? "on" : "off");
+                    OfxrApply();
+                }
+                for (int fe = 0; fe < 2; ++fe) {
+                    uint32_t& flags = *reinterpret_cast<uint32_t*>(g_eyes[fe] + 0x16ccc);
+                    flags = alternate && fe != freshEye ? (flags | 1u) : (flags & ~1u);
+                }
                 {
                     // The game scales jitter by the size at +0x448, +0x44c: one pixel of the flat view, not of an eye.
                     const int mode = g_eyeJitter.load();
@@ -669,6 +689,7 @@ static void __fastcall HookRenderAll() {
                 const float scale = g_worldScale.load();
                 alignas(16) static uint8_t desc[0x600];
                 for (int e = 0; e < 2; ++e) {
+                    if (alternate && e != freshEye) continue;
                     const XrEyePose& p = eye[e];
                     // Head axes in LOCAL space from the quaternion.
                     const float x = p.qx, y = p.qy, z = p.qz, w = p.qw;
@@ -695,12 +716,12 @@ static void __fastcall HookRenderAll() {
                         eyePose[12 + i] = cam[12 + i] + offset[i] * scale;
                     }
                     eyePose[15] = 1;
-                    if (e == 0) XrTagPose(eyePose + 12);
+                    XrTagPose(e, eyePose + 12);
                     const bool fix = g_lensFix.load();
                     if (g_vendorNow) {
                         // The game's own camera and framing, both eyes the same: that screen is close. The head does not move it.
                         memcpy(eyePose, main, sizeof(eyePose));
-                        if (e == 0) XrTagPose(eyePose + 12);
+                        XrTagPose(e, eyePose + 12);
                         // Width as the game has it; height fills the eye image, of which the middle 16 by 9 band is shown.
                         const float* noJitter = reinterpret_cast<const float*>(main + 0x1c0);
                         const float tanX = 1.0f / fabsf(noJitter[0]);
@@ -1178,7 +1199,7 @@ static void OfxrApply() {
     WritePrivateProfileStringW(L"ofxr", L"triple_frame_gen", triple ? L"1" : L"0", ini.c_str());
     OfxrSettingsV2 c{};
     c.structSize = sizeof(c);
-    c.enabled = g_fgMode != 0;
+    c.enabled = g_fgMode != 0 && !g_alternateNow.load();
     c.backend = g_fgType == 3 ? 0 : triple ? 3 : 2;
     c.frameGeneration = g_fgType == 1 ? 1 : g_fgType == 2 ? 2 : 0;
     c.preset = g_fgPreset;
@@ -1190,7 +1211,7 @@ static int g_dlssPercentSetting = -1;  // -1 the game's choice, 0 no DLSS in the
 static float g_hudDistanceSetting = 2.0f;
 static std::wstring g_iniPath;
 static std::vector<uint32_t> g_menuImage;
-static const int kMenuW = 1024, kMenuH = 1344, kMenuRows = 16;
+static const int kMenuW = 1024, kMenuH = 1416, kMenuRows = 17;
 
 static void SaveSetting(const wchar_t* name, int value) {
     WritePrivateProfileStringW(L"VR", name, std::to_wstring(value).c_str(), g_iniPath.c_str());
@@ -1265,6 +1286,10 @@ static void MenuRowText(int row, wchar_t (&name)[64], wchar_t (&value)[64]) {
     case 14:
         wcscpy_s(name, L"Frame generation pacing");
         wcscpy_s(value, g_fgDirector ? L"Director" : L"Framework");
+        break;
+    case 15:
+        wcscpy_s(name, L"Stereo");
+        wcscpy_s(value, g_alternateSetting ? L"Alternate eye (no frame gen)" : L"Native");
         break;
     default: wcscpy_s(name, L"Close"); break;
     }
@@ -1446,6 +1471,10 @@ static void MenuChange(int dir) {
         g_fgDirector = !g_fgDirector;
         if (!g_fgDirector) SaveSetting(L"FrameGenDirector", 0);
         OfxrPacingUpdate();
+        break;
+    case 15:
+        g_alternateSetting = !g_alternateSetting;
+        SaveSetting(L"AlternateEye", g_alternateSetting ? 1 : 0);
         break;
     default:
         if (dir == 0) {
@@ -1755,7 +1784,7 @@ static void PollPad() {
         } else if (i == kLeft || i == kRight) {
             MenuChange(i == kLeft ? -1 : 1);
         } else if (i == kA) {
-            if (g_menuRow == 0 || g_menuRow == 2 || g_menuRow == 6 || g_menuRow == 7 || g_menuRow == 8 || g_menuRow == 9 || g_menuRow == 10 || g_menuRow == 11 || g_menuRow == 12 || g_menuRow == 13 || g_menuRow == 14 || g_menuRow == kMenuRows - 1) MenuChange(0);
+            if (g_menuRow == 0 || g_menuRow == 2 || g_menuRow == 6 || g_menuRow == 7 || g_menuRow == 8 || g_menuRow == 9 || g_menuRow == 10 || g_menuRow == 11 || g_menuRow == 12 || g_menuRow == 13 || g_menuRow == 14 || g_menuRow == 15 || g_menuRow == kMenuRows - 1) MenuChange(0);
         } else {
             MenuClose();
         }
@@ -2226,6 +2255,7 @@ static void RunCommand(const std::string& c) {
         g_fgDirector = g_w != 0;
         OfxrPacingUpdate();
     }
+    else if (sscanf(c.c_str(), "alternate %u", &g_w) == 1) g_alternateSetting = g_w != 0;
     else if (c == "fgstate") OfxrLogState("now");
     else if (sscanf(c.c_str(), "mirror %u", &g_w) == 1) g_mirrorEye = g_w != 0;
     else if (sscanf(c.c_str(), "eyeskip %u", &g_w) == 1) {
@@ -2423,6 +2453,7 @@ static DWORD WINAPI ProbeThread(void*) {
     g_fgType = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"VR", L"FrameGenType", 0, ini.c_str())), 0, 3);
     g_fgTypeAtLaunch = g_fgType;
     g_fgDirector = GetPrivateProfileIntW(L"VR", L"FrameGenDirector", 0, ini.c_str()) != 0;
+    g_alternateSetting = GetPrivateProfileIntW(L"VR", L"AlternateEye", 0, ini.c_str()) != 0;
     g_aimDot = static_cast<int>(GetPrivateProfileIntW(L"VR", L"AimDot", 1, ini.c_str()));
     g_labProbes = GetPrivateProfileIntW(L"VR", L"LabProbes", 1, ini.c_str()) != 0;
     g_skipLauncher = g_skipLauncherSetting;
