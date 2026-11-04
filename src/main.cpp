@@ -26,7 +26,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 84
+#define BUILD_NUMBER 85
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -1302,11 +1302,10 @@ static void OfxrApply() {
     const int ok = request(&c);
     Log("FRAMEGEN asked mode %d type %d preset %d scale %d, accepted %d", g_fgMode, g_fgType, g_fgPreset, g_fgScale, ok);
 }
-static int g_dlssPercentSetting = -1;  // -1 the game's choice, 0 no DLSS in the eyes, otherwise a fixed size
 static float g_hudDistanceSetting = 2.0f;
 static std::wstring g_iniPath;
 static std::vector<uint32_t> g_menuImage;
-static const int kMenuW = 1024, kMenuH = 1416, kMenuRows = 17;
+static const int kMenuW = 1024, kMenuH = 1344, kMenuRows = 16;
 
 static void SaveSetting(const wchar_t* name, int value) {
     WritePrivateProfileStringW(L"VR", name, std::to_wstring(value).c_str(), g_iniPath.c_str());
@@ -1333,27 +1332,21 @@ static void MenuRowText(int row, wchar_t (&name)[64], wchar_t (&value)[64]) {
         swprintf_s(value, L"%d%%", g_resolutionSetting);
         break;
     case 5:
-        wcscpy_s(name, L"DLSS in the eyes (next launch)");
-        if (g_dlssPercentSetting == 0) wcscpy_s(value, L"DLSS off");
-        else if (g_dlssPercentSetting < 0) wcscpy_s(value, L"Game's setting");
-        else swprintf_s(value, L"%d%%", g_dlssPercentSetting);
-        break;
-    case 6:
         wcscpy_s(name, L"Skip the launcher window (next launch)");
         wcscpy_s(value, g_skipLauncherSetting ? L"On" : L"Off");
         break;
-    case 7:
+    case 6:
         wcscpy_s(name, L"Vendor screen up close");
         wcscpy_s(value, g_vendorOn ? L"On" : L"Off");
         break;
-    case 8:
+    case 7:
         wcscpy_s(name, L"Aim dot");
         wcscpy_s(value, g_aimDot == 0 ? L"Off" : g_aimDot == 1 ? L"While aiming" : L"Always");
         break;
-    case 9:
+    case 8:
         wcscpy_s(name, L"Snapshot in 2 seconds");
         break;
-    case 10:
+    case 9:
     {
         wcscpy_s(name, L"Frame generation");
         OfxrSnapshotV2 v;
@@ -1362,7 +1355,7 @@ static void MenuRowText(int row, wchar_t (&name)[64], wchar_t (&value)[64]) {
         swprintf_s(value, L"%ls%ls", g_fgMode == 0 ? L"Off" : threeX ? L"3X" : L"2X", !loaded && g_fgMode != 0 ? L" next launch" : loaded && v.errors ? L" failed" : L"");
         break;
     }
-    case 11: {
+    case 10: {
         static const wchar_t* const types[4] = {L"Optical flow", L"FSR 3.1 (no frames)", L"DLSS-G", L"Hybrid"};
         wcscpy_s(name, L"Frame generation type");
         OfxrSnapshotV2 v;
@@ -1370,19 +1363,19 @@ static void MenuRowText(int row, wchar_t (&name)[64], wchar_t (&value)[64]) {
         swprintf_s(value, L"%ls%ls", types[g_fgType], notLive && g_fgMode != 0 ? L" next launch" : L"");
         break;
     }
-    case 12:
+    case 11:
         wcscpy_s(name, L"Optical flow quality");
         wcscpy_s(value, g_fgPreset == 2 ? L"Fast" : g_fgPreset == 1 ? L"Medium" : L"Slow");
         break;
-    case 13:
+    case 12:
         wcscpy_s(name, L"Optical flow detail");
         wcscpy_s(value, g_fgScale == 0 ? L"100%" : g_fgScale == 1 ? L"75%" : g_fgScale == 2 ? L"50%" : L"25%");
         break;
-    case 14:
+    case 13:
         wcscpy_s(name, L"Frame generation pacing");
         wcscpy_s(value, g_fgDirector ? L"Director" : L"Framework");
         break;
-    case 15:
+    case 14:
         wcscpy_s(name, L"Stereo");
         wcscpy_s(value, !g_alternateSetting ? L"Native" : g_rebuildSetting ? L"Alternate, depth rebuild" : L"Alternate, plain");
         break;
@@ -1512,62 +1505,50 @@ static void MenuChange(int dir) {
         SaveSetting(L"Resolution", g_resolutionSetting);
         break;
     case 5:
-    {
-        // The game's own choice, off, then fixed sizes.
-        static const int steps[] = {-1, 0, 50, 58, 67, 77, 100};
-        int i = 0;
-        for (int k = 0; k < 7; ++k) if (steps[k] == g_dlssPercentSetting) i = k;
-        i = std::clamp(i + (dir == 0 ? 1 : dir), 0, 6);
-        g_dlssPercentSetting = steps[i];
-        SaveSetting(L"EyeDLSS", g_dlssPercentSetting ? 1 : 0);
-        SaveSetting(L"EyeDLSSScene", g_dlssPercentSetting);
-        break;
-    }
-    case 6:
         g_skipLauncherSetting = !g_skipLauncherSetting;
         SaveSetting(L"SkipLauncher", g_skipLauncherSetting ? 1 : 0);
         break;
-    case 7:
+    case 6:
         g_vendorOn = !g_vendorOn;
         SaveSetting(L"VendorScreen", g_vendorOn ? 1 : 0);
         break;
-    case 8:
+    case 7:
         g_aimDot = (g_aimDot.load() + (dir < 0 ? 2 : 1)) % 3;
         SaveSetting(L"AimDot", g_aimDot.load());
         break;
-    case 9:
+    case 8:
         if (dir == 0) {
             CreateThread(nullptr, 0, SnapshotThread, nullptr, 0, nullptr);
             MenuClose();
             return;
         }
         break;
-    case 10:
+    case 9:
         g_fgMode = (g_fgMode + (dir < 0 ? 2 : 1)) % 3;
         SaveSetting(L"FrameGen", g_fgMode);
         OfxrApply();
         break;
-    case 11:
+    case 10:
         g_fgType = (g_fgType + (dir < 0 ? 3 : 1)) % 4;
         SaveSetting(L"FrameGenType", g_fgType);
         if (g_fgMode) OfxrApply();
         break;
-    case 12:
+    case 11:
         g_fgPreset = (g_fgPreset + (dir < 0 ? 1 : 2)) % 3;
         SaveSetting(L"FrameGenQuality", g_fgPreset);
         if (g_fgMode) OfxrApply();
         break;
-    case 13:
+    case 12:
         g_fgScale = (g_fgScale + (dir < 0 ? 1 : 3)) % 4;
         SaveSetting(L"FrameGenDetail", g_fgScale);
         if (g_fgMode) OfxrApply();
         break;
-    case 14:
+    case 13:
         g_fgDirector = !g_fgDirector;
         if (!g_fgDirector) SaveSetting(L"FrameGenDirector", 0);
         OfxrPacingUpdate();
         break;
-    case 15:
+    case 14:
     {
         // Native, then alternate with the rebuild, then plain alternate.
         const int now = !g_alternateSetting ? 0 : g_rebuildSetting ? 1 : 2;
@@ -1585,7 +1566,7 @@ static void MenuChange(int dir) {
         }
         break;
     }
-    Log("MENU row %d dir %d: scale %.2f pitch decoupled %d hud %.2f resolution %d dlss %d", g_menuRow, dir, g_worldScale.load(), g_levelCamera.load(), g_hudDistanceSetting, g_resolutionSetting, g_dlssPercentSetting);
+    Log("MENU row %d dir %d: scale %.2f pitch decoupled %d hud %.2f resolution %d", g_menuRow, dir, g_worldScale.load(), g_levelCamera.load(), g_hudDistanceSetting, g_resolutionSetting);
     MenuDraw();
 }
 
@@ -1886,7 +1867,7 @@ static void PollPad() {
         } else if (i == kLeft || i == kRight) {
             MenuChange(i == kLeft ? -1 : 1);
         } else if (i == kA) {
-            if (g_menuRow == 0 || g_menuRow == 2 || g_menuRow == 6 || g_menuRow == 7 || g_menuRow == 8 || g_menuRow == 9 || g_menuRow == 10 || g_menuRow == 11 || g_menuRow == 12 || g_menuRow == 13 || g_menuRow == 14 || g_menuRow == 15 || g_menuRow == kMenuRows - 1) MenuChange(0);
+            if (g_menuRow == 0 || g_menuRow == 2 || g_menuRow >= 5) MenuChange(0);
         } else {
             MenuClose();
         }
@@ -2648,11 +2629,8 @@ static void VtProbeReport() {
 static DWORD WINAPI ProbeThread(void*) {
     {
         const std::wstring early = g_dir + L"RiftApartVR.ini";
-        g_eyeDlss = GetPrivateProfileIntW(L"VR", L"EyeDLSS", 1, early.c_str()) != 0;
-        {
-            const int v = static_cast<int>(GetPrivateProfileIntW(L"VR", L"EyeDLSSScene", -1, early.c_str()));
-            g_eyeRenderPercent = !g_eyeDlss ? 100 : v < 0 ? -1 : std::clamp(v, 33, 100);
-        }
+        // The game's own DLSS menu is the only control. Old EyeDLSS and EyeDLSSScene values in the ini are ignored: a size far
+        // from the game's mode stops DLSS running in the eyes, with no error.
         g_regForce = !g_eyeDlss && GetPrivateProfileIntW(L"VR", L"ForceGameAA", 1, early.c_str()) != 0;
         g_skipLauncher = GetPrivateProfileIntW(L"VR", L"SkipLauncher", 1, early.c_str()) != 0;
         g_smallFlat = GetPrivateProfileIntW(L"VR", L"SmallFlatView", 1, early.c_str()) != 0;
@@ -2666,7 +2644,6 @@ static DWORD WINAPI ProbeThread(void*) {
     const std::wstring ini = g_dir + L"RiftApartVR.ini";
     g_iniPath = ini;
     g_skipLauncherSetting = GetPrivateProfileIntW(L"VR", L"SkipLauncher", 1, ini.c_str()) != 0;
-    g_dlssPercentSetting = g_eyeDlss ? g_eyeRenderPercent.load() : 0;
     g_vendorOn = GetPrivateProfileIntW(L"VR", L"VendorScreen", 1, ini.c_str()) != 0;
     g_fgMode = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"VR", L"FrameGen", 0, ini.c_str())), 0, 2);
     g_fgPreset = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"VR", L"FrameGenQuality", 1, ini.c_str())), 0, 2);

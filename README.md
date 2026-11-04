@@ -30,7 +30,6 @@ Click and hold both thumbsticks for half a second to open the VR menu. The game 
 | Decoupled pitch | On: the world stays level, only the camera's turn moves you. Off: the camera's up and down tilt moves the world too. Auto: level, except on gravity walls |
 | HUD distance | How far away the HUD panel sits |
 | Resolution | Percent of what your headset asks for. Next launch |
-| DLSS scene size | How large each eye is drawn before DLSS: 50 Performance, 58 Balanced, 67 Quality, 77 Ultra Quality, 100 DLAA. Next launch |
 | Skip the launcher window | Next launch |
 | Vendor screen up close | Shop screens fill your view when the game zooms onto one. Off leaves them in the world |
 | Aim dot | Shows where you aim, as a ring in the world |
