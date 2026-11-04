@@ -24,7 +24,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 67
+#define BUILD_NUMBER 68
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -370,8 +370,6 @@ static std::atomic<int> g_levelCamera{2};
 static float g_levelBlend = 0;
 // The engine's lens takes the top of the picture first, measured along its downward Y: minus OpenXR's up, then minus its down.
 static std::atomic<bool> g_lensFix{true};
-static std::atomic<float> g_eyeNear{0.0f};
-static std::atomic<bool> g_eyeSubmitId{false};
 // Eye jitter: 0 none, 1 the game's value resized from the flat view's pixels to the eye's, 2 the flat view's value as it is.
 static std::atomic<int> g_eyeJitter{1};
 static float g_lastFacing[2] = {0, 1};
@@ -422,7 +420,6 @@ static float g_aimRoom[3];
 static std::atomic<ULONGLONG> g_lastTrigger{0};
 // 1 while the pause menu is up. Found by comparing .data, tools\\flag_watch.py. Beside the frame counter 0x6794fe8.
 static const size_t kPausedFlag = 0x6794fd0;
-static const size_t kPausedOthers[] = {0x51628f8, 0x5162e98, 0x5f3a478, 0x5f3e324, 0x5f5c2d1, 0x628bb30, 0x679b214};
 // Logging and counters that only help development. LabProbes=0 in the ini, or `probes 0`, turns them off.
 static std::atomic<bool> g_labProbes{true};
 static void UpdateMode() {
@@ -434,7 +431,8 @@ static void UpdateMode() {
         const bool atOrigin = fabsf(cam[12]) + fabsf(cam[13]) + fabsf(cam[14]) < 1.0f;
         const double vfov = proj[5] != 0 ? 2.0 * atan(1.0 / fabs(proj[5])) * 57.29577951 : 0;
         // The title's fly-by holds one spot with a 33.3 degree lens.
-        const bool titleSpot = fabsf(cam[12] + 17.55f) + fabsf(cam[13] - 39.476f) + fabsf(cam[14] + 223.651f) < 1.0f;
+        const float titleDist = fabsf(cam[12] + 17.55f) + fabsf(cam[13] - 39.476f) + fabsf(cam[14] + 223.651f);
+        const bool titleSpot = titleDist < 1.0f || (titleDist < 12.0f && fabs(vfov - 33.30) < 0.02);
         // Frame to frame change of the game's camera, position and direction.
         static float lastCam[16];
         float moved = 0;
@@ -466,24 +464,6 @@ static void UpdateMode() {
             Log("MODE vendor screen %s, lens %.2f", vendor ? "starts" : "ends", vfov);
             g_vendorNow = vendor;
             XrSetCinema(vendor);
-        }
-        if (g_labProbes) {
-            static uint8_t seenPause[7] = {};
-            static int seenMain = 0;
-            char pauseChanges[160];
-            int pn = 0;
-            for (int i = 0; i < 7; ++i) {
-                const uint8_t v = *(g_base + kPausedOthers[i]);
-                if (v != seenPause[i]) {
-                    pn += sprintf_s(pauseChanges + pn, sizeof(pauseChanges) - pn, " %zx=%u", kPausedOthers[i], v);
-                    seenPause[i] = v;
-                }
-            }
-            const int paused = *reinterpret_cast<int*>(g_base + kPausedFlag);
-            if (pn || paused != seenMain) {
-                Log("PAUSEFLAGS chosen %d%s", paused, pn ? pauseChanges : "");
-                seenMain = paused;
-            }
         }
         // Only the title's own spots are flat. A rule on its 39.43 lens used to be here, and gameplay's aim zoom can pass through
         // that lens: Steve's log has it at 39.41, the flat screen came on, and no menu option could stop it.
@@ -643,7 +623,7 @@ static void __fastcall HookRenderAll() {
                     D[2] = F[0] * R[1] - F[1] * R[0];
                     memcpy(cam, rows, sizeof(rows));
                 }
-                const float nearZ = std::max(*reinterpret_cast<float*>(main + 0x3f8), g_eyeNear.load()), farZ = *reinterpret_cast<float*>(main + 0x3fc);
+                const float nearZ = *reinterpret_cast<float*>(main + 0x3f8), farZ = *reinterpret_cast<float*>(main + 0x3fc);
                 {
                     // The game aims along its camera's forward row. In the room: undo the level frame, then the centring.
                     const float* real = reinterpret_cast<const float*>(main);
@@ -765,12 +745,6 @@ static void __fastcall HookRenderAll() {
 // ---- pass queue: what each view asks the renderer to do. Lab log, and a list of passes an eye leaves out. ----
 using PassQueueFn = int64_t(__fastcall*)(void*, int64_t, int64_t, int64_t);
 static PassQueueFn g_origPassQueue;
-static thread_local int t_submitKind = 0;  // 0 not in a view's submit, 1 main, 2 left eye, 3 right eye
-static std::atomic<int> g_passLogFrames{0};
-static std::atomic<bool> g_eyeDropOverlay{false};
-static std::atomic<size_t> g_overlayBucket{0x1600};
-static std::atomic<uint64_t> g_overlayDropped{0};
-static std::atomic<uint64_t> g_passSkipBits[4];
 // ---- Each model of each view goes through here. ----
 // The HUD is a real model in the world, models/ui/playerhudrtt, placed by the game near its camera. In the game's own view
 // it lands in the UI overlay. In an offscreen view it lands in the picture, 20 units out, with bloom: the doubled HUD.
@@ -787,35 +761,6 @@ static void __fastcall HookModelQueue(uint8_t* ctx, uint8_t* inst, char flag) {
         if (name && memcmp(name, kUiModels, sizeof(kUiModels) - 1) == 0) return;
     }
     g_origModelQueue(ctx, inst, flag);
-}
-
-static int64_t __fastcall HookPassQueue(void* bucket, int64_t idWide, int64_t a, int64_t b) {
-    const int id = static_cast<int>(idWide);
-    const int kind = t_submitKind;
-    if (g_passLogFrames.load() > 0 && id != 0x62) {
-        uint8_t* e0 = g_eyeA.load();
-        uint8_t* e1 = g_eyeB.load();
-        uint8_t* m = ActiveView();
-        const auto at = reinterpret_cast<uint8_t*>(bucket);
-        const size_t span = 0x17000;
-        const int owner = (m && at >= m && at < m + span) ? 1 : (e0 && at >= e0 && at < e0 + span) ? 2 : (e1 && at >= e1 && at < e1 + span) ? 3 : 0;
-        const size_t off = owner == 1 ? at - m : owner == 2 ? at - e0 : owner == 3 ? at - e1 : 0;
-        Log("PASSQ thread %d owner %d off %zx id %#x from %zx", kind, owner, off, id, static_cast<size_t>(reinterpret_cast<uint8_t*>(_ReturnAddress()) - g_base));
-    }
-    // The UI's models queue into the overlay bucket. The main view renders that bucket into the overlay. Eyes have no overlay
-    // step, so the same models would land in their picture: leave them out.
-    if (g_eyeDropOverlay.load()) {
-        const auto at = reinterpret_cast<uint8_t*>(bucket);
-        uint8_t* e0 = g_eyeA.load();
-        uint8_t* e1 = g_eyeB.load();
-        const size_t off = g_overlayBucket.load();
-        if ((e0 && at == e0 + off) || (e1 && at == e1 + off)) {
-            ++g_overlayDropped;
-            return 0;
-        }
-    }
-    if (kind >= 2 && id >= 0 && id < 256 && (g_passSkipBits[id / 64].load() >> (id % 64) & 1)) return 0;
-    return g_origPassQueue(bucket, idWide, a, b);
 }
 
 // Resting the flat view: the scene submit returns at once when view +0x11d8 is clear. Set again when not resting.
@@ -873,23 +818,13 @@ static void* __fastcall HookSceneSubmit(uint8_t* view, void* a, uint32_t mask, c
         memcpy(saved, view + 0x1740, sizeof(saved));
         memcpy(view + 0x1740, main + 0x1740, sizeof(saved));
         const uint64_t t = PerfNow();
-        t_submitKind = view == g_eyeA.load() ? 2 : 3;
-        // Offscreen views have a negative id, and the engine then draws the UI's models into their picture.
-        int* idField = reinterpret_cast<int*>(view + 0xf90);
-        const int savedId = *idField;
-        if (g_eyeSubmitId.load()) *idField = 0;
         void* r = g_origSceneSubmit(view, a, mask, b);
-        *idField = savedId;
-        t_submitKind = 0;
         g_usEyeSubmit += PerfNow() - t;
         memcpy(view + 0x1740, saved, sizeof(saved));
         return r;
     }
     const uint64_t t = PerfNow();
-    t_submitKind = view == ActiveView() ? 1 : 0;
     void* r = g_origSceneSubmit(view, a, mask, b);
-    t_submitKind = 0;
-    if (view == ActiveView() && g_passLogFrames.load() > 0) g_passLogFrames.fetch_sub(1);
     g_usMainSubmit += PerfNow() - t;
     return r;
 }
@@ -911,7 +846,6 @@ static void InstallHooks() {
     MH_CreateHook(g_base + kViewCreate.rva, reinterpret_cast<void*>(&HookViewCreate), reinterpret_cast<void**>(&g_origViewCreate));
     MH_CreateHook(g_base + kCameraPush.rva, reinterpret_cast<void*>(&HookCameraPush), reinterpret_cast<void**>(&g_origCameraPush));
     MH_CreateHook(g_base + kTone.rva, reinterpret_cast<void*>(&HookTone), reinterpret_cast<void**>(&g_origTone));
-    MH_CreateHook(g_base + 0x1215870, reinterpret_cast<void*>(&HookPassQueue), reinterpret_cast<void**>(&g_origPassQueue));
     MH_CreateHook(g_base + 0x11212d0, reinterpret_cast<void*>(&HookModelQueue), reinterpret_cast<void**>(&g_origModelQueue));
     MH_CreateHook(g_base + kBufferSize.rva, reinterpret_cast<void*>(&HookBufferSize), reinterpret_cast<void**>(&g_origBufferSize));
     const MH_STATUS st = MH_EnableHook(MH_ALL_HOOKS);
@@ -1115,7 +1049,7 @@ static void OnPresentForXr(void* backBuffer, unsigned bbW, unsigned bbH, int bbF
             void* r[1] = {ui[0].resource};
             uint32_t st0[1] = {ui[0].state};
             static std::wstring path;
-            path = g_dir + L"vrlab_shots\hudshot.bmp";
+            path = g_dir + L"vrlab_shots\\hudshot.bmp";
             const wchar_t* paths[1] = {path.c_str()};
             Log("HUD shot queued: %s", CaptureRequest(r, st0, paths, 1) ? "yes" : "no");
         }
@@ -1713,6 +1647,7 @@ static ID3D12Resource* g_dlssRead;
 static UINT64 g_dlssFreq;
 static std::atomic<uint32_t> g_dlssFrame[kDlssSlots];
 static std::atomic<uint64_t> g_dlssTicks[kDlssSlots], g_dlssCount[kDlssSlots];
+static std::atomic<uint64_t> g_eyeSpanTicks{0}, g_eyeSpanCount{0};
 static bool DlssTimerBegin(ID3D12GraphicsCommandList* list, int vp, UINT* index) {
     if (!g_labProbes.load() || vp < 0 || vp >= static_cast<int>(kDlssSlots) || !list) return false;
     if (!g_dlssHeap) {
@@ -1750,6 +1685,13 @@ static bool DlssTimerBegin(ID3D12GraphicsCommandList* list, int vp, UINT* index)
             if (b > a) {
                 g_dlssTicks[vp] += b - a;
                 ++g_dlssCount[vp];
+                static UINT64 leftEnd = 0;
+                if (vp == 1) leftEnd = b;
+                if (vp == 2 && leftEnd && b > leftEnd) {
+                    g_eyeSpanTicks += b - leftEnd;
+                    ++g_eyeSpanCount;
+                    leftEnd = 0;
+                }
             }
         }
     }
@@ -2110,15 +2052,7 @@ static void RunCommand(const std::string& c) {
     else if (sscanf(c.c_str(), "level %u", &g_w) == 1) g_levelCamera = static_cast<int>(g_w);
     else if (sscanf(c.c_str(), "lensfix %u", &g_w) == 1) g_lensFix = g_w != 0;
     else if (sscanf(c.c_str(), "eyenoui %u", &g_w) == 1) g_eyeNoUi = g_w != 0;
-    else if (sscanf(c.c_str(), "passlog %u", &g_w) == 1) g_passLogFrames = static_cast<int>(g_w);
-    else if (sscanf(c.c_str(), "dropoverlay %u", &g_w) == 1) g_eyeDropOverlay = g_w != 0;
-    else if (sscanf(c.c_str(), "eyenear %f", &g_f) == 1) g_eyeNear = g_f;
-    else if (sscanf(c.c_str(), "eyeid %u", &g_w) == 1) g_eyeSubmitId = g_w != 0;
-    else if (sscanf(c.c_str(), "overlaybucket %x", &g_w) == 1) g_overlayBucket = g_w;
     else if (sscanf(c.c_str(), "eyeui %u", &g_w) == 1) g_eyeDropUi = g_w != 0;
-    else if (c == "droppedinfo") Log("OVERLAY dropped %llu", static_cast<unsigned long long>(g_overlayDropped.load()));
-    else if (sscanf(c.c_str(), "passskip %x", &g_w) == 1) g_passSkipBits[(g_w & 0xff) / 64].fetch_or(1ull << ((g_w & 0xff) % 64));
-    else if (sscanf(c.c_str(), "passkeep %x", &g_w) == 1) g_passSkipBits[(g_w & 0xff) / 64].fetch_and(~(1ull << ((g_w & 0xff) % 64)));
     else if (sscanf(c.c_str(), "mirror %u", &g_w) == 1) g_mirrorEye = g_w != 0;
     else if (sscanf(c.c_str(), "eyeskip %u", &g_w) == 1) {
         // Lab: stop drawing an eye, to see what it costs. 1 right, 2 both, 0 neither.
@@ -2407,7 +2341,9 @@ static DWORD WINAPI ProbeThread(void*) {
                         }
                         double copyMs = 0, betweenMs = 0;
                         XrCopyTimes(&copyMs, &betweenMs);
-                        Log("PERF GPU ms: DLSS game's view %.2f, left %.2f, right %.2f; mod's copies %.2f; between frame ends %.2f", ms[0], ms[1], ms[2], copyMs, betweenMs);
+                        const uint64_t spanCount = g_eyeSpanCount.exchange(0), spanTicks = g_eyeSpanTicks.exchange(0);
+                        const double spanMs = spanCount && g_dlssFreq ? static_cast<double>(spanTicks) / static_cast<double>(spanCount) * 1000.0 / static_cast<double>(g_dlssFreq) : 0;
+                        Log("PERF GPU ms: DLSS game's view %.2f, left %.2f, right %.2f; right eye whole %.2f; mod's copies %.2f; between frame ends %.2f", ms[0], ms[1], ms[2], spanMs, copyMs, betweenMs);
                     }
                     Log("PERF frames %llu, ms per frame: whole %.2f, pacing wait %.2f, all offscreen %.2f, eye submits %.2f, main submit %.2f", static_cast<unsigned long long>(n), g_usFrame.exchange(0) / f, g_usPace.exchange(0) / f, g_usOffscreen.exchange(0) / f, g_usEyeSubmit.exchange(0) / f, g_usMainSubmit.exchange(0) / f);
                 }
