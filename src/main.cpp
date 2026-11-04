@@ -26,7 +26,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 85
+#define BUILD_NUMBER 86
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -583,6 +583,68 @@ static void LogMemory() {
     if (adapter) adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local);
     const auto mb = [](uint64_t b) { return static_cast<unsigned long long>(b / (1024 * 1024)); };
     Log("MEM system commit %llu of %llu MB, RAM free %llu of %llu MB; game private %llu, working set %llu MB; card %llu of %llu MB", mb(m.ullTotalPageFile - m.ullAvailPageFile), mb(m.ullTotalPageFile), mb(m.ullAvailPhys), mb(m.ullTotalPhys), mb(pc.PrivateUsage), mb(pc.WorkingSetSize), mb(local.CurrentUsage), mb(local.Budget));
+}
+
+// ---- When the GPU hangs: D3D12's own recorder says which command list and which operation it stopped in. ----
+// Must be turned on before the game makes its device. DeviceDiagnostics=0 in the ini turns it off.
+static void DredEnable() {
+    const HMODULE d = LoadLibraryW(L"d3d12.dll");
+    using GetFn = HRESULT(WINAPI*)(REFIID, void**);
+    const auto get = d ? reinterpret_cast<GetFn>(GetProcAddress(d, "D3D12GetDebugInterface")) : nullptr;
+    ID3D12DeviceRemovedExtendedDataSettings* settings = nullptr;
+    if (get && SUCCEEDED(get(IID_PPV_ARGS(&settings))) && settings) {
+        settings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+        settings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+        settings->Release();
+        Log("DRED on");
+    } else {
+        Log("DRED not available");
+    }
+}
+static void DredReport(ID3D12Device* device, HRESULT why) {
+    Log("DRED device removed %08lx, camera below", static_cast<unsigned long>(why));
+    LogView();
+    ID3D12DeviceRemovedExtendedData* dred = nullptr;
+    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&dred))) || !dred) {
+        Log("DRED no data");
+        return;
+    }
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT out{};
+    if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&out))) {
+        int shown = 0;
+        for (const D3D12_AUTO_BREADCRUMB_NODE* n = out.pHeadAutoBreadcrumbNode; n && shown < 12; n = n->pNext) {
+            const UINT32 last = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
+            if (last >= n->BreadcrumbCount) continue;  // this list finished
+            ++shown;
+            Log("DRED unfinished list %p queue %p, %ls / %ls, done %u of %u", n->pCommandList, n->pCommandQueue, n->pCommandListDebugNameW ? n->pCommandListDebugNameW : L"", n->pCommandQueueDebugNameW ? n->pCommandQueueDebugNameW : L"", last, n->BreadcrumbCount);
+            char ops[300];
+            int w = 0;
+            for (UINT32 i = last > 6 ? last - 6 : 0; i < n->BreadcrumbCount && i < last + 8 && w < 280; ++i) w += sprintf_s(ops + w, sizeof(ops) - w, i == last ? "[%d] " : "%d ", static_cast<int>(n->pCommandHistory[i]));
+            Log("DRED  operations, [next]: %s", ops);
+        }
+        Log("DRED %d lists unfinished", shown);
+    }
+    D3D12_DRED_PAGE_FAULT_OUTPUT fault{};
+    if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&fault))) {
+        Log("DRED page fault at %llx", static_cast<unsigned long long>(fault.PageFaultVA));
+        int shown = 0;
+        for (const D3D12_DRED_ALLOCATION_NODE* n = fault.pHeadExistingAllocationNode; n && shown < 6; n = n->pNext, ++shown) Log("DRED  existing %s type %d", n->ObjectNameA ? n->ObjectNameA : "", static_cast<int>(n->AllocationType));
+        shown = 0;
+        for (const D3D12_DRED_ALLOCATION_NODE* n = fault.pHeadRecentFreedAllocationNode; n && shown < 6; n = n->pNext, ++shown) Log("DRED  freed %s type %d", n->ObjectNameA ? n->ObjectNameA : "", static_cast<int>(n->AllocationType));
+    }
+    dred->Release();
+}
+static DWORD WINAPI DredWatch(void*) {
+    for (;;) {
+        Sleep(500);
+        auto* device = static_cast<ID3D12Device*>(CaptureDevice());
+        if (!device) continue;
+        const HRESULT why = device->GetDeviceRemovedReason();
+        if (FAILED(why)) {
+            DredReport(device, why);
+            return 0;
+        }
+    }
 }
 
 // ---- timing probe, game thread, reset every report ----
@@ -2458,6 +2520,11 @@ static void RunCommand(const std::string& c) {
             Log("VIEWINFO %p occlusion %p lens lod %.3f scale %.3f share flag %u flags %#x", v, *reinterpret_cast<void**>(v + 0x1bf0), *reinterpret_cast<float*>(v + 0x1d14), *reinterpret_cast<float*>(v + 0x1d18), *(v + 0x11da), *reinterpret_cast<uint32_t*>(v + 0x16ccc));
         }
     }
+    else if (c == "dredtest") {
+        // Lab: removes the device on purpose, to prove the report works.
+        ID3D12Device5* d5 = nullptr;
+        if (CaptureDevice() && SUCCEEDED(static_cast<ID3D12Device*>(CaptureDevice())->QueryInterface(IID_PPV_ARGS(&d5))) && d5) d5->RemoveDevice();
+    }
     else if (c == "fgstate") OfxrLogState("now");
     else if (sscanf(c.c_str(), "mirror %u", &g_w) == 1) g_mirrorEye = g_w != 0;
     else if (sscanf(c.c_str(), "eyeskip %u", &g_w) == 1) {
@@ -2635,6 +2702,10 @@ static DWORD WINAPI ProbeThread(void*) {
         g_skipLauncher = GetPrivateProfileIntW(L"VR", L"SkipLauncher", 1, early.c_str()) != 0;
         g_smallFlat = GetPrivateProfileIntW(L"VR", L"SmallFlatView", 1, early.c_str()) != 0;
         g_skipMain = static_cast<int>(GetPrivateProfileIntW(L"VR", L"HudEveryFrames", 4, early.c_str()));
+        if (GetPrivateProfileIntW(L"VR", L"DeviceDiagnostics", 1, early.c_str()) != 0) {
+            DredEnable();
+            CreateThread(nullptr, 0, DredWatch, nullptr, 0, nullptr);
+        }
         MH_Initialize();
         InstallRegHooks();
     }
