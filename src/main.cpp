@@ -27,7 +27,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 89
+#define BUILD_NUMBER 90
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -608,7 +608,7 @@ static void LogMemory() {
 }
 
 // ---- Where the CPU time goes: every thread of the game, whole machine, at each PERF report. Lab probe. ----
-static std::atomic<DWORD> g_gameThreadId{0}, g_presentThreadId{0};
+static std::atomic<DWORD> g_gameThreadId{0}, g_presentThreadId{0}, g_topThreadId{0};
 static void LogThreads() {
     static std::map<DWORD, uint64_t> last;
     static uint64_t lastWall = 0, lastBusy = 0, lastIdle = 0;
@@ -653,6 +653,12 @@ static void LogThreads() {
     lastIdle = idle;
     if (!have) return;
     std::sort(delta.rbegin(), delta.rend());
+    for (const auto& d : delta) {
+        if (d.second != g_gameThreadId.load()) {
+            g_topThreadId = d.second;
+            break;
+        }
+    }
     char line[300];
     int w = 0;
     const DWORD game = g_gameThreadId.load(), present = g_presentThreadId.load();
@@ -667,6 +673,84 @@ static void LogThreads() {
         if (d.second == present) presentPct = pct;
     }
     Log("CPU game thread %.0f%%, render thread %.0f%%, process %.2f cores, whole PC %.0f%% busy; top threads %s", gamePct, presentPct, static_cast<double>(total) / static_cast<double>(span), 100.0 * static_cast<double>(sysBusy) / static_cast<double>(sysBusy + sysIdle), line);
+}
+
+// ---- What the busiest thread is doing. Stops it briefly 40 times every 20 s and copies its instruction pointer and top of stack. ----
+// Nothing is logged, allocated or locked while it is stopped: it could be holding the lock. Lab probe.
+static std::wstring ModuleOf(uint64_t a, uint64_t* offset) {
+    HMODULE m = nullptr;
+    wchar_t path[MAX_PATH] = {};
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(a), &m) || !m) return L"";
+    GetModuleFileNameW(m, path, MAX_PATH);
+    *offset = a - reinterpret_cast<uint64_t>(m);
+    const wchar_t* slash = wcsrchr(path, L'\\');
+    return slash ? slash + 1 : path;
+}
+static DWORD WINAPI ThreadSampler(void*) {
+    static uint8_t stackCopy[0x3000];
+    using NtQueryFn = LONG(NTAPI*)(HANDLE, int, void*, ULONG, ULONG*);
+    const auto query = reinterpret_cast<NtQueryFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+    using DescFn = HRESULT(WINAPI*)(HANDLE, PWSTR*);
+    const auto description = reinterpret_cast<DescFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetThreadDescription"));
+    for (;;) {
+        Sleep(20000);
+        const DWORD tid = g_topThreadId.load();
+        if (!g_labProbes.load() || !tid || tid == GetCurrentThreadId() || !g_xrEyes.load()) continue;
+        HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
+        if (!h) continue;
+        uint64_t start = 0;
+        if (query) query(h, 9, &start, sizeof(start), nullptr);
+        std::wstring name;
+        PWSTR raw = nullptr;
+        if (description && SUCCEEDED(description(h, &raw)) && raw) {
+            name = raw;
+            LocalFree(raw);
+        }
+        std::map<std::wstring, int> where;
+        std::map<uint64_t, int> frames;
+        int got = 0;
+        for (int i = 0; i < 40; ++i) {
+            Sleep(25);
+            CONTEXT c{};
+            c.ContextFlags = CONTEXT_CONTROL;
+            if (SuspendThread(h) == static_cast<DWORD>(-1)) break;
+            const BOOL ok = GetThreadContext(h, &c);
+            bool copied = false;
+            if (ok) copied = SafeCopy(stackCopy, reinterpret_cast<void*>(c.Rsp), sizeof(stackCopy));
+            ResumeThread(h);
+            if (!ok) continue;
+            ++got;
+            uint64_t off = 0;
+            std::wstring mod = ModuleOf(c.Rip, &off);
+            ++where[mod.empty() ? L"?" : mod];
+            // The nearest address in the game's own code says what it was doing for the game.
+            const uint64_t lo = reinterpret_cast<uint64_t>(g_base) + g_textStart, hi = lo + g_textSize;
+            uint64_t hit = c.Rip >= lo && c.Rip < hi ? c.Rip : 0;
+            if (!hit && copied) {
+                const uint64_t* words = reinterpret_cast<const uint64_t*>(stackCopy);
+                for (size_t k = 0; k < sizeof(stackCopy) / 8 && !hit; ++k) {
+                    if (words[k] >= lo && words[k] < hi) hit = words[k];
+                }
+            }
+            if (hit) ++frames[(hit - reinterpret_cast<uint64_t>(g_base)) & ~0xffull];
+        }
+        CloseHandle(h);
+        uint64_t startOff = 0;
+        const std::wstring startMod = start ? ModuleOf(start, &startOff) : L"";
+        char line[400];
+        int w = 0;
+        std::vector<std::pair<int, std::wstring>> wl;
+        for (const auto& e : where) wl.push_back({e.second, e.first});
+        std::sort(wl.rbegin(), wl.rend());
+        for (size_t i = 0; i < wl.size() && i < 6; ++i) w += sprintf_s(line + w, sizeof(line) - w, "%ls %d, ", wl[i].second.c_str(), wl[i].first);
+        Log("TOPTHREAD %lu name '%ls' start %ls+%llx, %d samples in: %s", tid, name.c_str(), startMod.c_str(), static_cast<unsigned long long>(startOff), got, line);
+        w = 0;
+        std::vector<std::pair<int, uint64_t>> fl;
+        for (const auto& e : frames) fl.push_back({e.second, e.first});
+        std::sort(fl.rbegin(), fl.rend());
+        for (size_t i = 0; i < fl.size() && i < 10 && w < 340; ++i) w += sprintf_s(line + w, sizeof(line) - w, "%llx x%d, ", static_cast<unsigned long long>(fl[i].second), fl[i].first);
+        Log("TOPTHREAD game code near: %s", line);
+    }
 }
 
 // ---- When the GPU hangs: D3D12's own recorder says which command list and which operation it stopped in. ----
@@ -1501,7 +1585,7 @@ static void MenuRowText(int row, wchar_t (&name)[64], wchar_t (&value)[64]) {
         OfxrSnapshotV2 v;
         const bool loaded = OfxrSnapshot(&v);
         const bool threeX = g_fgMode == 2 && g_fgType != 1 && g_fgType != 3;
-        swprintf_s(value, L"%ls%ls", g_fgMode == 0 ? L"Off" : threeX ? L"3X" : L"2X", !loaded && g_fgMode != 0 ? L" next launch" : loaded && v.errors ? L" failed" : L"");
+        swprintf_s(value, L"%ls%ls", g_fgMode == 0 ? L"Off" : threeX ? L"3X" : L"2X", g_fgMode == 0 ? L"" : g_alternateSetting ? L", off in alternate" : !loaded ? L" next launch" : v.errors ? L" failed" : L"");
         break;
     }
     case 10: {
@@ -2801,6 +2885,7 @@ static DWORD WINAPI ProbeThread(void*) {
         g_smallFlat = GetPrivateProfileIntW(L"VR", L"SmallFlatView", 1, early.c_str()) != 0;
         g_skipMain = static_cast<int>(GetPrivateProfileIntW(L"VR", L"HudEveryFrames", 4, early.c_str()));
         g_cutsceneCamera = static_cast<int>(GetPrivateProfileIntW(L"VR", L"CutsceneCamera", 0, early.c_str())) % 3;
+        CreateThread(nullptr, 0, ThreadSampler, nullptr, 0, nullptr);
         if (GetPrivateProfileIntW(L"VR", L"DeviceDiagnostics", 1, early.c_str()) != 0) {
             DredEnable();
             CreateThread(nullptr, 0, DredWatch, nullptr, 0, nullptr);
