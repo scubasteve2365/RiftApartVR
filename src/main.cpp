@@ -24,7 +24,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 58
+#define BUILD_NUMBER 67
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -370,6 +370,8 @@ static std::atomic<int> g_levelCamera{2};
 static float g_levelBlend = 0;
 // The engine's lens takes the top of the picture first, measured along its downward Y: minus OpenXR's up, then minus its down.
 static std::atomic<bool> g_lensFix{true};
+static std::atomic<float> g_eyeNear{0.0f};
+static std::atomic<bool> g_eyeSubmitId{false};
 // Eye jitter: 0 none, 1 the game's value resized from the flat view's pixels to the eye's, 2 the flat view's value as it is.
 static std::atomic<int> g_eyeJitter{1};
 static float g_lastFacing[2] = {0, 1};
@@ -410,16 +412,9 @@ static void CreateEyeImpl() {
 // The title sits at the origin with a 39.43 degree lens. Anything else that lasts a second is treated as the world.
 static std::atomic<bool> g_xrSession{false};
 static void CreateEyeNow();
-// Above 0 during real cinematics. Found by comparing .data (data_cross.py, flag_watch.py, cine_prune.py), chosen from
-// Steve's long play: the atmosphere track count 0x5339144 also fires for short scripted moments in combat, this does not.
-// Nothing references it directly, so what it is is unknown.
-static const size_t kCinematicTracks = 0x61d19d4;
-// The others that passed the same test, logged when they change so a longer play can judge them.
-static const size_t kCinematicOthers[] = {0x512cf1c, 0x512f770, 0x513195c, 0x5339144, 0x5f3bdc0, 0x5f3d6f8, 0x5ffa764, 0x6240ba8};
-static std::atomic<bool> g_cinemaOn{true};
-static std::atomic<bool> g_cinemaNow{false};
-static std::atomic<float> g_cinemaIpd{0.03f};
-static const size_t kAtmosphereTracks = 0x5339144;
+// A vendor: the game zooms onto the vendor's screen and holds. Lens 10.87 in Steve's log. A boss fight's zoom also went to
+// 9 to 10, but moving, so it takes a very narrow lens and a held camera. Off in the menu means never.
+static std::atomic<bool> g_vendorOn{true};
 static std::atomic<bool> g_vendorNow{false}, g_forceVendor{false};
 // 0 off, 1 while aiming, 2 always.
 static std::atomic<int> g_aimDot{1};
@@ -440,37 +435,38 @@ static void UpdateMode() {
         const double vfov = proj[5] != 0 ? 2.0 * atan(1.0 / fabs(proj[5])) * 57.29577951 : 0;
         // The title's fly-by holds one spot with a 33.3 degree lens.
         const bool titleSpot = fabsf(cam[12] + 17.55f) + fabsf(cam[13] - 39.476f) + fabsf(cam[14] + 223.651f) < 1.0f;
-        // Counted through the frame, so hold a state until it is steady.
-        static int onFrames = 0, offFrames = 0;
-        static bool steady = false;
-        if (*reinterpret_cast<int*>(g_base + kCinematicTracks) > 0) {
-            ++onFrames;
-            offFrames = 0;
-        } else {
-            ++offFrames;
-            onFrames = 0;
-        }
-        if (onFrames >= 3) steady = true;
-        if (offFrames >= 15) steady = false;
-        // A vendor: the game zooms its camera onto the vendor's screen, lens 10.87 in Steve's logs, with an atmosphere track
-        // running. Same path as a cutscene, so the zoomed view fills the screen. Both eyes the same: that screen is close.
-        const bool vendorNow = g_forceVendor.load() || (*reinterpret_cast<int*>(g_base + kAtmosphereTracks) > 0 && vfov > 0 && vfov < 13.0);
-        static int vendorOn = 0, vendorOff = 0;
-        if (vendorNow) {
-            ++vendorOn;
-            vendorOff = 0;
-        } else {
-            ++vendorOff;
-            vendorOn = 0;
+        // Frame to frame change of the game's camera, position and direction.
+        static float lastCam[16];
+        float moved = 0;
+        for (int i = 0; i < 3; ++i) moved = (std::max)(moved, fabsf(cam[12 + i] - lastCam[12 + i]));
+        for (int i = 8; i < 11; ++i) moved = (std::max)(moved, fabsf(cam[i] - lastCam[i]));
+        memcpy(lastCam, cam, sizeof(lastCam));
+        static int zoomHeld = 0, vendorOff = 0;
+        const bool zoomed = vfov > 0 && vfov < 13.0;
+        zoomHeld = zoomed && moved < 0.003f ? zoomHeld + 1 : 0;
+        // The numbers the rule rests on, for checking it against a real vendor in Steve's next log.
+        if (zoomed && g_labProbes) {
+            static int zoomLog = 0;
+            if (++zoomLog % 30 == 1) Log("VENDOR zoom lens %.2f moved %.5f held %d", vfov, moved, zoomHeld);
         }
         static bool vendor = false;
-        if (vendorOn >= 3) vendor = true;
-        if (vendorOff >= 15) vendor = false;
+        if (g_forceVendor.load() || zoomHeld >= 8) {
+            vendor = true;
+            vendorOff = 0;
+        } else if (!zoomed) {
+            // The zoom going away ends it fast. A small wobble while still zoomed does not.
+            if (++vendorOff >= 3) vendor = false;
+        } else if (moved >= 0.05f) {
+            if (++vendorOff >= 8) vendor = false;
+        } else {
+            vendorOff = 0;
+        }
+        vendor = vendor && g_vendorOn.load();
         if (vendor != g_vendorNow.load()) {
             Log("MODE vendor screen %s, lens %.2f", vendor ? "starts" : "ends", vfov);
             g_vendorNow = vendor;
+            XrSetCinema(vendor);
         }
-        const bool cine = g_cinemaOn && (steady || vendor);
         if (g_labProbes) {
             static uint8_t seenPause[7] = {};
             static int seenMain = 0;
@@ -488,24 +484,14 @@ static void UpdateMode() {
                 Log("PAUSEFLAGS chosen %d%s", paused, pn ? pauseChanges : "");
                 seenMain = paused;
             }
-            static uint8_t seen[8] = {};
-            char changes[160];
-            int n = 0;
-            for (int i = 0; i < 8; ++i) {
-                const uint8_t v = *(g_base + kCinematicOthers[i]);
-                if (v != seen[i]) {
-                    n += sprintf_s(changes + n, sizeof(changes) - n, " %zx=%u", kCinematicOthers[i], v);
-                    seen[i] = v;
-                }
-            }
-            if (n) Log("CINEFLAGS%s (chosen %d)", changes, *reinterpret_cast<int*>(g_base + kCinematicTracks));
         }
-        // Cinematics can use the title's lens too.
-        world = !atOrigin && !titleSpot && (cine || fabs(vfov - 39.43) > 0.05);
-        if (cine != g_cinemaNow.load()) {
-            Log("MODE cinematic %s, lens %.2f", cine ? "starts" : "ends", vfov);
-            g_cinemaNow = cine;
-            XrSetCinema(cine);
+        // Only the title's own spots are flat. A rule on its 39.43 lens used to be here, and gameplay's aim zoom can pass through
+        // that lens: Steve's log has it at 39.41, the flat screen came on, and no menu option could stop it.
+        world = !atOrigin && !titleSpot;
+        static bool seenWorld = false;
+        if (world != seenWorld) {
+            Log("MODE %s spot, camera %.2f %.2f %.2f lens %.2f", world ? "world" : "title", cam[12], cam[13], cam[14], vfov);
+            seenWorld = world;
         }
     }
     static ULONGLONG since = 0;
@@ -657,7 +643,7 @@ static void __fastcall HookRenderAll() {
                     D[2] = F[0] * R[1] - F[1] * R[0];
                     memcpy(cam, rows, sizeof(rows));
                 }
-                const float nearZ = *reinterpret_cast<float*>(main + 0x3f8), farZ = *reinterpret_cast<float*>(main + 0x3fc);
+                const float nearZ = std::max(*reinterpret_cast<float*>(main + 0x3f8), g_eyeNear.load()), farZ = *reinterpret_cast<float*>(main + 0x3fc);
                 {
                     // The game aims along its camera's forward row. In the room: undo the level frame, then the centring.
                     const float* real = reinterpret_cast<const float*>(main);
@@ -672,10 +658,10 @@ static void __fastcall HookRenderAll() {
                     // Aiming lens, or a trigger touched in the last two seconds: the game's reticle is up.
                     const bool aiming = fabs(lens - 32.64) < 0.5 || GetTickCount64() - g_lastTrigger.load() < 2000;
                     const int dot = g_aimDot.load();
-                    const bool dotOn = !g_cinemaNow && (dot == 2 || (dot == 1 && aiming));
+                    const bool dotOn = !g_vendorNow && (dot == 2 || (dot == 1 && aiming));
                     XrSetAimDot(dotOn ? room : nullptr, g_centre);
                     // Paused or in a cutscene the HUD image holds menus: otherwise the game's reticle never shows, aiming or not.
-                    XrSetHudHole(!g_cinemaNow && dot != 0 && *reinterpret_cast<int*>(g_base + kPausedFlag) == 0);
+                    XrSetHudHole(!g_vendorNow && dot != 0 && *reinterpret_cast<int*>(g_base + kPausedFlag) == 0);
                     g_aimRoom[0] = room[0];
                     g_aimRoom[1] = room[1];
                     g_aimRoom[2] = room[2];
@@ -726,11 +712,9 @@ static void __fastcall HookRenderAll() {
                     eyePose[15] = 1;
                     if (e == 0) XrTagPose(eyePose + 12);
                     const bool fix = g_lensFix.load();
-                    if (g_cinemaNow) {
-                        // The game's own camera and framing, eyes apart along its right row. The head does not move it.
+                    if (g_vendorNow) {
+                        // The game's own camera and framing, both eyes the same: that screen is close. The head does not move it.
                         memcpy(eyePose, main, sizeof(eyePose));
-                        const float side = g_vendorNow ? 0.0f : (e == 0 ? -0.5f : 0.5f) * g_cinemaIpd.load();
-                        for (int i = 0; i < 3; ++i) eyePose[12 + i] = reinterpret_cast<const float*>(main)[12 + i] + reinterpret_cast<const float*>(main)[i] * side;
                         if (e == 0) XrTagPose(eyePose + 12);
                         // Width as the game has it; height fills the eye image, of which the middle 16 by 9 band is shown.
                         const float* noJitter = reinterpret_cast<const float*>(main + 0x1c0);
@@ -776,6 +760,62 @@ static void __fastcall HookRenderAll() {
         g_origRenderAll();
         g_usOffscreen += PerfNow() - t;
     }
+}
+
+// ---- pass queue: what each view asks the renderer to do. Lab log, and a list of passes an eye leaves out. ----
+using PassQueueFn = int64_t(__fastcall*)(void*, int64_t, int64_t, int64_t);
+static PassQueueFn g_origPassQueue;
+static thread_local int t_submitKind = 0;  // 0 not in a view's submit, 1 main, 2 left eye, 3 right eye
+static std::atomic<int> g_passLogFrames{0};
+static std::atomic<bool> g_eyeDropOverlay{false};
+static std::atomic<size_t> g_overlayBucket{0x1600};
+static std::atomic<uint64_t> g_overlayDropped{0};
+static std::atomic<uint64_t> g_passSkipBits[4];
+// ---- Each model of each view goes through here. ----
+// The HUD is a real model in the world, models/ui/playerhudrtt, placed by the game near its camera. In the game's own view
+// it lands in the UI overlay. In an offscreen view it lands in the picture, 20 units out, with bloom: the doubled HUD.
+// So the eyes leave out every model under models/ui. The context's +8 is the view it works for.
+static std::atomic<bool> g_eyeDropUi{true};
+using ModelQueueFn = void(__fastcall*)(uint8_t*, uint8_t*, char);
+static ModelQueueFn g_origModelQueue;
+static const char kUiModels[] = "models\x5cui\x5c";
+static void __fastcall HookModelQueue(uint8_t* ctx, uint8_t* inst, char flag) {
+    const uint8_t* const view = *reinterpret_cast<uint8_t* const*>(ctx + 8);
+    if ((view == g_eyeA.load() || view == g_eyeB.load()) && g_eyeDropUi.load()) {
+        const uint8_t* const model = *reinterpret_cast<uint8_t* const*>(inst + 0x88);
+        const char* const name = model ? *reinterpret_cast<const char* const*>(model + 0x10) : nullptr;
+        if (name && memcmp(name, kUiModels, sizeof(kUiModels) - 1) == 0) return;
+    }
+    g_origModelQueue(ctx, inst, flag);
+}
+
+static int64_t __fastcall HookPassQueue(void* bucket, int64_t idWide, int64_t a, int64_t b) {
+    const int id = static_cast<int>(idWide);
+    const int kind = t_submitKind;
+    if (g_passLogFrames.load() > 0 && id != 0x62) {
+        uint8_t* e0 = g_eyeA.load();
+        uint8_t* e1 = g_eyeB.load();
+        uint8_t* m = ActiveView();
+        const auto at = reinterpret_cast<uint8_t*>(bucket);
+        const size_t span = 0x17000;
+        const int owner = (m && at >= m && at < m + span) ? 1 : (e0 && at >= e0 && at < e0 + span) ? 2 : (e1 && at >= e1 && at < e1 + span) ? 3 : 0;
+        const size_t off = owner == 1 ? at - m : owner == 2 ? at - e0 : owner == 3 ? at - e1 : 0;
+        Log("PASSQ thread %d owner %d off %zx id %#x from %zx", kind, owner, off, id, static_cast<size_t>(reinterpret_cast<uint8_t*>(_ReturnAddress()) - g_base));
+    }
+    // The UI's models queue into the overlay bucket. The main view renders that bucket into the overlay. Eyes have no overlay
+    // step, so the same models would land in their picture: leave them out.
+    if (g_eyeDropOverlay.load()) {
+        const auto at = reinterpret_cast<uint8_t*>(bucket);
+        uint8_t* e0 = g_eyeA.load();
+        uint8_t* e1 = g_eyeB.load();
+        const size_t off = g_overlayBucket.load();
+        if ((e0 && at == e0 + off) || (e1 && at == e1 + off)) {
+            ++g_overlayDropped;
+            return 0;
+        }
+    }
+    if (kind >= 2 && id >= 0 && id < 256 && (g_passSkipBits[id / 64].load() >> (id % 64) & 1)) return 0;
+    return g_origPassQueue(bucket, idWide, a, b);
 }
 
 // Resting the flat view: the scene submit returns at once when view +0x11d8 is clear. Set again when not resting.
@@ -833,13 +873,23 @@ static void* __fastcall HookSceneSubmit(uint8_t* view, void* a, uint32_t mask, c
         memcpy(saved, view + 0x1740, sizeof(saved));
         memcpy(view + 0x1740, main + 0x1740, sizeof(saved));
         const uint64_t t = PerfNow();
+        t_submitKind = view == g_eyeA.load() ? 2 : 3;
+        // Offscreen views have a negative id, and the engine then draws the UI's models into their picture.
+        int* idField = reinterpret_cast<int*>(view + 0xf90);
+        const int savedId = *idField;
+        if (g_eyeSubmitId.load()) *idField = 0;
         void* r = g_origSceneSubmit(view, a, mask, b);
+        *idField = savedId;
+        t_submitKind = 0;
         g_usEyeSubmit += PerfNow() - t;
         memcpy(view + 0x1740, saved, sizeof(saved));
         return r;
     }
     const uint64_t t = PerfNow();
+    t_submitKind = view == ActiveView() ? 1 : 0;
     void* r = g_origSceneSubmit(view, a, mask, b);
+    t_submitKind = 0;
+    if (view == ActiveView() && g_passLogFrames.load() > 0) g_passLogFrames.fetch_sub(1);
     g_usMainSubmit += PerfNow() - t;
     return r;
 }
@@ -861,6 +911,8 @@ static void InstallHooks() {
     MH_CreateHook(g_base + kViewCreate.rva, reinterpret_cast<void*>(&HookViewCreate), reinterpret_cast<void**>(&g_origViewCreate));
     MH_CreateHook(g_base + kCameraPush.rva, reinterpret_cast<void*>(&HookCameraPush), reinterpret_cast<void**>(&g_origCameraPush));
     MH_CreateHook(g_base + kTone.rva, reinterpret_cast<void*>(&HookTone), reinterpret_cast<void**>(&g_origTone));
+    MH_CreateHook(g_base + 0x1215870, reinterpret_cast<void*>(&HookPassQueue), reinterpret_cast<void**>(&g_origPassQueue));
+    MH_CreateHook(g_base + 0x11212d0, reinterpret_cast<void*>(&HookModelQueue), reinterpret_cast<void**>(&g_origModelQueue));
     MH_CreateHook(g_base + kBufferSize.rva, reinterpret_cast<void*>(&HookBufferSize), reinterpret_cast<void**>(&g_origBufferSize));
     const MH_STATUS st = MH_EnableHook(MH_ALL_HOOKS);
     Log("HOOKS %s", MH_StatusToString(st));
@@ -1128,8 +1180,8 @@ static void MenuRowText(int row, wchar_t (&name)[64], wchar_t (&value)[32]) {
         wcscpy_s(value, g_skipLauncherSetting ? L"On" : L"Off");
         break;
     case 7:
-        wcscpy_s(name, L"Cutscenes on a screen");
-        wcscpy_s(value, g_cinemaOn ? L"On" : L"Off");
+        wcscpy_s(name, L"Vendor screen up close");
+        wcscpy_s(value, g_vendorOn ? L"On" : L"Off");
         break;
     case 8:
         wcscpy_s(name, L"Aim dot");
@@ -1284,8 +1336,8 @@ static void MenuChange(int dir) {
         SaveSetting(L"SkipLauncher", g_skipLauncherSetting ? 1 : 0);
         break;
     case 7:
-        g_cinemaOn = !g_cinemaOn;
-        SaveSetting(L"CutsceneScreen", g_cinemaOn ? 1 : 0);
+        g_vendorOn = !g_vendorOn;
+        SaveSetting(L"VendorScreen", g_vendorOn ? 1 : 0);
         break;
     case 8:
         g_aimDot = (g_aimDot.load() + (dir < 0 ? 2 : 1)) % 3;
@@ -1385,7 +1437,7 @@ static DWORD WINAPI SnapshotThread(void*) {
     if (uint8_t* v = ActiveView()) {
         const float* c = reinterpret_cast<const float*>(v);
         const float* proj = reinterpret_cast<const float*>(v + 0x1c0);
-        sprintf_s(state, "cam %.2f %.2f %.2f fwd %.3f %.3f %.3f lens %.2f cinematic %d paused %d pitch %d", c[12], c[13], c[14], c[8], c[9], c[10], proj[5] != 0 ? 2.0 * atan(1.0 / fabs(proj[5])) * 57.29577951 : 0.0, g_cinemaNow.load() ? 1 : 0, *reinterpret_cast<int*>(g_base + kPausedFlag), g_levelCamera.load());
+        sprintf_s(state, "cam %.2f %.2f %.2f fwd %.3f %.3f %.3f lens %.2f vendor %d paused %d pitch %d", c[12], c[13], c[14], c[8], c[9], c[10], proj[5] != 0 ? 2.0 * atan(1.0 / fabs(proj[5])) * 57.29577951 : 0.0, g_vendorNow.load() ? 1 : 0, *reinterpret_cast<int*>(g_base + kPausedFlag), g_levelCamera.load());
     }
     Log("SNAP %d queued %d: %s %s", n, static_cast<int>(res.size()), queued ? "yes" : "no", state);
     // Written by the capture code as files appear. Each becomes a JPEG, listed in the index the lab reads.
@@ -2058,6 +2110,15 @@ static void RunCommand(const std::string& c) {
     else if (sscanf(c.c_str(), "level %u", &g_w) == 1) g_levelCamera = static_cast<int>(g_w);
     else if (sscanf(c.c_str(), "lensfix %u", &g_w) == 1) g_lensFix = g_w != 0;
     else if (sscanf(c.c_str(), "eyenoui %u", &g_w) == 1) g_eyeNoUi = g_w != 0;
+    else if (sscanf(c.c_str(), "passlog %u", &g_w) == 1) g_passLogFrames = static_cast<int>(g_w);
+    else if (sscanf(c.c_str(), "dropoverlay %u", &g_w) == 1) g_eyeDropOverlay = g_w != 0;
+    else if (sscanf(c.c_str(), "eyenear %f", &g_f) == 1) g_eyeNear = g_f;
+    else if (sscanf(c.c_str(), "eyeid %u", &g_w) == 1) g_eyeSubmitId = g_w != 0;
+    else if (sscanf(c.c_str(), "overlaybucket %x", &g_w) == 1) g_overlayBucket = g_w;
+    else if (sscanf(c.c_str(), "eyeui %u", &g_w) == 1) g_eyeDropUi = g_w != 0;
+    else if (c == "droppedinfo") Log("OVERLAY dropped %llu", static_cast<unsigned long long>(g_overlayDropped.load()));
+    else if (sscanf(c.c_str(), "passskip %x", &g_w) == 1) g_passSkipBits[(g_w & 0xff) / 64].fetch_or(1ull << ((g_w & 0xff) % 64));
+    else if (sscanf(c.c_str(), "passkeep %x", &g_w) == 1) g_passSkipBits[(g_w & 0xff) / 64].fetch_and(~(1ull << ((g_w & 0xff) % 64)));
     else if (sscanf(c.c_str(), "mirror %u", &g_w) == 1) g_mirrorEye = g_w != 0;
     else if (sscanf(c.c_str(), "eyeskip %u", &g_w) == 1) {
         // Lab: stop drawing an eye, to see what it costs. 1 right, 2 both, 0 neither.
@@ -2078,7 +2139,6 @@ static void RunCommand(const std::string& c) {
         XrDumpHudAfter(p.c_str());
     }
     else if (sscanf(c.c_str(), "skipmain %u", &g_w) == 1) g_skipMain = static_cast<int>(g_w);
-    else if (sscanf(c.c_str(), "cinemaipd %f", &g_f) == 1) g_cinemaIpd = g_f;
     else if (sscanf(c.c_str(), "vendortest %u", &g_w) == 1) g_forceVendor = g_w != 0;
     else if (sscanf(c.c_str(), "aimdot %u", &g_w) == 1) g_aimDot = static_cast<int>(g_w);
     else if (c == "aiminfo") {
@@ -2086,7 +2146,6 @@ static void RunCommand(const std::string& c) {
         const float* v = m ? reinterpret_cast<const float*>(m) : nullptr;
         if (v) Log("AIM room %.4f %.4f %.4f camera forward %.4f %.4f %.4f", g_aimRoom[0], g_aimRoom[1], g_aimRoom[2], v[8], v[9], v[10]);
     }
-    else if (sscanf(c.c_str(), "cinema %u", &g_w) == 1) g_cinemaOn = g_w != 0;
     else if (c == "padinfo") {
         Log("PADINFO WGI gamepad reads %u, raw reads %u, blocked %u", g_wgiGamepadCalls.load(), g_wgiRawCalls.load(), g_wgiBlocked.load());
         Log("PADINFO XInput calls: 1_4 %u, 1_3 %u, 9_1_0 %u, 1_4 Ex %u, 1_3 Ex %u", g_xinputCalls[0].load(), g_xinputCalls[1].load(), g_xinputCalls[2].load(), g_xinputCalls[3].load(), g_xinputCalls[4].load());
@@ -2249,7 +2308,7 @@ static DWORD WINAPI ProbeThread(void*) {
     g_iniPath = ini;
     g_skipLauncherSetting = GetPrivateProfileIntW(L"VR", L"SkipLauncher", 1, ini.c_str()) != 0;
     g_dlssPercentSetting = g_eyeDlss ? g_eyeRenderPercent.load() : 0;
-    g_cinemaOn = GetPrivateProfileIntW(L"VR", L"CutsceneScreen", 1, ini.c_str()) != 0;
+    g_vendorOn = GetPrivateProfileIntW(L"VR", L"VendorScreen", 1, ini.c_str()) != 0;
     g_frameGenSetting = GetPrivateProfileIntW(L"VR", L"FrameGen", 0, ini.c_str()) != 0;
     g_aimDot = static_cast<int>(GetPrivateProfileIntW(L"VR", L"AimDot", 1, ini.c_str()));
     g_labProbes = GetPrivateProfileIntW(L"VR", L"LabProbes", 1, ini.c_str()) != 0;
