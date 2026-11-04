@@ -8,6 +8,8 @@
 #include "xr.h"
 #include <d3d12.h>
 #include <wincodec.h>
+#include <psapi.h>
+#include <dxgi1_4.h>
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "ole32.lib")
 #undef small
@@ -24,7 +26,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 81
+#define BUILD_NUMBER 82
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -48,6 +50,49 @@ void Log(const char* fmt, ...) {
     va_end(a);
     fprintf(g_log, "%8.3f %s\n", (GetTickCount64() - g_start) / 1000.0, line);
     fflush(g_log);
+}
+
+// ---- A launch overwrites the mod's log and the game's. Keep the last ones, and list them with the game's crash dumps. ----
+// Runs before the mod's log opens. Windows file calls only, since the loader may still be busy.
+static void KeepLogHistory() {
+    const std::wstring dir = g_dir + L"vrlab_logs\\";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    const std::wstring modLog = g_dir + L"RiftApartVR.log";
+    wchar_t profile[MAX_PATH] = {};
+    GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH);
+    const std::wstring docs = std::wstring(profile) + L"\\Documents\\Ratchet & Clank - Rift Apart\\";
+    const std::wstring gameLog = docs + L"Ratchet & Clank - Rift Apart.log";
+    WIN32_FILE_ATTRIBUTE_DATA a{};
+    if (GetFileAttributesExW(modLog.c_str(), GetFileExInfoStandard, &a)) {
+        SYSTEMTIME t{};
+        FileTimeToSystemTime(&a.ftLastWriteTime, &t);
+        wchar_t stamp[32];
+        swprintf_s(stamp, L"%04u%02u%02u-%02u%02u%02u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+        MoveFileExW(modLog.c_str(), (dir + L"mod-" + stamp + L".log").c_str(), MOVEFILE_REPLACE_EXISTING);
+        CopyFileW(gameLog.c_str(), (dir + L"game-" + stamp + L".log").c_str(), FALSE);
+    }
+    // Names sort by time. Keep the newest 40 logs, 20 launches.
+    std::vector<std::wstring> logs;
+    WIN32_FIND_DATAW f{};
+    HANDLE h = FindFirstFileW((dir + L"*.log").c_str(), &f);
+    if (h != INVALID_HANDLE_VALUE) {
+        do logs.push_back(f.cFileName);
+        while (FindNextFileW(h, &f));
+        FindClose(h);
+    }
+    std::sort(logs.begin(), logs.end(), [](const std::wstring& x, const std::wstring& y) { return x.substr(x.find(L'-')) > y.substr(y.find(L'-')); });
+    for (size_t i = 40; i < logs.size(); ++i) DeleteFileW((dir + logs[i]).c_str());
+    if (logs.size() > 40) logs.resize(40);
+    FILE* index = nullptr;
+    if (_wfopen_s(&index, (dir + L"index.txt").c_str(), L"w") != 0 || !index) return;
+    for (const std::wstring& l : logs) fwprintf(index, L"log %ls\n", l.c_str());
+    h = FindFirstFileW((docs + L"*.mdmp").c_str(), &f);
+    if (h != INVALID_HANDLE_VALUE) {
+        do fwprintf(index, L"dump %ls\n", f.cFileName);
+        while (FindNextFileW(h, &f));
+        FindClose(h);
+    }
+    fclose(index);
 }
 
 // Reads a block of game memory, surviving an address that has gone away.
@@ -511,6 +556,34 @@ static void UpdateMode() {
 }
 
 static void CreateEyeNow() { CreateEyeImpl(); }
+
+// ---- What fills memory: the whole system's commit, this process, and the card. Goes with the PERF lines. ----
+static void LogMemory() {
+    MEMORYSTATUSEX m{};
+    m.dwLength = sizeof(m);
+    GlobalMemoryStatusEx(&m);
+    PROCESS_MEMORY_COUNTERS_EX pc{};
+    pc.cb = sizeof(pc);
+    K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pc), sizeof(pc));
+    static IDXGIAdapter3* adapter = nullptr;
+    static bool tried = false;
+    if (!tried && CaptureDevice()) {
+        tried = true;
+        const HMODULE d = LoadLibraryW(L"dxgi.dll");
+        using CreateFn = HRESULT(WINAPI*)(REFIID, void**);
+        const auto create = d ? reinterpret_cast<CreateFn>(GetProcAddress(d, "CreateDXGIFactory1")) : nullptr;
+        IDXGIFactory4* factory = nullptr;
+        if (create && SUCCEEDED(create(IID_PPV_ARGS(&factory))) && factory) {
+            const LUID luid = static_cast<ID3D12Device*>(CaptureDevice())->GetAdapterLuid();
+            factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter));
+            factory->Release();
+        }
+    }
+    DXGI_QUERY_VIDEO_MEMORY_INFO local{};
+    if (adapter) adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local);
+    const auto mb = [](uint64_t b) { return static_cast<unsigned long long>(b / (1024 * 1024)); };
+    Log("MEM system commit %llu of %llu MB, RAM free %llu of %llu MB; game private %llu, working set %llu MB; card %llu of %llu MB", mb(m.ullTotalPageFile - m.ullAvailPageFile), mb(m.ullTotalPageFile), mb(m.ullAvailPhys), mb(m.ullTotalPhys), mb(pc.PrivateUsage), mb(pc.WorkingSetSize), mb(local.CurrentUsage), mb(local.Budget));
+}
 
 // ---- timing probe, game thread, reset every report ----
 static uint64_t PerfNow() {
@@ -2681,6 +2754,7 @@ static DWORD WINAPI ProbeThread(void*) {
                         const double spanMs = spanCount && g_dlssFreq ? static_cast<double>(spanTicks) / static_cast<double>(spanCount) * 1000.0 / static_cast<double>(g_dlssFreq) : 0;
                         Log("PERF GPU ms: DLSS game's view %.2f, left %.2f, right %.2f; right eye whole %.2f; mod's copies %.2f; between frame ends %.2f", ms[0], ms[1], ms[2], spanMs, copyMs, betweenMs);
                     }
+                    LogMemory();
                     Log("PERF frames %llu, ms per frame: whole %.2f, pacing wait %.2f, all offscreen %.2f, eye submits %.2f, main submit %.2f", static_cast<unsigned long long>(n), g_usFrame.exchange(0) / f, g_usPace.exchange(0) / f, g_usOffscreen.exchange(0) / f, g_usEyeSubmit.exchange(0) / f, g_usMainSubmit.exchange(0) / f);
                 }
             }
@@ -2715,6 +2789,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD why, LPVOID) {
     GetModuleFileNameW(inst, path, MAX_PATH);
     g_dir = path;
     g_dir.resize(g_dir.find_last_of(L'\\') + 1);
+    KeepLogHistory();
     g_log = _wfopen((g_dir + L"RiftApartVR.log").c_str(), L"w");
     g_base = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
     SYSTEMTIME st;
