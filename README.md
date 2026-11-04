@@ -19,7 +19,7 @@ If it cannot find the game, or to remove the mod, run the bat file from a comman
 
 ## Playing
 
-The launcher window is skipped. Splash and menus show on a flat screen in front of you. The world is a solid 3D place around you. Cutscenes play in the same 3D world.
+The launcher window is skipped. Splash and menus show on a flat screen in front of you. The world is a solid 3D place around you. Cutscenes play in the same 3D world, apart from very zoomed in shots.
 
 Click and hold both thumbsticks for half a second to open the VR menu. The game ignores the pad while the menu is open (Xbox style pads, tested).
 
@@ -31,6 +31,7 @@ Click and hold both thumbsticks for half a second to open the VR menu. The game 
 | HUD distance | How far away the HUD panel sits |
 | Resolution | Percent of what your headset asks for. Next launch |
 | Skip the launcher window | Next launch |
+| Cutscenes on a screen | Zoomed shots: very zoomed in cutscene shots show on a screen, the rest in 3D. Needed for a GPU hang at one scripted ride. All cutscenes, or Never, where that ride can hang |
 | Vendor screen up close | Shop screens fill your view when the game zooms onto one. Off leaves them in the world |
 | Aim dot | Shows where you aim, as a ring in the world |
 | Frame generation | Off, 2X or 3X. Off by default. Uses OFXR-BRIDGE from the `ofxr` folder, which loads at launch once a mode is chosen, then changes apply at once, including Off. Close the OFXR tray program first |

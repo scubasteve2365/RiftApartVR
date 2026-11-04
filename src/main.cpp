@@ -26,7 +26,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 87
+#define BUILD_NUMBER 88
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -466,8 +466,10 @@ static void CreateEyeNow();
 // A vendor: the game zooms onto the vendor's screen and holds. Lens 10.87 in Steve's log. A boss fight's zoom also went to
 // 9 to 10, but moving, so it takes a very narrow lens and a held camera. Off in the menu means never.
 static std::atomic<bool> g_vendorOn{true};
-// Steve's GPU hang on his second save. Next launch: 0 off, 1 the old cutscene camera, 2 game's view every frame, 3 keep UI models.
-static std::atomic<int> g_hangTest{0};
+// Steve's GPU hang: a scripted ride opens with the game zoomed in, lens 10 to 20, and at the full headset view his RTX 5090 hangs on
+// a draw, on two drivers. On the game's own camera it rides through. So zoomed cutscene shots use that camera on the room's screen.
+// 0 zoomed shots, 1 all cutscenes, 2 never. Cause of the hang not known.
+static std::atomic<int> g_cutsceneCamera{0};
 static const size_t kCinematicTracks = 0x61d19d4;
 static std::atomic<bool> g_vendorNow{false}, g_forceVendor{false};
 // 0 off, 1 while aiming, 2 always.
@@ -505,15 +507,20 @@ static void UpdateMode() {
         }
         static bool vendor = false;
         static int cineOn = 0, cineOff = 0;
-        if (g_hangTest.load() == 1 && *reinterpret_cast<int*>(g_base + kCinematicTracks) > 0) {
+        static bool cine = false;
+        const int cutsceneRule = g_cutsceneCamera.load();
+        const bool inCutscene = *reinterpret_cast<int*>(g_base + kCinematicTracks) > 0;
+        // Zoomed: starts under lens 25, holds until 30, so a shot does not flip back and forth.
+        const bool wanted = inCutscene && (cutsceneRule == 1 || (cutsceneRule == 0 && vfov > 0 && vfov < (cine ? 30.0 : 25.0)));
+        if (wanted) {
             ++cineOn;
             cineOff = 0;
         } else {
             ++cineOff;
             cineOn = 0;
         }
-        static bool cine = false;
-        if (cineOn >= 3) cine = true;
+        // On at once: the hang can come within seconds of the zoom.
+        if (cineOn >= 1) cine = true;
         if (cineOff >= 15) cine = false;
         if (g_forceVendor.load() || zoomHeld >= 8 || cine) {
             vendor = true;
@@ -1452,9 +1459,9 @@ static void MenuRowText(int row, wchar_t (&name)[64], wchar_t (&value)[64]) {
         wcscpy_s(value, g_fgDirector ? L"Director" : L"Framework");
         break;
     case 15: {
-        static const wchar_t* const tests[4] = {L"Off", L"Old cutscene camera", L"Game's view every frame", L"Keep UI models"};
-        wcscpy_s(name, L"Hang test (next launch)");
-        wcscpy_s(value, tests[g_hangTest.load() & 3]);
+        static const wchar_t* const rules[3] = {L"Zoomed shots", L"All cutscenes", L"Never (can hang)"};
+        wcscpy_s(name, L"Cutscenes on a screen");
+        wcscpy_s(value, rules[g_cutsceneCamera.load() % 3]);
         break;
     }
     case 14:
@@ -1642,8 +1649,8 @@ static void MenuChange(int dir) {
         break;
     }
     case 15:
-        g_hangTest = (g_hangTest.load() + (dir < 0 ? 3 : 1)) % 4;
-        SaveSetting(L"HangTest", g_hangTest.load());
+        g_cutsceneCamera = (g_cutsceneCamera.load() + (dir < 0 ? 2 : 1)) % 3;
+        SaveSetting(L"CutsceneCamera", g_cutsceneCamera.load());
         break;
     default:
         if (dir == 0) {
@@ -2726,10 +2733,7 @@ static DWORD WINAPI ProbeThread(void*) {
         g_skipLauncher = GetPrivateProfileIntW(L"VR", L"SkipLauncher", 1, early.c_str()) != 0;
         g_smallFlat = GetPrivateProfileIntW(L"VR", L"SmallFlatView", 1, early.c_str()) != 0;
         g_skipMain = static_cast<int>(GetPrivateProfileIntW(L"VR", L"HudEveryFrames", 4, early.c_str()));
-        g_hangTest = static_cast<int>(GetPrivateProfileIntW(L"VR", L"HangTest", 0, early.c_str())) & 3;
-        if (g_hangTest.load() == 2) g_skipMain = 0;
-        if (g_hangTest.load() == 3) g_eyeDropUi = false;
-        Log("HANGTEST %d", g_hangTest.load());
+        g_cutsceneCamera = static_cast<int>(GetPrivateProfileIntW(L"VR", L"CutsceneCamera", 0, early.c_str())) % 3;
         if (GetPrivateProfileIntW(L"VR", L"DeviceDiagnostics", 1, early.c_str()) != 0) {
             DredEnable();
             CreateThread(nullptr, 0, DredWatch, nullptr, 0, nullptr);
