@@ -79,13 +79,26 @@ bool XrInit(const wchar_t* dir) {
         const std::wstring ini = std::wstring(dir) + L"RiftApartVR.ini";
         const std::wstring folder = std::wstring(dir) + L"ofxr";
         const std::wstring manifest = folder + L"\\XR_APILAYER_OFXRBridge.json";
-        if (GetPrivateProfileIntW(L"VR", L"FrameGen", 0, ini.c_str()) != 0) {
+        const int fgMode = static_cast<int>(GetPrivateProfileIntW(L"VR", L"FrameGen", 0, ini.c_str()));
+        if (fgMode != 0) {
             if (GetFileAttributesW(manifest.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                // The menu's choices, as OFXR reads them at its start. pacing_mode 0: its director hangs at this game's title on
+                // RigB. lower_vram 1: the HUD layer keeps its real image, with no optical flow run over it.
+                const int preset = static_cast<int>(GetPrivateProfileIntW(L"VR", L"FrameGenQuality", 1, ini.c_str()));
+                const int scale = static_cast<int>(GetPrivateProfileIntW(L"VR", L"FrameGenDetail", 2, ini.c_str()));
+                const int diagnostics = static_cast<int>(GetPrivateProfileIntW(L"VR", L"FrameGenLog", 0, ini.c_str()));
+                char profile[400];
+                sprintf_s(profile, "[ofxr]\r\nenabled=1\r\nframe_generation=0\r\nbackend=%d\r\nmotion_vectors=0\r\noverlay_position=0\r\nlower_vram=1\r\npacing_mode=0\r\npreset=%d\r\nscale=%d\r\ntriple_frame_gen=%d\r\ndiagnostics=%d\r\n", fgMode == 2 ? 3 : 2, preset, scale, fgMode == 2 ? 1 : 0, diagnostics);
+                const std::wstring profilePath = folder + L"\\settings\\Profiles\\RiftApart.exe.ini";
+                if (FILE* f = _wfopen(profilePath.c_str(), L"wb")) {
+                    fputs(profile, f);
+                    fclose(f);
+                }
                 SetEnvironmentVariableW(L"XR_API_LAYER_PATH", folder.c_str());
                 SetEnvironmentVariableW(L"XR_ENABLE_API_LAYERS", L"XR_APILAYER_OFXRBridge");
                 // Its settings stay in its own folder, apart from a tray install's.
                 SetEnvironmentVariableW(L"OFXR_BRIDGE_PROFILE_DIR", (folder + L"\\settings").c_str());
-                Log("XR frame generation on, layer in the ofxr folder");
+                Log("XR frame generation on, mode %d, layer in the ofxr folder", fgMode);
             } else {
                 Log("XR frame generation chosen, but the ofxr folder has no layer: running without it");
             }

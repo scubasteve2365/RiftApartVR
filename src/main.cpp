@@ -24,7 +24,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 69
+#define BUILD_NUMBER 70
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -1072,12 +1072,67 @@ static std::atomic<bool> g_menuOpen{false};
 static int g_menuRow = 0;
 static int g_resolutionSetting = 100;
 static bool g_skipLauncherSetting = true;
-static bool g_frameGenSetting = false;
+// ---- OFXR frame generation. A separate program in the ofxr folder, loaded at launch if chosen. Once loaded it takes changes
+// live through the control functions it exports for other modules in the process, and its INI beside the DLL for 3X. ----
+static int g_fgMode = 0;      // 0 off, 1 2X, 2 3X
+static int g_fgPreset = 1;    // OFXR's numbers: 0 slow, 1 medium, 2 fast
+static int g_fgScale = 2;     // OFXR's numbers: 0 full, 1 three quarters, 2 half, 3 quarter
+struct OfxrSettingsV2 {
+    uint32_t structSize;
+    int32_t enabled, backend, preset, scale, backward, motionVectors, frameGeneration;
+};
+struct OfxrSnapshotV2 {
+    uint32_t structSize, apiVersion;
+    OfxrSettingsV2 desired;
+    uint64_t revision;
+    uint32_t sessions, pending, bypass, ready, errors;
+    int32_t lastError;
+    uint32_t providers;
+};
+static HMODULE OfxrModule() { return GetModuleHandleW(L"XR_APILAYER_XRFrameBridge_diagnostic.dll"); }
+static bool OfxrSnapshot(OfxrSnapshotV2* out) {
+    const HMODULE m = OfxrModule();
+    const auto get = m ? reinterpret_cast<int(*)(OfxrSnapshotV2*)>(GetProcAddress(m, "OFXR_GetControlSnapshotV2")) : nullptr;
+    if (!get) return false;
+    *out = {};
+    out->structSize = sizeof(OfxrSnapshotV2);
+    out->apiVersion = 2;
+    out->desired.structSize = sizeof(OfxrSettingsV2);
+    return get(out) != 0;
+}
+static void OfxrLogState(const char* when) {
+    OfxrSnapshotV2 v;
+    if (!OfxrSnapshot(&v)) {
+        Log("FRAMEGEN %s: not loaded", when);
+        return;
+    }
+    Log("FRAMEGEN %s: enabled %d backend %d preset %d scale %d, revision %llu sessions %u pending %u bypass %u ready %u errors %u last error %d", when, v.desired.enabled, v.desired.backend, v.desired.preset, v.desired.scale, static_cast<unsigned long long>(v.revision), v.sessions, v.pending, v.bypass, v.ready, v.errors, v.lastError);
+}
+// Live when OFXR is loaded. 3X only exists on its 0.2.14 route, backend 3, so the mode picks the route too.
+static void OfxrApply() {
+    const HMODULE m = OfxrModule();
+    const auto request = m ? reinterpret_cast<int(*)(const OfxrSettingsV2*)>(GetProcAddress(m, "OFXR_RequestControlV2")) : nullptr;
+    if (!request) {
+        Log("FRAMEGEN mode %d saved for next launch: OFXR is not loaded", g_fgMode);
+        return;
+    }
+    const std::wstring ini = g_dir + L"ofxr\\ofxr_bridge.ini";
+    WritePrivateProfileStringW(L"ofxr", L"deep_pipeline", L"1", ini.c_str());
+    WritePrivateProfileStringW(L"ofxr", L"triple_frame_gen", g_fgMode == 2 ? L"1" : L"0", ini.c_str());
+    OfxrSettingsV2 c{};
+    c.structSize = sizeof(c);
+    c.enabled = g_fgMode != 0;
+    c.backend = g_fgMode == 2 ? 3 : 2;
+    c.preset = g_fgPreset;
+    c.scale = g_fgScale;
+    const int ok = request(&c);
+    Log("FRAMEGEN asked mode %d preset %d scale %d, accepted %d", g_fgMode, g_fgPreset, g_fgScale, ok);
+}
 static int g_dlssPercentSetting = -1;  // -1 the game's choice, 0 no DLSS in the eyes, otherwise a fixed size
 static float g_hudDistanceSetting = 2.0f;
 static std::wstring g_iniPath;
 static std::vector<uint32_t> g_menuImage;
-static const int kMenuW = 1024, kMenuH = 1056, kMenuRows = 12;
+static const int kMenuW = 1024, kMenuH = 1200, kMenuRows = 14;
 
 static void SaveSetting(const wchar_t* name, int value) {
     WritePrivateProfileStringW(L"VR", name, std::to_wstring(value).c_str(), g_iniPath.c_str());
@@ -1125,8 +1180,20 @@ static void MenuRowText(int row, wchar_t (&name)[64], wchar_t (&value)[32]) {
         wcscpy_s(name, L"Snapshot in 2 seconds");
         break;
     case 10:
-        wcscpy_s(name, L"Frame generation (next launch)");
-        wcscpy_s(value, g_frameGenSetting ? L"On" : L"Off");
+    {
+        wcscpy_s(name, L"Frame generation");
+        OfxrSnapshotV2 v;
+        const bool loaded = OfxrSnapshot(&v);
+        swprintf_s(value, L"%ls%ls", g_fgMode == 0 ? L"Off" : g_fgMode == 1 ? L"2X" : L"3X", !loaded && g_fgMode != 0 ? L" next launch" : loaded && v.errors ? L" failed" : L"");
+        break;
+    }
+    case 11:
+        wcscpy_s(name, L"Frame generation quality");
+        wcscpy_s(value, g_fgPreset == 2 ? L"Fast" : g_fgPreset == 1 ? L"Medium" : L"Slow");
+        break;
+    case 12:
+        wcscpy_s(name, L"Frame generation detail");
+        wcscpy_s(value, g_fgScale == 0 ? L"100%" : g_fgScale == 1 ? L"75%" : g_fgScale == 2 ? L"50%" : L"25%");
         break;
     default: wcscpy_s(name, L"Close"); break;
     }
@@ -1285,8 +1352,19 @@ static void MenuChange(int dir) {
         }
         break;
     case 10:
-        g_frameGenSetting = !g_frameGenSetting;
-        SaveSetting(L"FrameGen", g_frameGenSetting ? 1 : 0);
+        g_fgMode = (g_fgMode + (dir < 0 ? 2 : 1)) % 3;
+        SaveSetting(L"FrameGen", g_fgMode);
+        OfxrApply();
+        break;
+    case 11:
+        g_fgPreset = (g_fgPreset + (dir < 0 ? 1 : 2)) % 3;
+        SaveSetting(L"FrameGenQuality", g_fgPreset);
+        if (g_fgMode) OfxrApply();
+        break;
+    case 12:
+        g_fgScale = (g_fgScale + (dir < 0 ? 1 : 3)) % 4;
+        SaveSetting(L"FrameGenDetail", g_fgScale);
+        if (g_fgMode) OfxrApply();
         break;
     default:
         if (dir == 0) {
@@ -1596,7 +1674,7 @@ static void PollPad() {
         } else if (i == kLeft || i == kRight) {
             MenuChange(i == kLeft ? -1 : 1);
         } else if (i == kA) {
-            if (g_menuRow == 0 || g_menuRow == 2 || g_menuRow == 6 || g_menuRow == 7 || g_menuRow == 8 || g_menuRow == 9 || g_menuRow == 10 || g_menuRow == kMenuRows - 1) MenuChange(0);
+            if (g_menuRow == 0 || g_menuRow == 2 || g_menuRow == 6 || g_menuRow == 7 || g_menuRow == 8 || g_menuRow == 9 || g_menuRow == 10 || g_menuRow == 11 || g_menuRow == 12 || g_menuRow == kMenuRows - 1) MenuChange(0);
         } else {
             MenuClose();
         }
@@ -2053,6 +2131,13 @@ static void RunCommand(const std::string& c) {
     else if (sscanf(c.c_str(), "lensfix %u", &g_w) == 1) g_lensFix = g_w != 0;
     else if (sscanf(c.c_str(), "eyenoui %u", &g_w) == 1) g_eyeNoUi = g_w != 0;
     else if (sscanf(c.c_str(), "eyeui %u", &g_w) == 1) g_eyeDropUi = g_w != 0;
+    else if (sscanf(c.c_str(), "fg %u %u %u", &g_w, &g_h, &g_k) == 3) {
+        g_fgMode = static_cast<int>(g_w) % 3;
+        g_fgPreset = static_cast<int>(g_h) % 3;
+        g_fgScale = static_cast<int>(g_k) % 4;
+        OfxrApply();
+    }
+    else if (c == "fgstate") OfxrLogState("now");
     else if (sscanf(c.c_str(), "mirror %u", &g_w) == 1) g_mirrorEye = g_w != 0;
     else if (sscanf(c.c_str(), "eyeskip %u", &g_w) == 1) {
         // Lab: stop drawing an eye, to see what it costs. 1 right, 2 both, 0 neither.
@@ -2243,7 +2328,9 @@ static DWORD WINAPI ProbeThread(void*) {
     g_skipLauncherSetting = GetPrivateProfileIntW(L"VR", L"SkipLauncher", 1, ini.c_str()) != 0;
     g_dlssPercentSetting = g_eyeDlss ? g_eyeRenderPercent.load() : 0;
     g_vendorOn = GetPrivateProfileIntW(L"VR", L"VendorScreen", 1, ini.c_str()) != 0;
-    g_frameGenSetting = GetPrivateProfileIntW(L"VR", L"FrameGen", 0, ini.c_str()) != 0;
+    g_fgMode = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"VR", L"FrameGen", 0, ini.c_str())), 0, 2);
+    g_fgPreset = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"VR", L"FrameGenQuality", 1, ini.c_str())), 0, 2);
+    g_fgScale = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"VR", L"FrameGenDetail", 2, ini.c_str())), 0, 3);
     g_aimDot = static_cast<int>(GetPrivateProfileIntW(L"VR", L"AimDot", 1, ini.c_str()));
     g_labProbes = GetPrivateProfileIntW(L"VR", L"LabProbes", 1, ini.c_str()) != 0;
     g_skipLauncher = g_skipLauncherSetting;
