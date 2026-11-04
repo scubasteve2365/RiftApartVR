@@ -26,7 +26,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 86
+#define BUILD_NUMBER 87
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -466,6 +466,9 @@ static void CreateEyeNow();
 // A vendor: the game zooms onto the vendor's screen and holds. Lens 10.87 in Steve's log. A boss fight's zoom also went to
 // 9 to 10, but moving, so it takes a very narrow lens and a held camera. Off in the menu means never.
 static std::atomic<bool> g_vendorOn{true};
+// Steve's GPU hang on his second save. Next launch: 0 off, 1 the old cutscene camera, 2 game's view every frame, 3 keep UI models.
+static std::atomic<int> g_hangTest{0};
+static const size_t kCinematicTracks = 0x61d19d4;
 static std::atomic<bool> g_vendorNow{false}, g_forceVendor{false};
 // 0 off, 1 while aiming, 2 always.
 static std::atomic<int> g_aimDot{1};
@@ -501,7 +504,18 @@ static void UpdateMode() {
             if (++zoomLog % 30 == 1) Log("VENDOR zoom lens %.2f moved %.5f held %d", vfov, moved, zoomHeld);
         }
         static bool vendor = false;
-        if (g_forceVendor.load() || zoomHeld >= 8) {
+        static int cineOn = 0, cineOff = 0;
+        if (g_hangTest.load() == 1 && *reinterpret_cast<int*>(g_base + kCinematicTracks) > 0) {
+            ++cineOn;
+            cineOff = 0;
+        } else {
+            ++cineOff;
+            cineOn = 0;
+        }
+        static bool cine = false;
+        if (cineOn >= 3) cine = true;
+        if (cineOff >= 15) cine = false;
+        if (g_forceVendor.load() || zoomHeld >= 8 || cine) {
             vendor = true;
             vendorOff = 0;
         } else if (!zoomed) {
@@ -1367,7 +1381,7 @@ static void OfxrApply() {
 static float g_hudDistanceSetting = 2.0f;
 static std::wstring g_iniPath;
 static std::vector<uint32_t> g_menuImage;
-static const int kMenuW = 1024, kMenuH = 1344, kMenuRows = 16;
+static const int kMenuW = 1024, kMenuH = 1416, kMenuRows = 17;
 
 static void SaveSetting(const wchar_t* name, int value) {
     WritePrivateProfileStringW(L"VR", name, std::to_wstring(value).c_str(), g_iniPath.c_str());
@@ -1437,6 +1451,12 @@ static void MenuRowText(int row, wchar_t (&name)[64], wchar_t (&value)[64]) {
         wcscpy_s(name, L"Frame generation pacing");
         wcscpy_s(value, g_fgDirector ? L"Director" : L"Framework");
         break;
+    case 15: {
+        static const wchar_t* const tests[4] = {L"Off", L"Old cutscene camera", L"Game's view every frame", L"Keep UI models"};
+        wcscpy_s(name, L"Hang test (next launch)");
+        wcscpy_s(value, tests[g_hangTest.load() & 3]);
+        break;
+    }
     case 14:
         wcscpy_s(name, L"Stereo");
         wcscpy_s(value, !g_alternateSetting ? L"Native" : g_rebuildSetting ? L"Alternate, depth rebuild" : L"Alternate, plain");
@@ -1621,6 +1641,10 @@ static void MenuChange(int dir) {
         XrRebuildSetMode(next == 1 ? 1 : 0);
         break;
     }
+    case 15:
+        g_hangTest = (g_hangTest.load() + (dir < 0 ? 3 : 1)) % 4;
+        SaveSetting(L"HangTest", g_hangTest.load());
+        break;
     default:
         if (dir == 0) {
             MenuClose();
@@ -2702,6 +2726,10 @@ static DWORD WINAPI ProbeThread(void*) {
         g_skipLauncher = GetPrivateProfileIntW(L"VR", L"SkipLauncher", 1, early.c_str()) != 0;
         g_smallFlat = GetPrivateProfileIntW(L"VR", L"SmallFlatView", 1, early.c_str()) != 0;
         g_skipMain = static_cast<int>(GetPrivateProfileIntW(L"VR", L"HudEveryFrames", 4, early.c_str()));
+        g_hangTest = static_cast<int>(GetPrivateProfileIntW(L"VR", L"HangTest", 0, early.c_str())) & 3;
+        if (g_hangTest.load() == 2) g_skipMain = 0;
+        if (g_hangTest.load() == 3) g_eyeDropUi = false;
+        Log("HANGTEST %d", g_hangTest.load());
         if (GetPrivateProfileIntW(L"VR", L"DeviceDiagnostics", 1, early.c_str()) != 0) {
             DredEnable();
             CreateThread(nullptr, 0, DredWatch, nullptr, 0, nullptr);
