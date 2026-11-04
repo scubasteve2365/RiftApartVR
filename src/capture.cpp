@@ -120,7 +120,9 @@ static void RunJob(DumpJob* job) {
         bar.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         bar.Transition.StateBefore = static_cast<D3D12_RESOURCE_STATES>(job->states[i]);
         bar.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        list->ResourceBarrier(1, &bar);
+        // A barrier from a state to itself removes the device.
+        const bool needBarrier = bar.Transition.StateBefore != bar.Transition.StateAfter;
+        if (needBarrier) list->ResourceBarrier(1, &bar);
         D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
         dst.pResource = b;
         dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
@@ -130,7 +132,7 @@ static void RunJob(DumpJob* job) {
         src.SubresourceIndex = 0;
         list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         std::swap(bar.Transition.StateBefore, bar.Transition.StateAfter);
-        list->ResourceBarrier(1, &bar);
+        if (needBarrier) list->ResourceBarrier(1, &bar);
     }
     list->Close();
     ID3D12CommandList* lists[] = {list};

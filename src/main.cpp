@@ -24,7 +24,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 76
+#define BUILD_NUMBER 81
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -233,10 +233,11 @@ static std::atomic<bool> g_eyeNoUi{true};
 // The overlay is cleared every frame and drawn only in the game's own view's work. Set when that view reaches the tone map.
 static std::atomic<bool> g_overlayFresh{false};
 static std::atomic<int> g_wantHudShot{0};
+static std::string g_rbShotName;
 static const size_t kOverlayResource = 0x67334c0 + 0x230 + 0x98, kNeutralResource = 0x678e710;
 static std::atomic<uint8_t*> g_eyeA{nullptr}, g_eyeB{nullptr};
 // Alternate eye, a menu option on top of native stereo: one eye drawn per tick. Off on the vendor screen and flat screens.
-static std::atomic<bool> g_alternateSetting{false}, g_alternateNow{false};
+static std::atomic<bool> g_alternateSetting{false}, g_alternateNow{false}, g_rebuildSetting{false};
 static void* __fastcall HookTone(void* a, void* b, void* c, uint8_t* view, void* e, uint64_t generic) {
     if (g_toneFix && view) {
         uint8_t* owner = *reinterpret_cast<uint8_t**>(view + 0x1ff8);
@@ -689,7 +690,6 @@ static void __fastcall HookRenderAll() {
                 const float scale = g_worldScale.load();
                 alignas(16) static uint8_t desc[0x600];
                 for (int e = 0; e < 2; ++e) {
-                    if (alternate && e != freshEye) continue;
                     const XrEyePose& p = eye[e];
                     // Head axes in LOCAL space from the quaternion.
                     const float x = p.qx, y = p.qy, z = p.qz, w = p.qw;
@@ -716,6 +716,8 @@ static void __fastcall HookRenderAll() {
                         eyePose[12 + i] = cam[12 + i] + offset[i] * scale;
                     }
                     eyePose[15] = 1;
+                    XrTagEyeCamera(e, right, up, back, eyePose + 12, p.tanLeft, p.tanRight, p.tanUp, p.tanDown, nearZ);
+                    if (alternate && e != freshEye) continue;
                     XrTagPose(e, eyePose + 12);
                     const bool fix = g_lensFix.load();
                     if (g_vendorNow) {
@@ -1082,6 +1084,19 @@ static void OnPresentForXr(void* backBuffer, unsigned bbW, unsigned bbH, int bbF
     }
     XrSetMirror(g_mirrorEye.load() ? backBuffer : nullptr);
     XrOnPresent(res, st, ui, g_uiCount.load());
+    if (!g_rbShotName.empty() && XrRebuildResult() && res[0] && res[1]) {
+        // Lab: the real eyes and the rebuilt one from the same frame, to compare.
+        static std::wstring paths[3];
+        const std::wstring base(g_rbShotName.begin(), g_rbShotName.end());
+        paths[0] = g_dir + L"vrlab_shots\\" + base + L"_L.bmp";
+        paths[1] = g_dir + L"vrlab_shots\\" + base + L"_R.bmp";
+        paths[2] = g_dir + L"vrlab_shots\\" + base + L"_B.bmp";
+        void* r[3] = {res[0], res[1], XrRebuildResult()};
+        uint32_t s3[3] = {st[0], st[1], D3D12_RESOURCE_STATE_COPY_SOURCE};
+        const wchar_t* pp[3] = {paths[0].c_str(), paths[1].c_str(), paths[2].c_str()};
+        Log("REBUILD shot: %s", CaptureRequest(r, s3, pp, 3) ? "queued" : "not ready");
+        g_rbShotName.clear();
+    }
 }
 
 static bool g_xrStarted = false;
@@ -1289,7 +1304,7 @@ static void MenuRowText(int row, wchar_t (&name)[64], wchar_t (&value)[64]) {
         break;
     case 15:
         wcscpy_s(name, L"Stereo");
-        wcscpy_s(value, g_alternateSetting ? L"Alternate eye (no frame gen)" : L"Native");
+        wcscpy_s(value, !g_alternateSetting ? L"Native" : g_rebuildSetting ? L"Alternate, depth rebuild" : L"Alternate, plain");
         break;
     default: wcscpy_s(name, L"Close"); break;
     }
@@ -1473,9 +1488,16 @@ static void MenuChange(int dir) {
         OfxrPacingUpdate();
         break;
     case 15:
-        g_alternateSetting = !g_alternateSetting;
-        SaveSetting(L"AlternateEye", g_alternateSetting ? 1 : 0);
+    {
+        // Native, then alternate with the rebuild, then plain alternate.
+        const int now = !g_alternateSetting ? 0 : g_rebuildSetting ? 1 : 2;
+        const int next = (now + (dir < 0 ? 2 : 1)) % 3;
+        g_alternateSetting = next != 0;
+        g_rebuildSetting = next == 1;
+        SaveSetting(L"AlternateEye", next == 0 ? 0 : next == 1 ? 2 : 1);
+        XrRebuildSetMode(next == 1 ? 1 : 0);
         break;
+    }
     default:
         if (dir == 0) {
             MenuClose();
@@ -1890,9 +1912,46 @@ static void DlssTimerEnd(ID3D12GraphicsCommandList* list, UINT index) {
     list->EndQuery(g_dlssHeap, D3D12_QUERY_TYPE_TIMESTAMP, index + 1);
     list->ResolveQueryData(g_dlssHeap, D3D12_QUERY_TYPE_TIMESTAMP, index, 2, g_dlssRead, static_cast<UINT64>(index) * 8);
 }
+// ---- Streamline's resource tags: where each eye's depth and motion vectors are. Layout from sl_core_types.h. ----
+struct SlBase {
+    void* next;
+    uint8_t type[16];
+    size_t version;
+};
+struct SlResource : SlBase {
+    uint32_t kind;
+    void* native;
+    void* memory;
+    void* view;
+    uint32_t state, width, height, nativeFormat;
+};
+struct SlExtent {
+    uint32_t top, left, width, height;
+};
+struct SlTag : SlBase {
+    SlResource* resource;
+    uint32_t bufferType;
+    uint32_t lifecycle;
+    SlExtent extent;
+};
+static std::atomic<int> g_slEvalLogLeft{0};
 static int __cdecl HookSlEvaluate(uint32_t feature, const void* frame, const void** inputs, uint32_t n, void* cmd) {
     ++g_slCount[0];
     const int vp = g_slViewport.load();
+    if (g_slEvalLogLeft.load() > 0 && g_slEvalLogLeft.fetch_sub(1) > 0) {
+        for (uint32_t i = 0; i < n; ++i) {
+            const SlBase* b = static_cast<const SlBase*>(inputs[i]);
+            uint32_t g = 0;
+            memcpy(&g, b->type, 4);
+            Log("SLEVAL viewport %d feature %u input %u/%u guid %08x version %zu", vp, feature, i, n, g, b->version);
+            if (g == 0x4c6a5aad) {
+                const SlTag* t = reinterpret_cast<const SlTag*>(b);
+                D3D12_RESOURCE_DESC d{};
+                if (t->resource && t->resource->native) d = static_cast<ID3D12Resource*>(t->resource->native)->GetDesc();
+                Log("SLEVAL  tag type %u native %p state %#x lifecycle %u extent %u %u %ux%u, resource %llux%u format %u flags %#x", t->bufferType, t->resource ? t->resource->native : nullptr, t->resource ? t->resource->state : 0, t->lifecycle, t->extent.left, t->extent.top, t->extent.width, t->extent.height, static_cast<unsigned long long>(d.Width), d.Height, static_cast<unsigned>(d.Format), static_cast<unsigned>(d.Flags));
+            }
+        }
+    }
     auto* timed = static_cast<ID3D12GraphicsCommandList*>(cmd);
     UINT timerIndex = 0;
     const bool timing = feature == 0 && DlssTimerBegin(timed, vp, &timerIndex);
@@ -1904,6 +1963,17 @@ static int __cdecl HookSlEvaluate(uint32_t feature, const void* frame, const voi
             if (on) DlssTimerEnd(l, i);
         }
     } end{timing, timed, timerIndex};
+    if ((vp == 1 || vp == 2) && feature == 0) {
+        for (uint32_t i = 0; i < n; ++i) {
+            const SlBase* b = static_cast<const SlBase*>(inputs[i]);
+            uint32_t g = 0;
+            memcpy(&g, b->type, 4);
+            if (g == 0x4c6a5aad) {
+                const SlTag* t = reinterpret_cast<const SlTag*>(b);
+                if (t->bufferType == 0 && t->resource) XrRebuildCopyDepth(vp - 1, cmd, t->resource->native);
+            }
+        }
+    }
     if (vp == 0 || feature != 0 || n == 0 || n > 8) return g_origSlEvaluate(feature, frame, inputs, n, cmd);
     const void* local[8];
     memcpy(local, inputs, n * sizeof(void*));
@@ -1914,8 +1984,47 @@ static int __cdecl HookSlEvaluate(uint32_t feature, const void* frame, const voi
     if (r != 0 && g_slLogLeft.fetch_sub(1) > 0) Log("SL evaluate viewport %d result %d", vp, r);
     return r;
 }
+struct EyeTagged {
+    std::atomic<ID3D12Resource*> resource{nullptr};
+    std::atomic<uint32_t> state{0};
+    SlExtent extent{};
+};
+static EyeTagged g_eyeDepthTag[3], g_eyeMotionTag[3];
+using SlSetTagFn = int(__cdecl*)(const void*, const SlTag*, uint32_t, void*);
+static SlSetTagFn g_origSlSetTag;
+static std::atomic<int> g_slTagLogLeft{0};
+static int __cdecl HookSlSetTag(const void* viewport, const SlTag* tags, uint32_t n, void* cmd) {
+    const int vp = g_slViewport.load();
+    for (uint32_t i = 0; i < n && vp >= 0 && vp < 3; ++i) {
+        const SlTag& t = tags[i];
+        if (!t.resource) continue;
+        EyeTagged* into = t.bufferType == 0 ? &g_eyeDepthTag[vp] : t.bufferType == 1 ? &g_eyeMotionTag[vp] : nullptr;
+        if (into) {
+            into->resource = static_cast<ID3D12Resource*>(t.resource->native);
+            into->state = t.resource->state;
+            into->extent = t.extent;
+        }
+        if (g_slTagLogLeft.load() > 0 && g_slTagLogLeft.fetch_sub(1) > 0) {
+            D3D12_RESOURCE_DESC d{};
+            if (t.resource->native) d = static_cast<ID3D12Resource*>(t.resource->native)->GetDesc();
+            Log("SLTAG viewport %d type %u native %p state %#x lifecycle %u, sl size %ux%u format %u, extent %u %u %ux%u, resource %llux%u format %u flags %#x", vp, t.bufferType, t.resource->native, t.resource->state, t.lifecycle, t.resource->width, t.resource->height, t.resource->nativeFormat, t.extent.left, t.extent.top, t.extent.width, t.extent.height, static_cast<unsigned long long>(d.Width), d.Height, static_cast<unsigned>(d.Format), static_cast<unsigned>(d.Flags));
+        }
+    }
+    if (g_slViewport.load() == 0 || !viewport) return g_origSlSetTag(viewport, tags, n, cmd);
+    ViewportCopy copy(viewport);
+    return g_origSlSetTag(copy.bytes, tags, n, cmd);
+}
+static std::atomic<int> g_slConstLogLeft{0};
 static int __cdecl HookSlSetConst(const void* values, const void* frame, const void* viewport) {
     ++g_slCount[2];
+    if (g_slConstLogLeft.load() > 0 && g_slConstLogLeft.fetch_sub(1) > 0 && values) {
+        const float* f = reinterpret_cast<const float*>(static_cast<const uint8_t*>(values) + sizeof(SlBase));
+        const uint32_t* u = reinterpret_cast<const uint32_t*>(f);
+        // After five 4x4 matrices: jitter, mvec scale, pinhole, position, up, right, fwd, near, far, fov, aspect, invalid, booleans.
+        const float* a = f + 80;
+        Log("SLCONST viewport %d viewToClip %.4f %.4f %.4f %.4f / %.4f %.4f / %.4f %.4f %.4f %.4f", g_slViewport.load(), f[0], f[5], f[10], f[11], f[14], f[15], f[8], f[9], f[2], f[3]);
+        Log("SLCONST jitter %.3f %.3f mvec scale %.5f %.5f pos %.3f %.3f %.3f near %.3f far %.1f fov %.3f aspect %.3f bools %u %u %u %u", a[0], a[1], a[2], a[3], a[6], a[7], a[8], a[18], a[19], a[20], a[21], u[80 + 23], u[80 + 24], u[80 + 25], u[80 + 26]);
+    }
     if (g_slViewport.load() == 0) return g_origSlSetConst(values, frame, viewport);
     ViewportCopy copy(viewport);
     const int r = g_origSlSetConst(values, frame, copy.bytes);
@@ -2008,6 +2117,7 @@ static void InstallSlProbe() {
     };
     const Item items[] = {{"slEvaluateFeature", reinterpret_cast<void*>(&HookSlEvaluate), reinterpret_cast<void**>(&g_origSlEvaluate)},
                           {"slSetConstants", reinterpret_cast<void*>(&HookSlSetConst), reinterpret_cast<void**>(&g_origSlSetConst)},
+                          {"slSetTag", reinterpret_cast<void*>(&HookSlSetTag), reinterpret_cast<void**>(&g_origSlSetTag)},
                           {"slGetFeatureFunction", reinterpret_cast<void*>(&HookSlGetFeature), reinterpret_cast<void**>(&g_origSlGetFeature)}};
     for (const Item& h : items) {
         void* f = reinterpret_cast<void*>(GetProcAddress(m, h.name));
@@ -2255,7 +2365,18 @@ static void RunCommand(const std::string& c) {
         g_fgDirector = g_w != 0;
         OfxrPacingUpdate();
     }
-    else if (sscanf(c.c_str(), "alternate %u", &g_w) == 1) g_alternateSetting = g_w != 0;
+    else if (sscanf(c.c_str(), "alternate %u", &g_w) == 1) {
+        g_alternateSetting = g_w != 0;
+        g_rebuildSetting = g_w == 2;
+        XrRebuildSetMode(g_w == 2 ? 1 : 0);
+    }
+    else if (sscanf(c.c_str(), "rbtest %u", &g_w) == 1) {
+        XrRebuildSetMode(g_w ? 1 : (g_rebuildSetting ? 1 : 0));
+        XrRebuildTest(g_w != 0);
+    }
+    else if (sscanf(c.c_str(), "rbstage %u", &g_w) == 1) XrRebuildStage(static_cast<int>(g_w));
+    else if (sscanf(c.c_str(), "rbshot %63s", g_text) == 1) g_rbShotName = g_text;
+    else if (sscanf(c.c_str(), "sltag %u", &g_w) == 1) { g_slTagLogLeft = static_cast<int>(g_w); g_slEvalLogLeft = static_cast<int>(g_w); }
     else if (c == "fgstate") OfxrLogState("now");
     else if (sscanf(c.c_str(), "mirror %u", &g_w) == 1) g_mirrorEye = g_w != 0;
     else if (sscanf(c.c_str(), "eyeskip %u", &g_w) == 1) {
@@ -2453,7 +2574,12 @@ static DWORD WINAPI ProbeThread(void*) {
     g_fgType = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"VR", L"FrameGenType", 0, ini.c_str())), 0, 3);
     g_fgTypeAtLaunch = g_fgType;
     g_fgDirector = GetPrivateProfileIntW(L"VR", L"FrameGenDirector", 0, ini.c_str()) != 0;
-    g_alternateSetting = GetPrivateProfileIntW(L"VR", L"AlternateEye", 0, ini.c_str()) != 0;
+    {
+        const UINT alt = GetPrivateProfileIntW(L"VR", L"AlternateEye", 0, ini.c_str());
+        g_alternateSetting = alt != 0;
+        g_rebuildSetting = alt == 2;
+        XrRebuildSetMode(alt == 2 ? 1 : 0);
+    }
     g_aimDot = static_cast<int>(GetPrivateProfileIntW(L"VR", L"AimDot", 1, ini.c_str()));
     g_labProbes = GetPrivateProfileIntW(L"VR", L"LabProbes", 1, ini.c_str()) != 0;
     g_skipLauncher = g_skipLauncherSetting;

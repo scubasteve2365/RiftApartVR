@@ -208,8 +208,15 @@ static uint64_t NowUs() {
 
 // Each game frame's head pose, kept until the image drawn from it reaches Present. The layer must carry the pose the
 // image was drawn with, or the runtime reprojects by the difference and the world swims.
+struct RebuildEye {
+    float right[3], up[3], back[3], pos[3];
+    float tan[4];  // left, right, up, down
+    bool valid;
+};
 struct PendingPose {
     XrView views[2];
+    RebuildEye cameras[2];
+    float nearZ;
     uint64_t serial;
     float worldPos[2][3];
 };
@@ -227,6 +234,22 @@ static XrView g_heldView[2];
 void XrSetAlternate(bool on) {
     std::lock_guard<std::mutex> l(g_poseLock);
     if (g_alternate.exchange(on) != on) g_held[0] = g_held[1] = false;
+}
+
+void XrTagEyeCamera(int eye, const float right[3], const float up[3], const float back[3], const float pos[3], float tanLeft, float tanRight, float tanUp, float tanDown, float nearZ) {
+    std::lock_guard<std::mutex> l(g_poseLock);
+    PendingPose& p = g_poses[g_poseSerial % kPoses];
+    RebuildEye& c = p.cameras[eye];
+    memcpy(c.right, right, 12);
+    memcpy(c.up, up, 12);
+    memcpy(c.back, back, 12);
+    memcpy(c.pos, pos, 12);
+    c.tan[0] = tanLeft;
+    c.tan[1] = tanRight;
+    c.tan[2] = tanUp;
+    c.tan[3] = tanDown;
+    c.valid = true;
+    p.nearZ = nearZ;
 }
 
 void XrTagPose(int eye, const float worldPos[3]) {
@@ -326,6 +349,7 @@ bool XrLocate(XrEyePose out[2]) {
     PendingPose& p = g_poses[g_poseSerial % kPoses];
     p.views[0] = v[0];
     p.views[1] = v[1];
+    p.cameras[0].valid = p.cameras[1].valid = false;
     p.serial = g_poseSerial;
     return true;
 }
@@ -1041,6 +1065,10 @@ static void MirrorEye(ID3D12GraphicsCommandList* list, ID3D12Resource* eye, D3D1
     list->ResourceBarrier(2, bar);
 }
 
+#include "rebuild.inc"
+static std::atomic<bool> g_rbTest{false};
+void XrRebuildTest(bool on) { g_rbTest = on; }
+
 // ---- GPU time of the mod's own frame work: copies to the headset, HUD, monitor. And the time between two frames' ends. ----
 static ID3D12QueryHeap* g_copyHeap;
 static ID3D12Resource* g_copyRead;
@@ -1106,6 +1134,7 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
     PendingPose pose;
     bool havePose = false;
     bool copyEye[2] = {true, true};
+    int freshEye = -1;
     {
         std::lock_guard<std::mutex> pl(g_poseLock);
         if (g_renderedSerial > g_usedSerial && g_poses[g_renderedSerial % kPoses].serial == g_renderedSerial) {
@@ -1115,6 +1144,7 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
             havePose = true;
             if (g_alternate.load()) {
                 const int fresh = g_renderedEye;
+                freshEye = fresh;
                 // Until an eye has been drawn once in this mode, send both as they are.
                 if (g_held[1 - fresh]) copyEye[1 - fresh] = false;
                 else {
@@ -1123,8 +1153,13 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
                 }
                 g_held[fresh] = true;
                 g_heldView[fresh] = pose.views[fresh];
-                pose.views[0] = g_heldView[0];
-                pose.views[1] = g_heldView[1];
+                // With a rebuild the other eye is drawn for this tick's pose. Decided below: keep the real pose until then.
+                if (g_rebuildMode.load() == 0) {
+                    pose.views[0] = g_heldView[0];
+                    pose.views[1] = g_heldView[1];
+                } else {
+                    pose.views[fresh] = g_heldView[fresh];
+                }
             }
         }
     }
@@ -1153,12 +1188,28 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
     list->Reset(alloc, nullptr);
     UINT copyIndex = 0;
     const bool copyTimed = CopyTimerBegin(list, &copyIndex);
+    // The rebuilt eye: from the drawn eye's image and depth, for this tick's camera.
+    bool rebuilt = false;
+    if (g_rebuildMode.load() != 0 && freshEye >= 0 && pose.cameras[0].valid && pose.cameras[1].valid) {
+        rebuilt = RbRun(list, freshEye, pose.cameras, static_cast<ID3D12Resource*>(resources[freshEye]), static_cast<D3D12_RESOURCE_STATES>(states[freshEye]), pose.nearZ);
+    } else if (g_rbTest.load() && g_rebuildMode.load() != 0 && freshEye < 0 && pose.cameras[0].valid && pose.cameras[1].valid) {
+        RbRun(list, 0, pose.cameras, static_cast<ID3D12Resource*>(resources[0]), static_cast<D3D12_RESOURCE_STATES>(states[0]), pose.nearZ);
+    }
+    int rebuiltEye = -1;
+    if (rebuilt) rebuiltEye = 1 - freshEye;
+    else if (freshEye >= 0 && g_rebuildMode.load() != 0) {
+        // No rebuild this time: the held image with the pose it was drawn at.
+        std::lock_guard<std::mutex> pl(g_poseLock);
+        pose.views[1 - freshEye] = g_heldView[1 - freshEye];
+    }
     XrCompositionLayerProjectionView pv[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
     for (int e = 0; e < 2; ++e) {
         pv[e].pose = pose.views[e].pose;
         pv[e].fov = pose.views[e].fov;
         pv[e].subImage.swapchain = g_chain[e];
         pv[e].subImage.imageRect.extent = {g_chainW, g_chainH};
+        const bool fromRebuild = e == rebuiltEye;
+        if (fromRebuild) copyEye[e] = true;
         if (!copyEye[e]) continue;  // the runtime keeps showing this swapchain's last released image
         uint32_t idx = 0;
         const uint64_t t0 = NowUs();
@@ -1168,18 +1219,20 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
         p_xrWaitSwapchainImage(g_chain[e], &wi);
         g_usWaitImage += NowUs() - t0;
         ID3D12Resource* dst = g_images[e][idx].texture;
-        auto* src = static_cast<ID3D12Resource*>(resources[e]);
+        auto* src = fromRebuild ? g_rbOut : static_cast<ID3D12Resource*>(resources[e]);
+        const D3D12_RESOURCE_STATES srcBefore = fromRebuild ? D3D12_RESOURCE_STATE_COPY_SOURCE : static_cast<D3D12_RESOURCE_STATES>(states[e]);
         D3D12_RESOURCE_BARRIER bar[2]{};
         bar[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         bar[0].Transition.pResource = src;
         bar[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        bar[0].Transition.StateBefore = static_cast<D3D12_RESOURCE_STATES>(states[e]);
+        bar[0].Transition.StateBefore = srcBefore;
         bar[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
         bar[1] = bar[0];
         bar[1].Transition.pResource = dst;
         bar[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         bar[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-        list->ResourceBarrier(2, bar);
+        if (fromRebuild) list->ResourceBarrier(1, &bar[1]);
+        else list->ResourceBarrier(2, bar);
         D3D12_TEXTURE_COPY_LOCATION d{}, s{};
         d.pResource = dst;
         d.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -1190,7 +1243,8 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
         list->CopyTextureRegion(&d, 0, 0, 0, &s, &box);
         std::swap(bar[0].Transition.StateBefore, bar[0].Transition.StateAfter);
         std::swap(bar[1].Transition.StateBefore, bar[1].Transition.StateAfter);
-        list->ResourceBarrier(2, bar);
+        if (fromRebuild) list->ResourceBarrier(1, &bar[1]);
+        else list->ResourceBarrier(2, bar);
     }
     XrCompositionLayerQuad quads[kUiSlots];
     uint32_t quadCount = 0;

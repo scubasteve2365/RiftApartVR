@@ -20,6 +20,14 @@ void XrTagPose(int eye, const float worldPos[3]);
 void XrMarkRendered(int eye, const float worldPos[3]);
 // Alternate eye: only the eye drawn this tick is copied. The other keeps its last image and the pose it was drawn with.
 void XrSetAlternate(bool on);
+// Depth rebuild of the eye not drawn. Mode 0 off, 1 on. Camera of both eyes for this tick, in the game's world.
+void XrRebuildSetMode(int mode);
+void XrRebuildCopyDepth(int eye, void* cmd, void* depth);
+void XrTagEyeCamera(int eye, const float right[3], const float up[3], const float back[3], const float pos[3], float tanLeft, float tanRight, float tanUp, float tanDown, float nearZ);
+void* XrRebuildResult();
+// Lab: rebuild the right eye from the left in native stereo, to compare with the real right eye.
+void XrRebuildTest(bool on);
+void XrRebuildStage(int stage);
 // Game thread: wait for the headset's next frame, at most one and a half periods.
 void XrPaceWait();
 // Present thread: copy both eye images to the swapchains and end the open frame.
