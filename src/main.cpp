@@ -23,7 +23,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 51
+#define BUILD_NUMBER 52
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -418,6 +418,8 @@ static const size_t kCinematicOthers[] = {0x512cf1c, 0x512f770, 0x513195c, 0x533
 static std::atomic<bool> g_cinemaOn{true};
 static std::atomic<bool> g_cinemaNow{false};
 static std::atomic<float> g_cinemaIpd{0.03f};
+static const size_t kAtmosphereTracks = 0x5339144;
+static std::atomic<bool> g_vendorNow{false}, g_forceVendor{false};
 // 0 off, 1 while aiming, 2 always.
 static std::atomic<int> g_aimDot{1};
 static float g_aimRoom[3];
@@ -449,7 +451,25 @@ static void UpdateMode() {
         }
         if (onFrames >= 3) steady = true;
         if (offFrames >= 15) steady = false;
-        const bool cine = g_cinemaOn && steady;
+        // A vendor: the game zooms its camera onto the vendor's screen, lens 10.87 in Steve's logs, with an atmosphere track
+        // running. Same path as a cutscene, so the zoomed view fills the screen. Both eyes the same: that screen is close.
+        const bool vendorNow = g_forceVendor.load() || (*reinterpret_cast<int*>(g_base + kAtmosphereTracks) > 0 && vfov > 0 && vfov < 13.0);
+        static int vendorOn = 0, vendorOff = 0;
+        if (vendorNow) {
+            ++vendorOn;
+            vendorOff = 0;
+        } else {
+            ++vendorOff;
+            vendorOn = 0;
+        }
+        static bool vendor = false;
+        if (vendorOn >= 3) vendor = true;
+        if (vendorOff >= 15) vendor = false;
+        if (vendor != g_vendorNow.load()) {
+            Log("MODE vendor screen %s, lens %.2f", vendor ? "starts" : "ends", vfov);
+            g_vendorNow = vendor;
+        }
+        const bool cine = g_cinemaOn && (steady || vendor);
         if (g_labProbes) {
             static uint8_t seenPause[7] = {};
             static int seenMain = 0;
@@ -682,7 +702,7 @@ static void __fastcall HookRenderAll() {
                     if (g_cinemaNow) {
                         // The game's own camera and framing, eyes apart along its right row. The head does not move it.
                         memcpy(eyePose, main, sizeof(eyePose));
-                        const float side = (e == 0 ? -0.5f : 0.5f) * g_cinemaIpd.load();
+                        const float side = g_vendorNow ? 0.0f : (e == 0 ? -0.5f : 0.5f) * g_cinemaIpd.load();
                         for (int i = 0; i < 3; ++i) eyePose[12 + i] = reinterpret_cast<const float*>(main)[12 + i] + reinterpret_cast<const float*>(main)[i] * side;
                         if (e == 0) XrTagPose(eyePose + 12);
                         // Width as the game has it; height fills the eye image, of which the middle 16 by 9 band is shown.
@@ -1930,6 +1950,7 @@ static void RunCommand(const std::string& c) {
     }
     else if (sscanf(c.c_str(), "skipmain %u", &g_w) == 1) g_skipMain = static_cast<int>(g_w);
     else if (sscanf(c.c_str(), "cinemaipd %f", &g_f) == 1) g_cinemaIpd = g_f;
+    else if (sscanf(c.c_str(), "vendortest %u", &g_w) == 1) g_forceVendor = g_w != 0;
     else if (sscanf(c.c_str(), "aimdot %u", &g_w) == 1) g_aimDot = static_cast<int>(g_w);
     else if (c == "aiminfo") {
         uint8_t* m = ActiveView();
