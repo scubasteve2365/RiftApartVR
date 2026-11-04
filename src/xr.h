@@ -38,6 +38,8 @@ void XrMenuShow(const uint32_t* rgba, int width, int height);
 void XrMenuHide();
 // Game thread: cutscene now. Each eye's image goes on a screen fixed in the room instead of filling the view.
 void XrSetCinema(bool on);
+// Lab: GPU ms of the mod's own copies each frame, and between the ends of two frames, since the last call.
+void XrCopyTimes(double* copyMs, double* betweenMs);
 // Game thread: a small dot along this direction in room space, from this point, while aiming. Null hides it.
 void XrSetAimDot(const float* roomDir, const float* roomFrom = nullptr);
 // Game thread: cut the middle out of the first HUD image, where the game's reticle sits.

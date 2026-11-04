@@ -73,6 +73,24 @@ static bool Fn(const char* name, T& out) {
 
 bool XrInit(const wchar_t* dir) {
     if (g_inst) return true;
+    {
+        // OFXR frame generation, off unless chosen. An OpenXR layer in its own folder, turned on for this process only, the
+        // way a launcher would, with no tray program. LGPL, so it stays a separate DLL the player can replace.
+        const std::wstring ini = std::wstring(dir) + L"RiftApartVR.ini";
+        const std::wstring folder = std::wstring(dir) + L"ofxr";
+        const std::wstring manifest = folder + L"\\XR_APILAYER_XRFrameBridge_diagnostic.json";
+        if (GetPrivateProfileIntW(L"VR", L"FrameGen", 0, ini.c_str()) != 0) {
+            if (GetFileAttributesW(manifest.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                SetEnvironmentVariableW(L"XR_API_LAYER_PATH", folder.c_str());
+                SetEnvironmentVariableW(L"XR_ENABLE_API_LAYERS", L"XR_APILAYER_XRFrameBridge_diagnostic");
+                Log("XR frame generation on, layer in the ofxr folder");
+            } else {
+                Log("XR frame generation chosen, but the ofxr folder has no layer: running without it");
+            }
+        } else {
+            Log("XR frame generation off");
+        }
+    }
     const std::wstring path = std::wstring(dir) + L"openxr_loader.dll";
     HMODULE lib = LoadLibraryW(path.c_str());
     if (!lib) {
@@ -993,6 +1011,61 @@ static void MirrorEye(ID3D12GraphicsCommandList* list, ID3D12Resource* eye, D3D1
     list->ResourceBarrier(2, bar);
 }
 
+// ---- GPU time of the mod's own frame work: copies to the headset, HUD, monitor. And the time between two frames' ends. ----
+static ID3D12QueryHeap* g_copyHeap;
+static ID3D12Resource* g_copyRead;
+static UINT64 g_copyFreq;
+static uint32_t g_copyFrame;
+static std::atomic<uint64_t> g_copyTicks{0}, g_copyCount{0};
+static uint64_t g_lastEndTick;
+static std::atomic<uint64_t> g_frameTicks{0}, g_frameCount{0};
+static const UINT kCopyRing = 16;
+static bool CopyTimerBegin(ID3D12GraphicsCommandList* list, UINT* index) {
+    if (!g_copyHeap) {
+        D3D12_QUERY_HEAP_DESC qd{};
+        qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        qd.Count = kCopyRing * 2;
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = qd.Count * 8;
+        rd.Height = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(g_queue->GetTimestampFrequency(&g_copyFreq)) || FAILED(g_dev->CreateQueryHeap(&qd, IID_PPV_ARGS(&g_copyHeap))) || FAILED(g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_copyRead)))) return false;
+    }
+    const uint32_t f = g_copyFrame++;
+    *index = f % kCopyRing * 2;
+    if (f >= kCopyRing) {
+        D3D12_RANGE range{*index * 8, (*index + 2) * 8};
+        UINT64* m = nullptr;
+        if (SUCCEEDED(g_copyRead->Map(0, &range, reinterpret_cast<void**>(&m)))) {
+            const UINT64 a = m[*index], b = m[*index + 1];
+            D3D12_RANGE none{0, 0};
+            g_copyRead->Unmap(0, &none);
+            if (b > a) {
+                g_copyTicks += b - a;
+                ++g_copyCount;
+                if (g_lastEndTick && b > g_lastEndTick) {
+                    g_frameTicks += b - g_lastEndTick;
+                    ++g_frameCount;
+                }
+                g_lastEndTick = b;
+            }
+        }
+    }
+    list->EndQuery(g_copyHeap, D3D12_QUERY_TYPE_TIMESTAMP, *index);
+    return true;
+}
+void XrCopyTimes(double* copyMs, double* betweenMs) {
+    const uint64_t c = g_copyCount.exchange(0), t = g_copyTicks.exchange(0), fc = g_frameCount.exchange(0), ft = g_frameTicks.exchange(0);
+    *copyMs = c && g_copyFreq ? static_cast<double>(t) / static_cast<double>(c) * 1000.0 / static_cast<double>(g_copyFreq) : 0;
+    *betweenMs = fc && g_copyFreq ? static_cast<double>(ft) / static_cast<double>(fc) * 1000.0 / static_cast<double>(g_copyFreq) : 0;
+}
+
 void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiImage* ui, int uiCount) {
     std::lock_guard<std::mutex> l(g_frameLock);
     if (!g_open) {
@@ -1034,6 +1107,8 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
     ID3D12GraphicsCommandList* list = g_list[g_ringIndex];
     alloc->Reset();
     list->Reset(alloc, nullptr);
+    UINT copyIndex = 0;
+    const bool copyTimed = CopyTimerBegin(list, &copyIndex);
     XrCompositionLayerProjectionView pv[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
     for (int e = 0; e < 2; ++e) {
         uint32_t idx = 0;
@@ -1135,6 +1210,10 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
     const bool haveMenu = MenuRecord(list, &menuLayer);
     XrCompositionLayerQuad dotLayer{XR_TYPE_COMPOSITION_LAYER_QUAD};
     const bool haveDot = !g_cinema && DotRecord(list, &dotLayer, pose);
+    if (copyTimed) {
+        list->EndQuery(g_copyHeap, D3D12_QUERY_TYPE_TIMESTAMP, copyIndex + 1);
+        list->ResolveQueryData(g_copyHeap, D3D12_QUERY_TYPE_TIMESTAMP, copyIndex, 2, g_copyRead, static_cast<UINT64>(copyIndex) * 8);
+    }
     list->Close();
     ID3D12CommandList* lists[] = {list};
     g_queue->ExecuteCommandLists(1, lists);

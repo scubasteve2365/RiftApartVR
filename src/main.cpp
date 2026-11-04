@@ -6,6 +6,7 @@
 #include <MinHook.h>
 #include "capture.h"
 #include "xr.h"
+#include <d3d12.h>
 #include <wincodec.h>
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "ole32.lib")
@@ -23,7 +24,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 52
+#define BUILD_NUMBER 58
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -534,9 +535,35 @@ static void UpdateMode() {
 
 static void CreateEyeNow() { CreateEyeImpl(); }
 
+// ---- timing probe, game thread, reset every report ----
+static uint64_t PerfNow() {
+    static const double toUs = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return 1e6 / static_cast<double>(f.QuadPart);
+    }();
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return static_cast<uint64_t>(static_cast<double>(c.QuadPart) * toUs);
+}
+static std::atomic<uint64_t> g_usFrame{0}, g_usPace{0}, g_usOffscreen{0}, g_usEyeSubmit{0}, g_usMainSubmit{0}, g_usGamePart{0}, g_perfFrames{0};
 static void __fastcall HookRenderAll() {
     ++g_frames;
-    if (g_xrSession && g_pace) XrPaceWait();
+    {
+        // Whole frame: from one arrival here to the next.
+        static uint64_t last = 0;
+        const uint64_t nowUs = PerfNow();
+        if (last) {
+            g_usFrame += nowUs - last;
+            ++g_perfFrames;
+        }
+        last = nowUs;
+    }
+    {
+        const uint64_t t = PerfNow();
+        if (g_xrSession && g_pace) XrPaceWait();
+        g_usPace += PerfNow() - t;
+    }
     if (g_xrSession) UpdateMode();
     if (g_wantCreate.exchange(0)) CreateEyeNow();
     {
@@ -744,7 +771,11 @@ static void __fastcall HookRenderAll() {
             }
         }
     }
-    g_origRenderAll();
+    {
+        const uint64_t t = PerfNow();
+        g_origRenderAll();
+        g_usOffscreen += PerfNow() - t;
+    }
 }
 
 // Resting the flat view: the scene submit returns at once when view +0x11d8 is clear. Set again when not resting.
@@ -801,11 +832,16 @@ static void* __fastcall HookSceneSubmit(uint8_t* view, void* a, uint32_t mask, c
         uint8_t saved[0x38];
         memcpy(saved, view + 0x1740, sizeof(saved));
         memcpy(view + 0x1740, main + 0x1740, sizeof(saved));
+        const uint64_t t = PerfNow();
         void* r = g_origSceneSubmit(view, a, mask, b);
+        g_usEyeSubmit += PerfNow() - t;
         memcpy(view + 0x1740, saved, sizeof(saved));
         return r;
     }
-    return g_origSceneSubmit(view, a, mask, b);
+    const uint64_t t = PerfNow();
+    void* r = g_origSceneSubmit(view, a, mask, b);
+    g_usMainSubmit += PerfNow() - t;
+    return r;
 }
 
 static void __fastcall HookCameraSubmit(uint8_t* view, const uint8_t* desc) {
@@ -1050,11 +1086,12 @@ static std::atomic<bool> g_menuOpen{false};
 static int g_menuRow = 0;
 static int g_resolutionSetting = 100;
 static bool g_skipLauncherSetting = true;
+static bool g_frameGenSetting = false;
 static int g_dlssPercentSetting = -1;  // -1 the game's choice, 0 no DLSS in the eyes, otherwise a fixed size
 static float g_hudDistanceSetting = 2.0f;
 static std::wstring g_iniPath;
 static std::vector<uint32_t> g_menuImage;
-static const int kMenuW = 1024, kMenuH = 984, kMenuRows = 11;
+static const int kMenuW = 1024, kMenuH = 1056, kMenuRows = 12;
 
 static void SaveSetting(const wchar_t* name, int value) {
     WritePrivateProfileStringW(L"VR", name, std::to_wstring(value).c_str(), g_iniPath.c_str());
@@ -1100,6 +1137,10 @@ static void MenuRowText(int row, wchar_t (&name)[64], wchar_t (&value)[32]) {
         break;
     case 9:
         wcscpy_s(name, L"Snapshot in 2 seconds");
+        break;
+    case 10:
+        wcscpy_s(name, L"Frame generation (next launch)");
+        wcscpy_s(value, g_frameGenSetting ? L"On" : L"Off");
         break;
     default: wcscpy_s(name, L"Close"); break;
     }
@@ -1256,6 +1297,10 @@ static void MenuChange(int dir) {
             MenuClose();
             return;
         }
+        break;
+    case 10:
+        g_frameGenSetting = !g_frameGenSetting;
+        SaveSetting(L"FrameGen", g_frameGenSetting ? 1 : 0);
         break;
     default:
         if (dir == 0) {
@@ -1565,7 +1610,7 @@ static void PollPad() {
         } else if (i == kLeft || i == kRight) {
             MenuChange(i == kLeft ? -1 : 1);
         } else if (i == kA) {
-            if (g_menuRow == 0 || g_menuRow == 2 || g_menuRow == 6 || g_menuRow == 7 || g_menuRow == 8 || g_menuRow == 9 || g_menuRow == kMenuRows - 1) MenuChange(0);
+            if (g_menuRow == 0 || g_menuRow == 2 || g_menuRow == 6 || g_menuRow == 7 || g_menuRow == 8 || g_menuRow == 9 || g_menuRow == 10 || g_menuRow == kMenuRows - 1) MenuChange(0);
         } else {
             MenuClose();
         }
@@ -1609,9 +1654,74 @@ static SlEvaluateFn g_origSlEvaluate;
 static SlSetConstFn g_origSlSetConst;
 static SlGetFeatureFn g_origSlGetFeature;
 static SlSetOptionsFn g_origSlSetOptions;
+// ---- GPU time of each DLSS call, by timestamps either side of it on the game's own command list. Lab probe. ----
+static const UINT kDlssSlots = 3, kDlssRing = 16;
+static ID3D12QueryHeap* g_dlssHeap;
+static ID3D12Resource* g_dlssRead;
+static UINT64 g_dlssFreq;
+static std::atomic<uint32_t> g_dlssFrame[kDlssSlots];
+static std::atomic<uint64_t> g_dlssTicks[kDlssSlots], g_dlssCount[kDlssSlots];
+static bool DlssTimerBegin(ID3D12GraphicsCommandList* list, int vp, UINT* index) {
+    if (!g_labProbes.load() || vp < 0 || vp >= static_cast<int>(kDlssSlots) || !list) return false;
+    if (!g_dlssHeap) {
+        ID3D12Device* dev = nullptr;
+        if (FAILED(list->GetDevice(IID_PPV_ARGS(&dev)))) return false;
+        D3D12_QUERY_HEAP_DESC qd{};
+        qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        qd.Count = kDlssSlots * kDlssRing * 2;
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = qd.Count * 8;
+        rd.Height = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        auto* q = static_cast<ID3D12CommandQueue*>(CaptureQueue());
+        const bool ok = q && SUCCEEDED(q->GetTimestampFrequency(&g_dlssFreq)) && SUCCEEDED(dev->CreateQueryHeap(&qd, IID_PPV_ARGS(&g_dlssHeap))) && SUCCEEDED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_dlssRead)));
+        dev->Release();
+        if (!ok) return false;
+    }
+    const uint32_t f = g_dlssFrame[vp].fetch_add(1);
+    *index = (vp * kDlssRing + f % kDlssRing) * 2;
+    // What an earlier use of this slot measured has finished by now: the ring is many frames long.
+    if (f >= kDlssRing) {
+        const UINT old = *index;
+        D3D12_RANGE range{old * 8, (old + 2) * 8};
+        UINT64* m = nullptr;
+        if (SUCCEEDED(g_dlssRead->Map(0, &range, reinterpret_cast<void**>(&m)))) {
+            const UINT64 a = m[old], b = m[old + 1];
+            D3D12_RANGE none{0, 0};
+            g_dlssRead->Unmap(0, &none);
+            if (b > a) {
+                g_dlssTicks[vp] += b - a;
+                ++g_dlssCount[vp];
+            }
+        }
+    }
+    list->EndQuery(g_dlssHeap, D3D12_QUERY_TYPE_TIMESTAMP, *index);
+    return true;
+}
+static void DlssTimerEnd(ID3D12GraphicsCommandList* list, UINT index) {
+    list->EndQuery(g_dlssHeap, D3D12_QUERY_TYPE_TIMESTAMP, index + 1);
+    list->ResolveQueryData(g_dlssHeap, D3D12_QUERY_TYPE_TIMESTAMP, index, 2, g_dlssRead, static_cast<UINT64>(index) * 8);
+}
 static int __cdecl HookSlEvaluate(uint32_t feature, const void* frame, const void** inputs, uint32_t n, void* cmd) {
     ++g_slCount[0];
     const int vp = g_slViewport.load();
+    auto* timed = static_cast<ID3D12GraphicsCommandList*>(cmd);
+    UINT timerIndex = 0;
+    const bool timing = feature == 0 && DlssTimerBegin(timed, vp, &timerIndex);
+    struct End {
+        bool on;
+        ID3D12GraphicsCommandList* l;
+        UINT i;
+        ~End() {
+            if (on) DlssTimerEnd(l, i);
+        }
+    } end{timing, timed, timerIndex};
     if (vp == 0 || feature != 0 || n == 0 || n > 8) return g_origSlEvaluate(feature, frame, inputs, n, cmd);
     const void* local[8];
     memcpy(local, inputs, n * sizeof(void*));
@@ -1743,6 +1853,15 @@ static void OverrideSetting(const wchar_t* name, void* data) {
         Log("REG ShowLauncher was %d, the game is told 0", *static_cast<int*>(data));
         *static_cast<int*>(data) = 0;
         return;
+    }
+    {
+        // [Force] section of the ini: any DWORD game setting, by its registry name, for tests and for the VR effects choice.
+        const int forced = static_cast<int>(GetPrivateProfileIntW(L"Force", name, -1, (g_dir + L"RiftApartVR.ini").c_str()));
+        if (forced >= 0) {
+            if (*static_cast<int*>(data) != forced) Log("REG %ls was %d, forced %d", name, *static_cast<int*>(data), forced);
+            *static_cast<int*>(data) = forced;
+            return;
+        }
     }
     if (g_smallFlat) {
         // The window sets the HUD's layout and the size of the game's own view, which only draws the HUD now.
@@ -1940,6 +2059,16 @@ static void RunCommand(const std::string& c) {
     else if (sscanf(c.c_str(), "lensfix %u", &g_w) == 1) g_lensFix = g_w != 0;
     else if (sscanf(c.c_str(), "eyenoui %u", &g_w) == 1) g_eyeNoUi = g_w != 0;
     else if (sscanf(c.c_str(), "mirror %u", &g_w) == 1) g_mirrorEye = g_w != 0;
+    else if (sscanf(c.c_str(), "eyeskip %u", &g_w) == 1) {
+        // Lab: stop drawing an eye, to see what it costs. 1 right, 2 both, 0 neither.
+        std::lock_guard<std::mutex> l(g_eyesLock);
+        if (g_eyes.size() >= 2) {
+            uint32_t& fa = *reinterpret_cast<uint32_t*>(g_eyes[0] + 0x16ccc);
+            uint32_t& fb = *reinterpret_cast<uint32_t*>(g_eyes[1] + 0x16ccc);
+            fb = g_w >= 1 ? (fb | 1u) : (fb & ~1u);
+            fa = g_w >= 2 ? (fa | 1u) : (fa & ~1u);
+        }
+    }
     else if (c == "hudshot") g_wantHudShot = 1;
     else if (c == "snapshot") CreateThread(nullptr, 0, SnapshotThread, nullptr, 0, nullptr);
     else if (sscanf(c.c_str(), "probes %u", &g_w) == 1) g_labProbes = g_w != 0;
@@ -2121,6 +2250,7 @@ static DWORD WINAPI ProbeThread(void*) {
     g_skipLauncherSetting = GetPrivateProfileIntW(L"VR", L"SkipLauncher", 1, ini.c_str()) != 0;
     g_dlssPercentSetting = g_eyeDlss ? g_eyeRenderPercent.load() : 0;
     g_cinemaOn = GetPrivateProfileIntW(L"VR", L"CutsceneScreen", 1, ini.c_str()) != 0;
+    g_frameGenSetting = GetPrivateProfileIntW(L"VR", L"FrameGen", 0, ini.c_str()) != 0;
     g_aimDot = static_cast<int>(GetPrivateProfileIntW(L"VR", L"AimDot", 1, ini.c_str()));
     g_labProbes = GetPrivateProfileIntW(L"VR", L"LabProbes", 1, ini.c_str()) != 0;
     g_skipLauncher = g_skipLauncherSetting;
@@ -2200,6 +2330,27 @@ static DWORD WINAPI ProbeThread(void*) {
                             StartXr(resolution);
                         }
                     }
+                }
+            }
+        }
+        {
+            static ULONGLONG lastPerf = 0;
+            if (g_labProbes && now - lastPerf >= 5000) {
+                lastPerf = now;
+                const uint64_t n = g_perfFrames.exchange(0);
+                if (n) {
+                    const double f = static_cast<double>(n) * 1000.0;
+                    if (g_dlssFreq) {
+                        double ms[kDlssSlots] = {};
+                        for (UINT v = 0; v < kDlssSlots; ++v) {
+                            const uint64_t c = g_dlssCount[v].exchange(0), t = g_dlssTicks[v].exchange(0);
+                            ms[v] = c ? static_cast<double>(t) / static_cast<double>(c) * 1000.0 / static_cast<double>(g_dlssFreq) : 0;
+                        }
+                        double copyMs = 0, betweenMs = 0;
+                        XrCopyTimes(&copyMs, &betweenMs);
+                        Log("PERF GPU ms: DLSS game's view %.2f, left %.2f, right %.2f; mod's copies %.2f; between frame ends %.2f", ms[0], ms[1], ms[2], copyMs, betweenMs);
+                    }
+                    Log("PERF frames %llu, ms per frame: whole %.2f, pacing wait %.2f, all offscreen %.2f, eye submits %.2f, main submit %.2f", static_cast<unsigned long long>(n), g_usFrame.exchange(0) / f, g_usPace.exchange(0) / f, g_usOffscreen.exchange(0) / f, g_usEyeSubmit.exchange(0) / f, g_usMainSubmit.exchange(0) / f);
                 }
             }
         }
