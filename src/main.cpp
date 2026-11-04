@@ -26,7 +26,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 82
+#define BUILD_NUMBER 83
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -868,6 +868,7 @@ static void __fastcall HookModelQueue(uint8_t* ctx, uint8_t* inst, char flag) {
 static std::atomic<bool> g_restFlat{false};
 static std::atomic<int> g_skipMain{4};
 static std::atomic<uint64_t> g_mainSkipped{0};
+static std::atomic<bool> g_eyeDefer{false}, g_eyeShare{false};
 static void* __fastcall HookSceneSubmit(uint8_t* view, void* a, uint32_t mask, char b) {
     if (view == ActiveView()) {
         static uint8_t saved = 1;
@@ -919,7 +920,13 @@ static void* __fastcall HookSceneSubmit(uint8_t* view, void* a, uint32_t mask, c
         memcpy(saved, view + 0x1740, sizeof(saved));
         memcpy(view + 0x1740, main + 0x1740, sizeof(saved));
         const uint64_t t = PerfNow();
-        void* r = g_origSceneSubmit(view, a, mask, b);
+        // Lab, Fable's leads. Defer: the game thread does not wait for this eye's model jobs, as with the main view.
+        // Share: the right eye takes the left's lights and key light shadows, by the submit's own share struct.
+        static void* leftResult = nullptr;
+        const bool isLeft = view == g_eyeA.load();
+        void* const share = g_eyeShare.load() && !isLeft && leftResult ? leftResult : a;
+        void* r = g_origSceneSubmit(view, share, mask, g_eyeDefer.load() ? 1 : b);
+        if (isLeft) leftResult = r;
         g_usEyeSubmit += PerfNow() - t;
         memcpy(view + 0x1740, saved, sizeof(saved));
         return r;
@@ -2450,6 +2457,15 @@ static void RunCommand(const std::string& c) {
     else if (sscanf(c.c_str(), "rbstage %u", &g_w) == 1) XrRebuildStage(static_cast<int>(g_w));
     else if (sscanf(c.c_str(), "rbshot %63s", g_text) == 1) g_rbShotName = g_text;
     else if (sscanf(c.c_str(), "sltag %u", &g_w) == 1) { g_slTagLogLeft = static_cast<int>(g_w); g_slEvalLogLeft = static_cast<int>(g_w); }
+    else if (sscanf(c.c_str(), "eyedefer %u", &g_w) == 1) g_eyeDefer = g_w != 0;
+    else if (sscanf(c.c_str(), "eyeshare %u", &g_w) == 1) g_eyeShare = g_w != 0;
+    else if (c == "viewinfo") {
+        uint8_t* const vs[3] = {ActiveView(), g_eyeA.load(), g_eyeB.load()};
+        for (uint8_t* v : vs) {
+            if (!v) continue;
+            Log("VIEWINFO %p occlusion %p lens lod %.3f scale %.3f share flag %u flags %#x", v, *reinterpret_cast<void**>(v + 0x1bf0), *reinterpret_cast<float*>(v + 0x1d14), *reinterpret_cast<float*>(v + 0x1d18), *(v + 0x11da), *reinterpret_cast<uint32_t*>(v + 0x16ccc));
+        }
+    }
     else if (c == "fgstate") OfxrLogState("now");
     else if (sscanf(c.c_str(), "mirror %u", &g_w) == 1) g_mirrorEye = g_w != 0;
     else if (sscanf(c.c_str(), "eyeskip %u", &g_w) == 1) {
