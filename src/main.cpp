@@ -27,7 +27,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 90
+#define BUILD_NUMBER 91
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -1433,6 +1433,7 @@ static int g_fgPreset = 1;    // OFXR's numbers: 0 slow, 1 medium, 2 fast
 static int g_fgScale = 2;     // OFXR's numbers: 0 full, 1 three quarters, 2 half, 3 quarter
 static int g_fgType = 0;      // 0 optical flow, 1 FSR 3.1, 2 DLSS-G, 3 Hybrid
 static int g_fgTypeAtLaunch = 0;
+static bool g_overlapSetting = false;
 static bool g_fgDirector = false;
 struct OfxrSettingsV2 {
     uint32_t structSize;
@@ -1538,7 +1539,7 @@ static void OfxrApply() {
 static float g_hudDistanceSetting = 2.0f;
 static std::wstring g_iniPath;
 static std::vector<uint32_t> g_menuImage;
-static const int kMenuW = 1024, kMenuH = 1416, kMenuRows = 17;
+static const int kMenuW = 1024, kMenuH = 1488, kMenuRows = 18;
 
 static void SaveSetting(const wchar_t* name, int value) {
     WritePrivateProfileStringW(L"VR", name, std::to_wstring(value).c_str(), g_iniPath.c_str());
@@ -1607,6 +1608,10 @@ static void MenuRowText(int row, wchar_t (&name)[64], wchar_t (&value)[64]) {
     case 13:
         wcscpy_s(name, L"Frame generation pacing");
         wcscpy_s(value, g_fgDirector ? L"Director" : L"Framework");
+        break;
+    case 16:
+        wcscpy_s(name, L"Frame overlap");
+        wcscpy_s(value, g_overlapSetting ? L"On" : L"Off");
         break;
     case 15: {
         static const wchar_t* const rules[3] = {L"Zoomed shots", L"All cutscenes", L"Never (can hang)"};
@@ -1801,6 +1806,11 @@ static void MenuChange(int dir) {
     case 15:
         g_cutsceneCamera = (g_cutsceneCamera.load() + (dir < 0 ? 2 : 1)) % 3;
         SaveSetting(L"CutsceneCamera", g_cutsceneCamera.load());
+        break;
+    case 16:
+        g_overlapSetting = !g_overlapSetting;
+        SaveSetting(L"FrameOverlap", g_overlapSetting ? 1 : 0);
+        XrSetOverlap(g_overlapSetting);
         break;
     default:
         if (dir == 0) {
@@ -2707,6 +2717,7 @@ static void RunCommand(const std::string& c) {
         if (CaptureDevice() && SUCCEEDED(static_cast<ID3D12Device*>(CaptureDevice())->QueryInterface(IID_PPV_ARGS(&d5))) && d5) d5->RemoveDevice();
     }
     else if (sscanf(c.c_str(), "maineveryframe %u", &g_w) == 1) g_mainEveryOverride = g_w != 0;
+    else if (sscanf(c.c_str(), "overlap %u", &g_w) == 1) XrSetOverlap(g_w != 0);
     else if (c == "fgstate") OfxrLogState("now");
     else if (sscanf(c.c_str(), "mirror %u", &g_w) == 1) g_mirrorEye = g_w != 0;
     else if (sscanf(c.c_str(), "eyeskip %u", &g_w) == 1) {
@@ -2906,6 +2917,8 @@ static DWORD WINAPI ProbeThread(void*) {
     g_fgType = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"VR", L"FrameGenType", 0, ini.c_str())), 0, 3);
     g_fgTypeAtLaunch = g_fgType;
     g_fgDirector = GetPrivateProfileIntW(L"VR", L"FrameGenDirector", 0, ini.c_str()) != 0;
+    g_overlapSetting = GetPrivateProfileIntW(L"VR", L"FrameOverlap", 0, ini.c_str()) != 0;
+    XrSetOverlap(g_overlapSetting);
     {
         const UINT alt = GetPrivateProfileIntW(L"VR", L"AlternateEye", 0, ini.c_str());
         g_alternateSetting = alt != 0;

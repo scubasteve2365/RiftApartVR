@@ -398,6 +398,30 @@ static void EndEmpty(XrTime t) {
     ++g_endedEmpty;
 }
 
+// Overlap: xrWaitFrame for the next frame comes right after xrBeginFrame of this one, which OpenXR allows, so the game starts its next
+// tick while the render thread is still finishing this one. Its xrBeginFrame still waits for this frame's xrEndFrame.
+// Off: the next xrWaitFrame waits for xrEndFrame, so the game's work and the render thread's take turns.
+static std::atomic<bool> g_overlap{false};
+void XrSetOverlap(bool on) {
+    g_overlap = on;
+    Log("XR overlap %d", on ? 1 : 0);
+}
+static void WaitFrameClosed() {
+    const ULONGLONG start = GetTickCount64();
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> l(g_frameLock);
+            if (!g_open) return;
+            if (GetTickCount64() - start > 200) {
+                EndEmpty(g_openTime);
+                g_open = false;
+                return;
+            }
+        }
+        Sleep(1);
+    }
+}
+
 static DWORD WINAPI XrWorker(void*) {
     ULONGLONG lastStats = GetTickCount64();
     for (;;) {
@@ -419,6 +443,8 @@ static DWORD WINAPI XrWorker(void*) {
         g_predicted = fs.predictedDisplayTime;
         SetEvent(FrameEvent());
         g_periodNs = fs.predictedDisplayPeriod;
+        const bool overlap = g_overlap.load();
+        if (overlap) WaitFrameClosed();
         r = p_xrBeginFrame(g_sess, nullptr);
         if (XR_FAILED(r)) {
             Log("XR xrBeginFrame failed %d", static_cast<int>(r));
@@ -430,19 +456,7 @@ static DWORD WINAPI XrWorker(void*) {
             g_should = fs.shouldRender != XR_FALSE;
             g_openTime = fs.predictedDisplayTime;
         }
-        const ULONGLONG start = GetTickCount64();
-        for (;;) {
-            {
-                std::lock_guard<std::mutex> l(g_frameLock);
-                if (!g_open) break;
-                if (GetTickCount64() - start > 200) {
-                    EndEmpty(g_openTime);
-                    g_open = false;
-                    break;
-                }
-            }
-            Sleep(1);
-        }
+        if (!overlap) WaitFrameClosed();
         const ULONGLONG now = GetTickCount64();
         if (now - lastStats > 5000) {
             lastStats = now;
