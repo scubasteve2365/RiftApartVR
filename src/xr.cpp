@@ -1146,13 +1146,16 @@ void XrCopyTimes(double* copyMs, double* betweenMs) {
     *betweenMs = fc && g_copyFreq ? static_cast<double>(ft) / static_cast<double>(fc) * 1000.0 / static_cast<double>(g_copyFreq) : 0;
 }
 
+extern void SeqNote(char c);
 void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiImage* ui, int uiCount) {
     std::lock_guard<std::mutex> l(g_frameLock);
     if (!g_open) {
         ++g_notReady;
+        SeqNote('c');
         return;
     }
     const uint64_t present0 = NowUs();
+    SeqNote('o');
     PendingPose pose;
     bool havePose = false;
     bool copyEye[2] = {true, true};
@@ -1193,6 +1196,7 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
     if (!havePose) {
         // No new image yet. Leave the frame open for the next Present: the worker ends it if nothing comes.
         ++g_notReady;
+        SeqNote('n');
         return;
     }
     if (!g_should || !resources[0] || !resources[1]) {

@@ -27,7 +27,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 93
+#define BUILD_NUMBER 94
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -94,6 +94,26 @@ static void KeepLogHistory() {
         FindClose(h);
     }
     fclose(index);
+}
+
+// Lab: the order things happen in, one letter each, for finding why a frame loses its image.
+// T tick, M third view submitted, s third view skipped, A B eyes' tone map, m its tone map, P present, then in the XR code:
+// o an image sent, n no new image yet, c no frame open.
+static std::atomic<int> g_seqLeft{0};
+static char g_seq[4096];
+static std::atomic<int> g_seqAt{0};
+static std::atomic<uint32_t> g_seqCount[128];
+void SeqNote(char c) {
+    g_seqCount[c & 127].fetch_add(1, std::memory_order_relaxed);
+    if (g_seqLeft.load(std::memory_order_relaxed) <= 0) return;
+    const int i = g_seqAt.fetch_add(1);
+    if (i < static_cast<int>(sizeof(g_seq)) - 1) g_seq[i] = c;
+    if (i == 400) {
+        g_seqLeft = 0;
+        g_seq[(std::min)(i + 1, static_cast<int>(sizeof(g_seq)) - 1)] = 0;
+        Log("SEQ %s", g_seq);
+        g_seqAt = 0;
+    }
 }
 
 // Reads a block of game memory, surviving an address that has gone away.
@@ -290,6 +310,7 @@ static void* __fastcall HookTone(void* a, void* b, void* c, uint8_t* view, void*
         if (owner && (owner == g_eyeA.load() || owner == g_eyeB.load())) {
             generic = 0;
             if (g_eyeNoUi) {
+                SeqNote(owner == g_eyeA.load() ? 'A' : 'B');
                 if (owner == g_eyeA.load()) XrMarkRendered(0, reinterpret_cast<const float*>(view + 0x30));
                 else if (g_alternateNow.load()) XrMarkRendered(1, reinterpret_cast<const float*>(view + 0x30));
                 uint64_t* overlay = reinterpret_cast<uint64_t*>(g_base + kOverlayResource);
@@ -307,7 +328,12 @@ static void* __fastcall HookTone(void* a, void* b, void* c, uint8_t* view, void*
         if (owner && owner == g_eyeA.load()) XrMarkRendered(0, reinterpret_cast<const float*>(view + 0x30));
         else if (owner && owner == g_eyeB.load() && g_alternateNow.load()) XrMarkRendered(1, reinterpret_cast<const float*>(view + 0x30));
         // Offscreen views, eyes among them, have a negative id. The game's own view does not.
-        if (*reinterpret_cast<int*>(view + 0xf90) >= 0) g_overlayFresh = true;
+        if (*reinterpret_cast<int*>(view + 0xf90) >= 0) {
+            g_overlayFresh = true;
+            SeqNote('m');
+        } else {
+            SeqNote('x');
+        }
     }
     return g_origTone(a, b, c, view, e, generic);
 }
@@ -831,6 +857,7 @@ static uint64_t PerfNow() {
 }
 static std::atomic<uint64_t> g_usFrame{0}, g_usPace{0}, g_usOffscreen{0}, g_usEyeSubmit{0}, g_usMainSubmit{0}, g_usGamePart{0}, g_perfFrames{0};
 static void __fastcall HookRenderAll() {
+    SeqNote('T');
     ++g_frames;
     g_gameThreadId = GetCurrentThreadId();
     {
@@ -1102,6 +1129,19 @@ static void __fastcall HookModelQueue(uint8_t* ctx, uint8_t* inst, char flag) {
 static std::atomic<bool> g_restFlat{false};
 static std::atomic<int> g_skipMain{4};
 static std::atomic<bool> g_mainEveryOverride{false};  // lab
+static std::atomic<uint32_t> g_mainMask{0}, g_mainMaskSeen{0};  // lab: 0 leaves the game's own pass mask
+static std::atomic<int> g_lumFrom{0};
+// How the game's own view runs. It has to run every frame: brought back after a skipped frame, the engine drops that whole frame
+// (no tone map, no Present). Light keeps only the passes the HUD needs: 0x400 reaches the tone map, 0x1 draws the HUD pieces.
+// That view then has no picture to measure, so the eyes take exposure from the left eye. Menus still get the whole view.
+static const uint32_t kMainMaskLight = 0x401;
+static std::atomic<int> g_hudView{0};  // 0 light, 1 full, 2 never
+static void ApplyHudView() {
+    const int v = g_hudView.load();
+    g_skipMain = v == 2 ? 1 : 0;
+    g_mainMask = v == 0 ? kMainMaskLight : 0;
+    g_lumFrom = v == 1 ? 0 : 2;
+}
 static std::atomic<uint64_t> g_mainSkipped{0};
 static std::atomic<bool> g_eyeDefer{false}, g_eyeShare{false};
 static void* __fastcall HookSceneSubmit(uint8_t* view, void* a, uint32_t mask, char b) {
@@ -1134,19 +1174,44 @@ static void* __fastcall HookSceneSubmit(uint8_t* view, void* a, uint32_t mask, c
     // the scene submit copies the view into its job: if it stayed, rebuilding an eye would free the main view's buffer.
     // The game's own view only feeds the HUD in VR: the eyes are the picture and the monitor shows an eye. It runs one
     // frame in this many, because the UI overlay is drawn in its work. 0 every frame. 1 never, and the HUD freezes.
+    bool mainInVr = false, menuUpNow = false;
     if (view == ActiveView() && g_xrEyes.load()) {
+        mainInVr = true;
         // A pause menu only draws if this view runs every frame. So does the vendor screen's menu. In VR a still game camera says
         // nothing about that: standing still and looking around is normal, so it is not a reason to run this view.
         const bool menuUp = *reinterpret_cast<int*>(g_base + kPausedFlag) != 0 || g_vendorNow.load();
+        menuUpNow = menuUp;
+        static bool menuWas = false;
+        if (menuUp != menuWas) {
+            menuWas = menuUp;
+            Log("MENU %s, game's own view %s", menuUp ? "up" : "down", menuUp ? "whole" : "as set");
+        }
         const int every = menuUp || g_mainEveryOverride.load() ? 0 : g_skipMain.load();
         static uint32_t count = 0;
         ++count;
         if (every == 1 || (every > 1 && count % static_cast<uint32_t>(every) != 0)) {
             ++g_mainSkipped;
+            SeqNote('s');
             return nullptr;
         }
     }
     uint8_t* main = g_shareLum ? ActiveView() : nullptr;
+    // Lab. 0: both eyes read the game's own view's exposure. 1: each eye keeps its own. 2: left keeps its own, right reads left's.
+    const int lumFrom = g_lumFrom.load();
+    if (main && lumFrom != 0 && (view == g_eyeA.load() || view == g_eyeB.load())) {
+        const bool right = view == g_eyeB.load();
+        uint8_t* const src = lumFrom == 2 && right ? g_eyeA.load() : nullptr;
+        uint8_t saved[0x38];
+        if (src) {
+            memcpy(saved, view + 0x1740, sizeof(saved));
+            memcpy(view + 0x1740, src + 0x1740, sizeof(saved));
+        }
+        const uint64_t t = PerfNow();
+        void* r = g_origSceneSubmit(view, a, mask, b);
+        g_usEyeSubmit += PerfNow() - t;
+        if (src) memcpy(view + 0x1740, saved, sizeof(saved));
+        return r;
+    }
     if (main && view != main && (view == g_eyeA.load() || view == g_eyeB.load())) {
         uint8_t saved[0x38];
         memcpy(saved, view + 0x1740, sizeof(saved));
@@ -1162,6 +1227,11 @@ static void* __fastcall HookSceneSubmit(uint8_t* view, void* a, uint32_t mask, c
         g_usEyeSubmit += PerfNow() - t;
         memcpy(view + 0x1740, saved, sizeof(saved));
         return r;
+    }
+    if (view == ActiveView()) {
+        SeqNote('M');
+        g_mainMaskSeen = mask;
+        if (mainInVr && !menuUpNow && g_mainMask.load()) mask = g_mainMask.load();
     }
     const uint64_t t = PerfNow();
     void* r = g_origSceneSubmit(view, a, mask, b);
@@ -1396,6 +1466,7 @@ static void OnPresentForXr(void* backBuffer, unsigned bbW, unsigned bbH, int bbF
     }
     XrSetMirror(g_mirrorEye.load() ? backBuffer : nullptr);
     g_presentThreadId = GetCurrentThreadId();
+    SeqNote('P');
     XrOnPresent(res, st, ui, g_uiCount.load());
     if (!g_rbShotName.empty() && XrRebuildResult() && res[0] && res[1]) {
         // Lab: the real eyes and the rebuilt one from the same frame, to compare.
@@ -1610,9 +1681,9 @@ static void MenuRowText(int row, wchar_t (&name)[64], wchar_t (&value)[64]) {
         wcscpy_s(value, g_fgDirector ? L"Director" : L"Framework");
         break;
     case 17: {
-        const int every = g_skipMain.load();
+        const int v = g_hudView.load();
         wcscpy_s(name, L"Game's own view");
-        wcscpy_s(value, every == 1 ? L"Never (HUD freezes)" : every == 8 ? L"1 frame in 8" : every == 2 ? L"1 frame in 2" : L"1 frame in 4");
+        wcscpy_s(value, v == 2 ? L"Never (HUD freezes)" : v == 1 ? L"Full" : L"Light, HUD only");
         break;
     }
     case 16:
@@ -1819,13 +1890,11 @@ static void MenuChange(int dir) {
         XrSetOverlap(g_overlapSetting);
         break;
     case 17: {
-        // Live. HudEveryFrames in the ini, the HUD redraws only when this view runs, menus still force it on.
-        static const int steps[4] = {4, 8, 1, 2};
-        int i = 0;
-        for (int k = 0; k < 4; ++k) if (steps[k] == g_skipMain.load()) i = k;
-        g_skipMain = steps[(i + (dir < 0 ? 3 : 1)) % 4];
-        SaveSetting(L"HudEveryFrames", g_skipMain.load());
-        Log("THIRD view every %d", g_skipMain.load());
+        // Live. HudView in the ini.
+        g_hudView = (g_hudView.load() + (dir < 0 ? 2 : 1)) % 3;
+        ApplyHudView();
+        SaveSetting(L"HudView", g_hudView.load());
+        Log("HUDVIEW %d", g_hudView.load());
         break;
     }
     default:
@@ -2734,6 +2803,23 @@ static void RunCommand(const std::string& c) {
     }
     else if (sscanf(c.c_str(), "maineveryframe %u", &g_w) == 1) g_mainEveryOverride = g_w != 0;
     else if (sscanf(c.c_str(), "overlap %u", &g_w) == 1) XrSetOverlap(g_w != 0);
+    else if (c == "seqlog") {
+        g_seqAt = 0;
+        g_seqLeft = 1;
+    }
+    else if (sscanf(c.c_str(), "lumfrom %u", &g_w) == 1) g_lumFrom = static_cast<int>(g_w);
+    else if (sscanf(c.c_str(), "hudview %u", &g_w) == 1) {
+        g_hudView = static_cast<int>(g_w % 3);
+        ApplyHudView();
+        Log("HUDVIEW %d", g_hudView.load());
+    }
+    else if (sscanf(c.c_str(), "mainmask %x", &g_w) == 1) {
+        Log("MAINMASK game's own %x, now %x", g_mainMaskSeen.load(), g_w);
+        g_mainMask = g_w;
+    }
+    else if (c == "seqcount") {
+        Log("SEQCOUNT T %u M %u s %u A %u B %u m %u x %u G %u P %u o %u n %u c %u", g_seqCount['T'].exchange(0), g_seqCount['M'].exchange(0), g_seqCount['s'].exchange(0), g_seqCount['A'].exchange(0), g_seqCount['B'].exchange(0), g_seqCount['m'].exchange(0), g_seqCount['x'].exchange(0), g_seqCount['G'].exchange(0), g_seqCount['P'].exchange(0), g_seqCount['o'].exchange(0), g_seqCount['n'].exchange(0), g_seqCount['c'].exchange(0));
+    }
     else if (c == "fgstate") OfxrLogState("now");
     else if (sscanf(c.c_str(), "mirror %u", &g_w) == 1) g_mirrorEye = g_w != 0;
     else if (sscanf(c.c_str(), "eyeskip %u", &g_w) == 1) {
@@ -2910,7 +2996,9 @@ static DWORD WINAPI ProbeThread(void*) {
         g_regForce = !g_eyeDlss && GetPrivateProfileIntW(L"VR", L"ForceGameAA", 1, early.c_str()) != 0;
         g_skipLauncher = GetPrivateProfileIntW(L"VR", L"SkipLauncher", 1, early.c_str()) != 0;
         g_smallFlat = GetPrivateProfileIntW(L"VR", L"SmallFlatView", 1, early.c_str()) != 0;
-        g_skipMain = static_cast<int>(GetPrivateProfileIntW(L"VR", L"HudEveryFrames", 4, early.c_str()));
+        g_hudView = static_cast<int>(GetPrivateProfileIntW(L"VR", L"HudView", 0, early.c_str())) % 3;
+        ApplyHudView();
+        Log("HUDVIEW %d", g_hudView.load());
         g_cutsceneCamera = static_cast<int>(GetPrivateProfileIntW(L"VR", L"CutsceneCamera", 0, early.c_str())) % 3;
         CreateThread(nullptr, 0, ThreadSampler, nullptr, 0, nullptr);
         if (GetPrivateProfileIntW(L"VR", L"DeviceDiagnostics", 1, early.c_str()) != 0) {

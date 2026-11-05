@@ -250,8 +250,10 @@ static std::atomic<void (*)(void*, unsigned, unsigned, int)> g_callback{nullptr}
 
 static thread_local int t_depth = 0;
 
+extern void SeqNote(char c);
 static void OnPresent(IDXGISwapChain* chain) {
     ++g_presents;
+    SeqNote('G');
     if (DumpJob* job = g_job.exchange(nullptr)) RunJob(job);
     auto fn = g_callback.load();
     if (!fn) return;
