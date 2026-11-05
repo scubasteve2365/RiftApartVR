@@ -3,6 +3,7 @@
 // D3D12 side: finds the game's direct queue and its Present, without loading d3d12.dll early, and copies eye images
 // to files for the scripted stereo check. Everything starts from a real game texture, so it runs late, after boot.
 #include <windows.h>
+#include <mutex>
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include <MinHook.h>
@@ -34,10 +35,95 @@ struct DumpJob {
 };
 static std::atomic<DumpJob*> g_job{nullptr};
 
+// ---- All the GPU work of this queue: a timestamp either side of each submission, game's and mod's. Lab probe. ----
+// The stamps are small lists recorded once. 256 pairs in a ring, far more than frames in flight use before one comes round again.
+static const UINT kStampPairs = 256;
+static ID3D12QueryHeap* g_stampHeap;
+static ID3D12Resource* g_stampRead;
+static const UINT64* g_stampData;
+static ID3D12GraphicsCommandList* g_stampLists[kStampPairs * 2];
+static std::atomic<uint64_t> g_stampHead{0};
+static uint64_t g_stampTail;
+static UINT64 g_stampFreq;
+static std::atomic<int> g_stampState{0};  // 0 not made, 1 ready, 2 failed
+static bool StampSetup(ID3D12CommandQueue* q) {
+    ID3D12Device* d = nullptr;
+    if (FAILED(q->GetDevice(IID_PPV_ARGS(&d))) || !d) return false;
+    D3D12_QUERY_HEAP_DESC qd{};
+    qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    qd.Count = kStampPairs * 2;
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = qd.Count * 8;
+    rd.Height = 1;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12CommandAllocator* alloc = nullptr;
+    void* mapped = nullptr;
+    if (FAILED(q->GetTimestampFrequency(&g_stampFreq)) || FAILED(d->CreateQueryHeap(&qd, IID_PPV_ARGS(&g_stampHeap))) || FAILED(d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_stampRead))) || FAILED(d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) || FAILED(g_stampRead->Map(0, nullptr, &mapped))) return false;
+    g_stampData = static_cast<const UINT64*>(mapped);
+    for (UINT i = 0; i < kStampPairs * 2; ++i) {
+        if (FAILED(d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&g_stampLists[i])))) return false;
+        g_stampLists[i]->EndQuery(g_stampHeap, D3D12_QUERY_TYPE_TIMESTAMP, i);
+        g_stampLists[i]->ResolveQueryData(g_stampHeap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, g_stampRead, static_cast<UINT64>(i) * 8);
+        g_stampLists[i]->Close();
+    }
+    return true;
+}
+std::atomic<bool> g_stampOn{false};  // off: the game's work does not come through this hook, so it only saw the mod's
+// Busy GPU time in ms and submissions since the last call, and the time they span.
+void CaptureGpuBusy(double* busyMs, double* spanMs, uint64_t* submits) {
+    *busyMs = *spanMs = 0;
+    *submits = 0;
+    if (g_stampState.load() != 1 || !g_stampFreq) return;
+    const uint64_t head = g_stampHead.load();
+    // Only pairs surely finished, and not about to be overwritten.
+    const uint64_t safe = head > 32 ? head - 32 : 0;
+    uint64_t from = g_stampTail;
+    if (safe > from + (kStampPairs - 40)) from = safe - (kStampPairs - 40);
+    UINT64 busy = 0, first = 0, last = 0;
+    for (uint64_t k = from; k < safe; ++k) {
+        const UINT i = static_cast<UINT>(k % kStampPairs) * 2;
+        const UINT64 a = g_stampData[i], b = g_stampData[i + 1];
+        if (b < a) continue;
+        busy += b - a;
+        if (!first) first = a;
+        last = b;
+        ++*submits;
+    }
+    g_stampTail = safe;
+    const double toMs = 1000.0 / static_cast<double>(g_stampFreq);
+    *busyMs = static_cast<double>(busy) * toMs;
+    *spanMs = last > first ? static_cast<double>(last - first) * toMs : 0;
+}
+
 static void STDMETHODCALLTYPE HookExecute(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists) {
     if (!g_queue.load() && q->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
         g_queue = q;
         Log("D3D game direct queue %p", q);
+    }
+    const bool stamp = q == g_queue.load() && g_stampOn.load();
+    if (stamp && g_stampState.load() == 0) {
+        static std::mutex setup;
+        std::lock_guard<std::mutex> l(setup);
+        if (g_stampState.load() == 0) {
+            const bool ok = StampSetup(q);
+            g_stampState = ok ? 1 : 2;
+            Log("D3D GPU stamps %s", ok ? "ready" : "failed");
+        }
+    }
+    if (stamp && g_stampState.load() == 1) {
+        const UINT i = static_cast<UINT>(g_stampHead.fetch_add(1) % kStampPairs) * 2;
+        ID3D12CommandList* before[1] = {g_stampLists[i]};
+        ID3D12CommandList* after[1] = {g_stampLists[i + 1]};
+        g_origExecute(q, 1, before);
+        g_origExecute(q, n, lists);
+        g_origExecute(q, 1, after);
+        return;
     }
     g_origExecute(q, n, lists);
 }

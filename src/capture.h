@@ -13,3 +13,5 @@ void* CaptureQueue();
 void CaptureSetPresentCallback(void (*fn)(void*, unsigned, unsigned, int));
 // While VR runs the flat window must not hold the game to the monitor's rate.
 void CaptureNoVsync(bool on);
+// Lab: busy GPU ms on the game's queue and how long those submissions span, since the last call.
+void CaptureGpuBusy(double* busyMs, double* spanMs, uint64_t* submits);

@@ -27,7 +27,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 91
+#define BUILD_NUMBER 93
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -1539,7 +1539,7 @@ static void OfxrApply() {
 static float g_hudDistanceSetting = 2.0f;
 static std::wstring g_iniPath;
 static std::vector<uint32_t> g_menuImage;
-static const int kMenuW = 1024, kMenuH = 1488, kMenuRows = 18;
+static const int kMenuW = 1024, kMenuH = 1560, kMenuRows = 19;
 
 static void SaveSetting(const wchar_t* name, int value) {
     WritePrivateProfileStringW(L"VR", name, std::to_wstring(value).c_str(), g_iniPath.c_str());
@@ -1609,6 +1609,12 @@ static void MenuRowText(int row, wchar_t (&name)[64], wchar_t (&value)[64]) {
         wcscpy_s(name, L"Frame generation pacing");
         wcscpy_s(value, g_fgDirector ? L"Director" : L"Framework");
         break;
+    case 17: {
+        const int every = g_skipMain.load();
+        wcscpy_s(name, L"Game's own view");
+        wcscpy_s(value, every == 1 ? L"Never (HUD freezes)" : every == 8 ? L"1 frame in 8" : every == 2 ? L"1 frame in 2" : L"1 frame in 4");
+        break;
+    }
     case 16:
         wcscpy_s(name, L"Frame overlap");
         wcscpy_s(value, g_overlapSetting ? L"On" : L"Off");
@@ -1812,6 +1818,16 @@ static void MenuChange(int dir) {
         SaveSetting(L"FrameOverlap", g_overlapSetting ? 1 : 0);
         XrSetOverlap(g_overlapSetting);
         break;
+    case 17: {
+        // Live. HudEveryFrames in the ini, the HUD redraws only when this view runs, menus still force it on.
+        static const int steps[4] = {4, 8, 1, 2};
+        int i = 0;
+        for (int k = 0; k < 4; ++k) if (steps[k] == g_skipMain.load()) i = k;
+        g_skipMain = steps[(i + (dir < 0 ? 3 : 1)) % 4];
+        SaveSetting(L"HudEveryFrames", g_skipMain.load());
+        Log("THIRD view every %d", g_skipMain.load());
+        break;
+    }
     default:
         if (dir == 0) {
             MenuClose();
@@ -3044,6 +3060,13 @@ static DWORD WINAPI ProbeThread(void*) {
                             Log("SPLIT ms: after DLSS, at output size %.2f; before right's DLSS, its scene plus left's after DLSS %.2f; so scene %.2f; DLSS %.2f", post, between, between - post, ms[2]);
                         }
                         Log("PERF GPU ms: DLSS game's view %.2f, left %.2f, right %.2f; right eye whole %.2f; mod's copies %.2f; between frame ends %.2f", ms[0], ms[1], ms[2], spanMs, copyMs, betweenMs);
+                    }
+                    {
+                        double busyMs = 0, spanMs = 0;
+                        uint64_t submits = 0;
+                        CaptureGpuBusy(&busyMs, &spanMs, &submits);
+                        const uint64_t fr = n;
+                        if (fr && submits) Log("GPUBUSY per game frame: busy %.2f ms, span %.2f ms, %.1f submissions; all of this queue, mod's included, not the compositor", busyMs / fr, spanMs / fr, static_cast<double>(submits) / fr);
                     }
                     LogMemory();
                     LogThreads();
