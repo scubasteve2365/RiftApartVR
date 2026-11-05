@@ -27,7 +27,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 94
+#define BUILD_NUMBER 95
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -195,6 +195,7 @@ static const Target kUpscalePass{"UpscalePass", 0x11df5a0, "\x85\xd2\x0f\x8e\xbf
 static const Target kSlConstants{"SlConstants", 0x1238930, "\x48\x89\x5c\x24\x08\x48\x89\x74\x24\x10"};
 static const Target kUpEval{"UpscalerEvaluate", 0x16e87b0, "\x40\x55\x53\x56\x57\x41\x54\x41\x55"};
 static const Target kUpEvalDlss{"DlssEvaluate", 0x16e8100, "\x48\x89\x5c\x24\x08\x48\x89\x74\x24\x10"};
+static const Target kFinalizeQueries{"FinalizeQueries", 0x1227c50, "\x40\x53\x56\x48\x83\xec\x48"};
 static const Target kCameraPush{"CameraPush", 0xfc7110, "\x40\x53\x57\x41\x56\x48\x81\xec\x30\x05"};
 static const size_t kManager = 0x6739a10;
     // ViewContextManager
@@ -779,6 +780,92 @@ static DWORD WINAPI ThreadSampler(void*) {
     }
 }
 
+// ---- Where a thread spends its frame: full call stacks, many samples. Lab probe, command "stacks game|render|top N". ----
+// The stack is unwound while the thread is stopped, into fixed buffers, with no logging or allocation. Addresses are named
+// after it runs again. Each sample also records how far into the game's tick it was taken.
+static uint64_t PerfNow();
+extern std::atomic<uint64_t> g_tickStartUs;
+static std::atomic<int> g_stackWant{0}, g_stackWhich{0};
+static constexpr int kStackDepth = 28;
+struct StackSample {
+    uint64_t at;
+    int depth;
+    uint64_t pc[kStackDepth];
+};
+static StackSample g_stackSamples[600];
+static void UnwindStopped(CONTEXT c, StackSample* out) {
+    out->depth = 0;
+    for (int i = 0; i < kStackDepth && c.Rip; ++i) {
+        out->pc[out->depth++] = c.Rip;
+        DWORD64 imageBase = 0;
+        PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(c.Rip, &imageBase, nullptr);
+        if (!f) {
+            // A leaf function: the return address is on top of the stack.
+            uint64_t ret = 0;
+            if (!SafeCopy(&ret, reinterpret_cast<void*>(c.Rsp), 8)) break;
+            c.Rip = ret;
+            c.Rsp += 8;
+            continue;
+        }
+        void* handlerData = nullptr;
+        DWORD64 establisher = 0;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, c.Rip, f, &c, &handlerData, &establisher, nullptr);
+    }
+}
+static std::string NameAddress(uint64_t a) {
+    uint64_t off = 0;
+    std::wstring m = ModuleOf(a, &off);
+    if (m.empty()) {
+        char b[32];
+        sprintf_s(b, "?%llx", static_cast<unsigned long long>(a));
+        return b;
+    }
+    std::string n(m.begin(), m.end());
+    const size_t dot = n.rfind('.');
+    if (dot != std::string::npos) n.resize(dot);
+    if (n == "RiftApart") n = "G";
+    char b[32];
+    sprintf_s(b, "+%llx", static_cast<unsigned long long>(off));
+    return n + b;
+}
+static DWORD WINAPI StackSampler(void*) {
+    for (;;) {
+        Sleep(200);
+        const int want = (std::min)(g_stackWant.exchange(0), static_cast<int>(sizeof(g_stackSamples) / sizeof(g_stackSamples[0])));
+        if (want <= 0) continue;
+        const int which = g_stackWhich.load();
+        const DWORD tid = which == 1 ? g_presentThreadId.load() : which == 2 ? g_topThreadId.load() : g_gameThreadId.load();
+        HANDLE h = tid && tid != GetCurrentThreadId() ? OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid) : nullptr;
+        if (!h) {
+            Log("STACKS no thread");
+            continue;
+        }
+        int got = 0;
+        const uint64_t t0 = PerfNow();
+        for (int i = 0; i < want; ++i) {
+            Sleep(2 + (i * 7) % 5);  // uneven spacing, so the samples do not lock onto the frame
+            CONTEXT c{};
+            c.ContextFlags = CONTEXT_FULL;
+            if (SuspendThread(h) == static_cast<DWORD>(-1)) break;
+            const uint64_t at = PerfNow() - g_tickStartUs.load();
+            if (GetThreadContext(h, &c)) {
+                g_stackSamples[got].at = at;
+                UnwindStopped(c, &g_stackSamples[got]);
+                ++got;
+            }
+            ResumeThread(h);
+        }
+        CloseHandle(h);
+        Log("STACKS %s thread %lu, %d samples over %.1f s", which == 1 ? "render" : which == 2 ? "top" : "game", tid, got, static_cast<double>(PerfNow() - t0) / 1e6);
+        for (int i = 0; i < got; ++i) {
+            std::string line;
+            for (int k = 0; k < g_stackSamples[i].depth; ++k) line += NameAddress(g_stackSamples[i].pc[k]) + " ";
+            Log("STK %llu %s", static_cast<unsigned long long>(g_stackSamples[i].at), line.c_str());
+        }
+        Log("STACKS done");
+    }
+}
+
 // ---- When the GPU hangs: D3D12's own recorder says which command list and which operation it stopped in. ----
 // Must be turned on before the game makes its device. DeviceDiagnostics=0 in the ini turns it off.
 static void DredEnable() {
@@ -856,10 +943,12 @@ static uint64_t PerfNow() {
     return static_cast<uint64_t>(static_cast<double>(c.QuadPart) * toUs);
 }
 static std::atomic<uint64_t> g_usFrame{0}, g_usPace{0}, g_usOffscreen{0}, g_usEyeSubmit{0}, g_usMainSubmit{0}, g_usGamePart{0}, g_perfFrames{0};
+std::atomic<uint64_t> g_tickStartUs{0};
 static void __fastcall HookRenderAll() {
     SeqNote('T');
     ++g_frames;
     g_gameThreadId = GetCurrentThreadId();
+    g_tickStartUs = PerfNow();
     {
         // Whole frame: from one arrival here to the next.
         static uint64_t last = 0;
@@ -1144,6 +1233,42 @@ static void ApplyHudView() {
 }
 static std::atomic<uint64_t> g_mainSkipped{0};
 static std::atomic<bool> g_eyeDefer{false}, g_eyeShare{false};
+// "RenderHandlerFinalizeQueries" (0x1227c50, the game's own name in its timeout message). On the render handler's job thread,
+// for a list of items: GetData on each item's GPU query (vtable +0xe8 of the device wrapper at 0x6745b20, flag 1, 8 bytes),
+// spinning with pause until each is ready, then storing the result as an int at +0x14 of the item's +0x30 record and
+// setting bits 1 and 4 at +0x1e. Lab: time it. g_queryNoSpin asks once and leaves unready items for a later frame.
+using FinalizeFn = void(__fastcall*)(int64_t, uint32_t);
+static FinalizeFn g_origFinalize;
+static std::atomic<uint64_t> g_usFinalize{0}, g_finalizeCalls{0}, g_finalizeItems{0}, g_finalizeNotReady{0};
+static std::atomic<bool> g_queryNoSpin{false};
+static void __fastcall HookFinalize(int64_t list, uint32_t count) {
+    const uint64_t t = PerfNow();
+    if (!g_queryNoSpin.load()) {
+        g_origFinalize(list, count);
+    } else {
+        void** const ctx = *reinterpret_cast<void***>(g_base + 0x6745b20);
+        using GetDataFn = int(__fastcall*)(void*, void*, int64_t*, uint32_t, uint32_t);
+        const GetDataFn getData = ctx ? reinterpret_cast<GetDataFn>((*reinterpret_cast<void***>(ctx))[0xe8 / 8]) : nullptr;
+        for (uint32_t i = 0; getData && i < count && static_cast<int>(count) > 0; ++i) {
+            uint8_t* const item = *reinterpret_cast<uint8_t**>(list + 8 + 16 * i);
+            uint8_t* const rec = *reinterpret_cast<uint8_t**>(item + 0x30);
+            void* const query = *reinterpret_cast<void**>(item + 0x38);
+            if ((rec[0x1e] & 4) != 0 || !query) continue;
+            int64_t v = 0;
+            const int r = getData(ctx, query, &v, 8, 1);
+            if (r == 0) {
+                *reinterpret_cast<uint16_t*>(rec + 0x1e) |= 5;
+                *reinterpret_cast<int32_t*>(rec + 0x14) = v < 0x7fffffff ? static_cast<int32_t>(v) : 0x7fffffff;
+            } else {
+                ++g_finalizeNotReady;
+            }
+        }
+    }
+    g_usFinalize += PerfNow() - t;
+    ++g_finalizeCalls;
+    g_finalizeItems += count;
+}
+
 static void* __fastcall HookSceneSubmit(uint8_t* view, void* a, uint32_t mask, char b) {
     if (view == ActiveView()) {
         static uint8_t saved = 1;
@@ -1252,6 +1377,10 @@ static void InstallHooks() {
     MH_Initialize();
     MH_CreateHook(g_base + kOffscreenRenderAll.rva, reinterpret_cast<void*>(&HookRenderAll), reinterpret_cast<void**>(&g_origRenderAll));
     MH_CreateHook(g_base + kSceneSubmit.rva, reinterpret_cast<void*>(&HookSceneSubmit), reinterpret_cast<void**>(&g_origSceneSubmit));
+    if (Check(kFinalizeQueries)) {
+        Log("QUERIES hook %s", MH_StatusToString(MH_CreateHook(g_base + kFinalizeQueries.rva, reinterpret_cast<void*>(&HookFinalize), reinterpret_cast<void**>(&g_origFinalize))));
+        MH_EnableHook(g_base + kFinalizeQueries.rva);
+    }
     MH_CreateHook(g_base + kCameraSubmit.rva, reinterpret_cast<void*>(&HookCameraSubmit), reinterpret_cast<void**>(&g_origCameraSubmit));
     MH_CreateHook(g_base + kViewCreate.rva, reinterpret_cast<void*>(&HookViewCreate), reinterpret_cast<void**>(&g_origViewCreate));
     MH_CreateHook(g_base + kCameraPush.rva, reinterpret_cast<void*>(&HookCameraPush), reinterpret_cast<void**>(&g_origCameraPush));
@@ -1610,7 +1739,7 @@ static void OfxrApply() {
 static float g_hudDistanceSetting = 2.0f;
 static std::wstring g_iniPath;
 static std::vector<uint32_t> g_menuImage;
-static const int kMenuW = 1024, kMenuH = 1560, kMenuRows = 19;
+static const int kMenuW = 1024, kMenuH = 1488, kMenuRows = 18;
 
 static void SaveSetting(const wchar_t* name, int value) {
     WritePrivateProfileStringW(L"VR", name, std::to_wstring(value).c_str(), g_iniPath.c_str());
@@ -1680,16 +1809,12 @@ static void MenuRowText(int row, wchar_t (&name)[64], wchar_t (&value)[64]) {
         wcscpy_s(name, L"Frame generation pacing");
         wcscpy_s(value, g_fgDirector ? L"Director" : L"Framework");
         break;
-    case 17: {
+    case 16: {
         const int v = g_hudView.load();
         wcscpy_s(name, L"Game's own view");
         wcscpy_s(value, v == 2 ? L"Never (HUD freezes)" : v == 1 ? L"Full" : L"Light, HUD only");
         break;
     }
-    case 16:
-        wcscpy_s(name, L"Frame overlap");
-        wcscpy_s(value, g_overlapSetting ? L"On" : L"Off");
-        break;
     case 15: {
         static const wchar_t* const rules[3] = {L"Zoomed shots", L"All cutscenes", L"Never (can hang)"};
         wcscpy_s(name, L"Cutscenes on a screen");
@@ -1884,12 +2009,7 @@ static void MenuChange(int dir) {
         g_cutsceneCamera = (g_cutsceneCamera.load() + (dir < 0 ? 2 : 1)) % 3;
         SaveSetting(L"CutsceneCamera", g_cutsceneCamera.load());
         break;
-    case 16:
-        g_overlapSetting = !g_overlapSetting;
-        SaveSetting(L"FrameOverlap", g_overlapSetting ? 1 : 0);
-        XrSetOverlap(g_overlapSetting);
-        break;
-    case 17: {
+    case 16: {
         // Live. HudView in the ini.
         g_hudView = (g_hudView.load() + (dir < 0 ? 2 : 1)) % 3;
         ApplyHudView();
@@ -2817,6 +2937,19 @@ static void RunCommand(const std::string& c) {
         Log("MAINMASK game's own %x, now %x", g_mainMaskSeen.load(), g_w);
         g_mainMask = g_w;
     }
+    else if (sscanf(c.c_str(), "stacks game %u", &g_w) == 1) {
+        g_stackWhich = 0;
+        g_stackWant = static_cast<int>(g_w);
+    }
+    else if (sscanf(c.c_str(), "stacks render %u", &g_w) == 1) {
+        g_stackWhich = 1;
+        g_stackWant = static_cast<int>(g_w);
+    }
+    else if (sscanf(c.c_str(), "stacks top %u", &g_w) == 1) {
+        g_stackWhich = 2;
+        g_stackWant = static_cast<int>(g_w);
+    }
+    else if (sscanf(c.c_str(), "querynospin %u", &g_w) == 1) g_queryNoSpin = g_w != 0;
     else if (c == "seqcount") {
         Log("SEQCOUNT T %u M %u s %u A %u B %u m %u x %u G %u P %u o %u n %u c %u", g_seqCount['T'].exchange(0), g_seqCount['M'].exchange(0), g_seqCount['s'].exchange(0), g_seqCount['A'].exchange(0), g_seqCount['B'].exchange(0), g_seqCount['m'].exchange(0), g_seqCount['x'].exchange(0), g_seqCount['G'].exchange(0), g_seqCount['P'].exchange(0), g_seqCount['o'].exchange(0), g_seqCount['n'].exchange(0), g_seqCount['c'].exchange(0));
     }
@@ -3001,6 +3134,7 @@ static DWORD WINAPI ProbeThread(void*) {
         Log("HUDVIEW %d", g_hudView.load());
         g_cutsceneCamera = static_cast<int>(GetPrivateProfileIntW(L"VR", L"CutsceneCamera", 0, early.c_str())) % 3;
         CreateThread(nullptr, 0, ThreadSampler, nullptr, 0, nullptr);
+        CreateThread(nullptr, 0, StackSampler, nullptr, 0, nullptr);
         if (GetPrivateProfileIntW(L"VR", L"DeviceDiagnostics", 1, early.c_str()) != 0) {
             DredEnable();
             CreateThread(nullptr, 0, DredWatch, nullptr, 0, nullptr);
@@ -3021,8 +3155,9 @@ static DWORD WINAPI ProbeThread(void*) {
     g_fgType = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"VR", L"FrameGenType", 0, ini.c_str())), 0, 3);
     g_fgTypeAtLaunch = g_fgType;
     g_fgDirector = GetPrivateProfileIntW(L"VR", L"FrameGenDirector", 0, ini.c_str()) != 0;
-    g_overlapSetting = GetPrivateProfileIntW(L"VR", L"FrameOverlap", 0, ini.c_str()) != 0;
-    XrSetOverlap(g_overlapSetting);
+    // Frame overlap is no longer a menu row: it made no measurable difference. Always off; lab command "overlap 1" for tests.
+    g_overlapSetting = false;
+    XrSetOverlap(false);
     {
         const UINT alt = GetPrivateProfileIntW(L"VR", L"AlternateEye", 0, ini.c_str());
         g_alternateSetting = alt != 0;
@@ -3159,6 +3294,7 @@ static DWORD WINAPI ProbeThread(void*) {
                     LogMemory();
                     LogThreads();
                     Log("PERF frames %llu, ms per frame: whole %.2f, pacing wait %.2f, all offscreen %.2f, eye submits %.2f, main submit %.2f", static_cast<unsigned long long>(n), g_usFrame.exchange(0) / f, g_usPace.exchange(0) / f, g_usOffscreen.exchange(0) / f, g_usEyeSubmit.exchange(0) / f, g_usMainSubmit.exchange(0) / f);
+                    Log("QUERIES ms per frame %.2f, calls %llu, items %llu, not ready %llu, mode %s", g_usFinalize.exchange(0) / f, static_cast<unsigned long long>(g_finalizeCalls.exchange(0)), static_cast<unsigned long long>(g_finalizeItems.exchange(0)), static_cast<unsigned long long>(g_finalizeNotReady.exchange(0)), g_queryNoSpin.load() ? "ask once" : "game's wait");
                 }
             }
         }
