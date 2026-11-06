@@ -30,7 +30,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 102
+#define BUILD_NUMBER 103
 #define MOD_VERSION "1.0"
 #define MOD_VERSION_W L"1.0"
 
@@ -3042,6 +3042,19 @@ static void InstallSlProbe() {
 static std::atomic<bool> g_regForce{false};
 static std::atomic<bool> g_skipLauncher{true};
 static std::atomic<bool> g_smallFlat{true};
+// The game's window in VR, 16 by 9: 2560x1440 when the main monitor has room, else 1920x1080, else 1280x720, so it never hangs
+// off a smaller screen. FlatWindowHeight in the ini (1440, 1080 or 720) picks one by hand. The window also sets the HUD's
+// resolution: 1440 gives the sharpest HUD.
+static int g_flatW = 0, g_flatH = 0;
+static void PickFlatWindow() {
+    if (g_flatW) return;
+    int want = static_cast<int>(GetPrivateProfileIntW(L"VR", L"FlatWindowHeight", 0, (g_dir + L"RiftApartVR.ini").c_str()));
+    const int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+    if (want != 1440 && want != 1080 && want != 720) want = sw >= 2560 && sh >= 1440 ? 1440 : sw >= 1920 && sh >= 1080 ? 1080 : 720;
+    g_flatH = want;
+    g_flatW = want * 16 / 9;
+    Log("FLAT window %dx%d (main monitor %dx%d)", g_flatW, g_flatH, sw, sh);
+}
 static void OverrideSetting(const wchar_t* name, void* data) {
     if (!name || !data) return;
     {
@@ -3078,8 +3091,8 @@ static void OverrideSetting(const wchar_t* name, void* data) {
         // 16 by 9 keeps HUD pieces in reach whatever the monitor. The monitor shows an eye.
         int small = -1;
         if (!_wcsicmp(name, L"Fullscreen") || !_wcsicmp(name, L"ExclusiveFullscreen") || !_wcsicmp(name, L"WindowMaximized")) small = 0;
-        else if (!_wcsicmp(name, L"WindowWidth") || !_wcsicmp(name, L"UserWindowWidth")) small = 2560;
-        else if (!_wcsicmp(name, L"WindowHeight") || !_wcsicmp(name, L"UserWindowHeight")) small = 1440;
+        else if (!_wcsicmp(name, L"WindowWidth") || !_wcsicmp(name, L"UserWindowWidth")) small = (PickFlatWindow(), g_flatW);
+        else if (!_wcsicmp(name, L"WindowHeight") || !_wcsicmp(name, L"UserWindowHeight")) small = (PickFlatWindow(), g_flatH);
         if (small >= 0) {
             if (*static_cast<int*>(data) != small) Log("REG %ls was %d, the game is told %d", name, *static_cast<int*>(data), small);
             *static_cast<int*>(data) = small;

@@ -100,7 +100,7 @@ Set these in the game's own Graphics and Display menus. Names can differ slightl
 | NVIDIA Reflex | Off | Not needed; the headset paces the game |
 | Motion Blur, Depth of Field, Chromatic Aberration, Film Grain, Vignette, Screen Shake | Off, for comfort | Camera effects made for a flat screen |
 | Shadows, Level of Detail, Hair, Ambient Occlusion | To taste. Low or Medium if you need speed | Each eye is drawn in full, so these cost twice |
-| VSync, display mode, window size | Anything | In VR the mod runs the game in a 2560x1440 window with VSync off, and your headset sets the frame rate |
+| VSync, display mode, window size | Anything | In VR the mod runs the game in a window sized to your monitor (2560x1440 or 1920x1080) with VSync off, and your headset sets the frame rate |
 
 The settings above were used for testing on an RTX 5090 with a Pimax Dream Air at 72 Hz, with a steady 72 in busy areas.
 
@@ -115,7 +115,7 @@ The settings above were used for testing on an RTX 5090 with a Pimax Dream Air a
 
 - Tested in real headsets on two setups: Pimax Dream Air through SteamVR, and Meta Quest 3 through Virtual Desktop's VDXR, with an RTX 5090. Other headsets and graphics cards should work through OpenXR but have not been tried. Reports are welcome.
 - The launcher is skipped. Splash screens and menus show on a flat screen in front of you.
-- In VR the game runs in a 2560x1440 window, and your monitor shows the left eye. The game is told VSync is off, so your headset sets the frame rate. Your saved game settings are not changed unless you save settings in the game's own menu while it runs.
+- In VR the game runs in a window sized to your monitor (2560x1440, or 1920x1080 on smaller screens; `FlatWindowHeight=1080` in `RiftApartVR.ini` picks one), and your monitor shows the left eye. The game is told VSync is off, so your headset sets the frame rate. Your saved game settings are not changed unless you save settings in the game's own menu while it runs.
 - Alternate Eye Rendering, Depth Based can make small bright lights and glows flicker between two spots, because they carry no depth for the other eye to be made from. Basic does not, but judders more.
 - One scripted ride can hang the GPU when its zoomed in cutscene shots are drawn in 3D. Cutscenes on a screen is set to Zoomed shots by default, which avoids it.
 - If something goes wrong, the log is `RiftApartVR.log` in the game folder, with earlier ones in `vrlab_logs`. Please attach it to an issue.
