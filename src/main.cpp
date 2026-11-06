@@ -27,7 +27,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 96
+#define BUILD_NUMBER 97
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -608,7 +608,63 @@ static void UpdateMode() {
 static void CreateEyeNow() { CreateEyeImpl(); }
 
 // ---- What fills memory: the whole system's commit, this process, and the card. Goes with the PERF lines. ----
+// Lab probe: ID3D12Device::CreateHeap (vtable 28, +0xe0). Fable saw the game thread spend 1.5 to 2 ms a tick inside it on RigA.
+// Counts calls, bytes and time per PERF report, and the game address that called it.
+using CreateHeapFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_HEAP_DESC*, REFIID, void**);
+static CreateHeapFn g_origCreateHeap;
+static std::atomic<uint64_t> g_heapCalls{0}, g_heapBytes{0}, g_heapUs{0}, g_heapGameThread{0};
+static std::mutex g_heapLock;
+static std::map<size_t, uint32_t> g_heapCallers;
+static uint64_t PerfNow();
+static HRESULT STDMETHODCALLTYPE HookCreateHeap(ID3D12Device* d, const D3D12_HEAP_DESC* desc, REFIID riid, void** out) {
+    const uint64_t t = PerfNow();
+    const HRESULT r = g_origCreateHeap(d, desc, riid, out);
+    g_heapUs += PerfNow() - t;
+    ++g_heapCalls;
+    if (desc) g_heapBytes += desc->SizeInBytes;
+    extern std::atomic<DWORD> g_gameThreadIdPub;
+    if (GetCurrentThreadId() == g_gameThreadIdPub.load()) ++g_heapGameThread;
+    void* frames[8] = {};
+    const USHORT n = RtlCaptureStackBackTrace(1, 8, frames, nullptr);
+    size_t caller = 0;
+    for (USHORT i = 0; i < n && !caller; ++i) {
+        const uint8_t* a = static_cast<uint8_t*>(frames[i]);
+        if (a >= g_base + g_textStart && a < g_base + g_textStart + g_textSize) caller = static_cast<size_t>(a - g_base);
+    }
+    std::lock_guard<std::mutex> l(g_heapLock);
+    ++g_heapCallers[caller];
+    return r;
+}
+static void InstallHeapProbe() {
+    static bool done = false;
+    if (done || !CaptureDevice()) return;
+    done = true;
+    void** vt = *reinterpret_cast<void***>(CaptureDevice());
+    Log("HEAP probe %s", MH_StatusToString(MH_CreateHook(vt[28], reinterpret_cast<void*>(&HookCreateHeap), reinterpret_cast<void**>(&g_origCreateHeap))));
+    MH_EnableHook(vt[28]);
+}
+static void LogHeaps(double frames) {
+    std::string top;
+    {
+        std::lock_guard<std::mutex> l(g_heapLock);
+        std::vector<std::pair<uint32_t, size_t>> v;
+        for (const auto& e : g_heapCallers) v.push_back({e.second, e.first});
+        std::sort(v.rbegin(), v.rend());
+        for (size_t i = 0; i < v.size() && i < 5; ++i) {
+            char b[40];
+            sprintf_s(b, "%zx x%u ", v[i].second, v[i].first);
+            top += b;
+        }
+        g_heapCallers.clear();
+    }
+    const uint64_t calls = g_heapCalls.exchange(0);
+    Log("HEAP CreateHeap calls %llu (%.2f per frame, game thread %llu), %.1f MB, %.2f ms per frame; callers %s", (unsigned long long)calls,
+        frames > 0 ? calls / frames : 0.0, (unsigned long long)g_heapGameThread.exchange(0), g_heapBytes.exchange(0) / 1048576.0,
+        frames > 0 ? g_heapUs.exchange(0) / 1000.0 / frames : 0.0, top.c_str());
+}
+
 static void LogMemory() {
+    InstallHeapProbe();
     MEMORYSTATUSEX m{};
     m.dwLength = sizeof(m);
     GlobalMemoryStatusEx(&m);
@@ -954,10 +1010,12 @@ static uint64_t PerfNow() {
 }
 static std::atomic<uint64_t> g_usFrame{0}, g_usPace{0}, g_usOffscreen{0}, g_usEyeSubmit{0}, g_usMainSubmit{0}, g_usGamePart{0}, g_perfFrames{0};
 std::atomic<uint64_t> g_tickStartUs{0};
+std::atomic<DWORD> g_gameThreadIdPub{0};
 static void __fastcall HookRenderAll() {
     SeqNote('T');
     ++g_frames;
     g_gameThreadId = GetCurrentThreadId();
+    g_gameThreadIdPub = GetCurrentThreadId();
     g_tickStartUs = PerfNow();
     {
         // Whole frame: from one arrival here to the next.
@@ -3409,6 +3467,7 @@ static DWORD WINAPI ProbeThread(void*) {
                         if (fr && submits) Log("GPUBUSY per game frame: busy %.2f ms, span %.2f ms, %.1f submissions; all of this queue, mod's included, not the compositor", busyMs / fr, spanMs / fr, static_cast<double>(submits) / fr);
                     }
                     LogMemory();
+                    LogHeaps(static_cast<double>(n));
                     LogThreads();
                     Log("PERF frames %llu, ms per frame: whole %.2f, pacing wait %.2f, all offscreen %.2f, eye submits %.2f, main submit %.2f", static_cast<unsigned long long>(n), g_usFrame.exchange(0) / f, g_usPace.exchange(0) / f, g_usOffscreen.exchange(0) / f, g_usEyeSubmit.exchange(0) / f, g_usMainSubmit.exchange(0) / f);
                     Log("OCCL ms per frame left %.2f right %.2f other %.2f; calls %llu %llu %llu; busy at entry %llu %llu %llu; %s",
