@@ -11,7 +11,7 @@ exit /b %RAVR_CODE%
 #>
 # Rift Apart VR installer. Copies the mod's two files and its ofxr folder (frame generation) into the game's folder,
 # or takes them out again.
-# Double-click to install. To remove the mod, run it from a command prompt with: uninstall
+# Double-click and type 1 to install or 2 to uninstall. From a command prompt: uninstall, or the game folder in quotes.
 # To choose the folder yourself, run it with the game's folder in double quotes.
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -LiteralPath $env:RAVR_BAT
@@ -28,6 +28,15 @@ function Test-VcRuntime {
 $appId = '1895880'
 $uninstall = $env:RAVR_A1 -ieq 'uninstall'
 $given = if ($uninstall) { $env:RAVR_A2 } else { $env:RAVR_A1 }
+if (-not $env:RAVR_A1) {
+    Write-Host 'Rift Apart VR'
+    Write-Host ''
+    Write-Host '  1  Install or update'
+    Write-Host '  2  Uninstall'
+    Write-Host ''
+    $choice = Read-Host 'Type 1 or 2 and press Enter'
+    if ($choice -eq '2') { $uninstall = $true } elseif ($choice -ne '1') { Write-Host 'Nothing done.'; exit 0 }
+}
 
 function Find-Game {
     $steam = $null

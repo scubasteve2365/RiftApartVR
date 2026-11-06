@@ -495,10 +495,10 @@ static void OfxrPacingUpdate();
 static void OfxrApply();
 static void OfxrPacingTick();
 static void CreateEyeNow();
-// A vendor: the game zooms onto the vendor's screen and holds. Lens 10.87 in Steve's log. A boss fight's zoom also went to
+// A vendor: the game zooms onto the vendor's screen and holds. Lens 10.87 in a tester's log. A boss fight's zoom also went to
 // 9 to 10, but moving, so it takes a very narrow lens and a held camera. Off in the menu means never.
 static std::atomic<bool> g_vendorOn{true};
-// Steve's GPU hang: a scripted ride opens with the game zoomed in, lens 10 to 20, and at the full headset view his RTX 5090 hangs on
+// A tester's GPU hang: a scripted ride opens with the game zoomed in, lens 10 to 20, and at the full headset view his RTX 5090 hangs on
 // a draw, on two drivers. On the game's own camera it rides through. So zoomed cutscene shots use that camera on the room's screen.
 // 0 zoomed shots, 1 all cutscenes, 2 never. Cause of the hang not known.
 static std::atomic<int> g_cutsceneCamera{0};
@@ -532,7 +532,7 @@ static void UpdateMode() {
         static int zoomHeld = 0, vendorOff = 0;
         const bool zoomed = vfov > 0 && vfov < 13.0;
         zoomHeld = zoomed && moved < 0.003f ? zoomHeld + 1 : 0;
-        // The numbers the rule rests on, for checking it against a real vendor in Steve's next log.
+        // The numbers the rule rests on, for checking it against a real vendor in a tester's next log.
         if (zoomed && g_labProbes) {
             static int zoomLog = 0;
             if (++zoomLog % 30 == 1) Log("VENDOR zoom lens %.2f moved %.5f held %d", vfov, moved, zoomHeld);
@@ -573,7 +573,7 @@ static void UpdateMode() {
             OfxrPacingUpdate();
         }
         // Only the title's own spots are flat. A rule on its 39.43 lens used to be here, and gameplay's aim zoom can pass through
-        // that lens: Steve's log has it at 39.41, the flat screen came on, and no menu option could stop it.
+        // that lens: a tester's log has it at 39.41, the flat screen came on, and no menu option could stop it.
         world = !atOrigin && !titleSpot;
         static bool seenWorld = false;
         if (world != seenWorld) {

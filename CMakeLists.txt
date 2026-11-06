@@ -19,7 +19,7 @@ add_library(winhttp SHARED src/main.cpp src/capture.cpp src/xr.cpp src/winhttp_s
 target_compile_features(winhttp PRIVATE cxx_std_17)
 target_compile_definitions(winhttp PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(winhttp PRIVATE minhook)
-set(OPENXR_DIR "C:/VRLab/bin/openxr_loader_1.1.65")
+set(OPENXR_DIR "C:/VRLab/bin/openxr_loader_1.1.65" CACHE PATH "Khronos OpenXR loader for Windows (include and x64/bin)")
 target_include_directories(winhttp PRIVATE third_party/minhook/include ${OPENXR_DIR}/include)
 set_property(TARGET winhttp minhook PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
 add_custom_command(TARGET winhttp POST_BUILD

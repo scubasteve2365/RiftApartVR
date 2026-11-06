@@ -1,35 +1,34 @@
-# Rift Apart VR
+# Rift Apart VR: Ratchet & Clank: Rift Apart in VR
 
-Ratchet & Clank: Rift Apart in VR. Native stereo: both eyes from the same game tick. Third person, gamepad, OpenXR, DLSS in both eyes.
+True stereo VR for Ratchet & Clank: Rift Apart. Both eyes are drawn from the same game tick, so there is no alternate-eye shimmer and no warping. You play in third person with a gamepad, in a solid 3D world that stays level around you; there are no motion controls. DLSS works in both eyes.
 
-Version 1.0.
+**Download:** see [Releases](../../releases).
+
+**Support:** Rift Apart VR is free. If you enjoy it, you can [buy me a coffee](https://buymeacoffee.com/scubasteve2365).
 
 ## What you need
 
-- Ratchet & Clank: Rift Apart on Steam (game version 3.630.1.0).
-- A PC VR headset with an OpenXR runtime: SteamVR, Virtual Desktop (VDXR), Pimax, and others.
-- A gamepad. There are no motion controls.
-- DLSS in both eyes needs an NVIDIA RTX card. On other cards choose another upscaler in the game; the eyes then draw at full size.
+- The Steam version of Ratchet & Clank: Rift Apart (game version 3.630.1.0)
+- A PC VR headset with a 64-bit OpenXR runtime. Two have been tested:
+  - SteamVR, set as your OpenXR runtime (SteamVR settings, OpenXR)
+  - Virtual Desktop's VDXR, for headsets like the Meta Quest 3
+- A gamepad
+- For DLSS in both eyes, an NVIDIA RTX card. With another upscaler chosen in the game, the eyes draw at full size
 
 ## Install
 
-1. Unzip everything into any folder, keeping `Install Rift Apart VR.bat`, `winhttp.dll`, `openxr_loader.dll` and the `ofxr` folder together.
-2. Double-click the bat file. It finds the game through Steam and copies the mod into the game's folder. If Microsoft's Visual C++ runtime is missing it offers to download it from Microsoft (only frame generation's DLSS-G type needs it).
-3. Start your headset's OpenXR runtime, then start the game from Steam.
-4. In the game's graphics settings, set Texture Quality to Medium or High (see Performance tips).
+1. Unzip the release anywhere. Keep `Install Rift Apart VR.bat`, `winhttp.dll`, `openxr_loader.dll` and the `ofxr` folder together.
+2. Double click `Install Rift Apart VR.bat` and type 1. It finds the game through Steam. If Microsoft's Visual C++ runtime is missing, it offers to download it from Microsoft; only frame generation's DLSS-G type needs it.
+3. Start SteamVR or connect Virtual Desktop, then start the game from Steam. VR starts by itself.
+4. In the game's graphics settings, set Texture Quality to Medium or High, not Ultra (see Performance tips).
 
-If it cannot find the game, or to remove the mod, run the bat file from a command prompt:
+To uninstall, run the same bat file and type 2. Your earlier `winhttp.dll`, if another mod had one, is put back. If the bat cannot find the game, run it from a command prompt with the game folder in double quotes after its name.
 
-```
-"Install Rift Apart VR.bat" "E:\SteamLibrary\steamapps\common\Ratchet & Clank - Rift Apart"
-"Install Rift Apart VR.bat" uninstall
-```
+The mod is not signed, so Windows may warn you about the bat file. It is plain text, so you can read it first. Windows Smart App Control can block unsigned mod DLLs. If it is on and the game stays flat, that is the likely cause.
 
-## Playing
+## Settings
 
-The launcher window is skipped. Splash and menus show on a flat screen in front of you. The world is a solid 3D place around you. Cutscenes play in the same 3D world, apart from very zoomed in shots.
-
-Click and hold both thumbsticks for half a second to open the VR menu. The game does not see the pad while the menu is open, or until you let go of every button after closing it.
+Click and hold both thumbsticks for half a second to open the menu in the headset. The game does not see your gamepad while it is open. Every change is saved straight away, and each setting has a short explanation at the bottom of the menu.
 
 | Control | In the menu |
 |---|---|
@@ -38,57 +37,59 @@ Click and hold both thumbsticks for half a second to open the VR menu. The game 
 | D-pad left / right, or A | Change it |
 | B, or both thumbsticks | Close |
 
-Each setting has a short explanation at the bottom of the menu.
-
 | Section | Setting | What it does |
 |---|---|---|
-| General | Recenter view | Makes where you are facing now the front. SteamVR's own recenter does the same |
-| General | World scale | How much of a miniature the world looks |
-| General | Decoupled pitch | On: the world stays level, only the camera's turn moves you. Off: the camera's tilt moves the world too. Auto: level, except on gravity walls |
+| General | Recenter view | Makes the way you face now the front. SteamVR's own recenter does the same |
+| General | World scale | How big the world feels. Higher makes it a miniature around you |
+| General | Decoupled pitch | On keeps the world level and only turns you with the camera. Off lets the camera tilt the world. Auto stays level except on gravity walls |
 | General | HUD distance | How far away the HUD panel sits |
-| General | Skip the launcher window | Next launch |
-| Performance | Frame generation | Off, 2X or 3X. Off by default. Uses OFXR-BRIDGE from the `ofxr` folder, which loads at launch once a mode is chosen. Close the OFXR tray program first |
-| Performance | Frame generation type | Optical flow, DLSS-G, or Hybrid (next launch). FSR 3.1 is listed but makes no frames yet |
-| Performance | Optical flow quality | Fast, Medium or Slow |
-| Performance | Optical flow detail | 25 to 100 percent |
-| Performance | Stereo | Native draws both eyes each frame and is the default. Alternate draws one eye per frame, faster, and turns frame generation off. Depth rebuild makes the other eye from the drawn one and needs DLSS on |
+| General | Skip the launcher window | Goes straight past the game's launcher. Next launch |
+| Performance | Frame generation | Off, 2X or 3X. Adds made-up frames between real ones, using OFXR-BRIDGE from the `ofxr` folder. Off by default |
+| Performance | Frame generation type | Optical flow, DLSS-G (RTX 40 and 50), or Hybrid (next launch). FSR 3.1 is listed but makes no frames yet |
+| Performance | Optical flow quality, detail | How carefully motion is tracked, and at what resolution |
+| Performance | Stereo | Native draws both eyes every frame and is the default. Alternate draws one eye per frame for speed; depth rebuild makes the other eye from it and needs DLSS |
 | Options | Vendor screen up close | Shop screens fill your view when the game zooms onto one |
-| Options | Aim dot | Shows where you aim, as a ring in the world |
-| Options | Cutscenes on a screen | Zoomed shots: very zoomed in cutscene shots show on a screen, the rest in 3D. Needed for a GPU hang at one scripted ride |
+| Options | Aim dot | A small ring in the world where your shots go |
+| Options | Cutscenes on a screen | Zoomed shots puts very zoomed in cutscene shots on a screen and the rest in 3D. All puts every cutscene on a screen |
 | Options | Menu sound | The menu's click: Off, Low, Medium or High |
-| Developer | Snapshot in 2 seconds | Saves pictures of what the mod shows, for reporting a problem |
-| Developer | Frame generation pacing | Framework or Director. Director can lower latency but has frozen the game on one test PC. Every launch starts on Framework |
+| Developer | Snapshot in 2 seconds | Saves pictures of what the mod is showing, for reporting a problem |
+| Developer | Frame generation pacing | Framework or Director. Every launch starts on Framework |
 | Developer | Hand frames to SteamVR from | Render thread (default) or XR thread, a test |
 
-Render resolution comes from SteamVR (its resolution setting). `Resolution=` in the ini still scales it, as a percent.
-
-Settings save to `RiftApartVR.ini` in the game's folder.
-
-In VR the game runs in a 2560x1440 window, whatever your settings say, and your monitor shows the left eye. Your saved settings are not changed by the mod, unless you save settings in the game's own menu while it runs.
-
-DLSS is used when DLSS is chosen in the game's graphics menu. With any other choice the eyes draw at full size.
-
-The mod tells the game VSync is off while in VR, so the headset sets the frame rate. `GameVSyncOff=0` in the ini keeps the game's own VSync.
+Frame generation and alternate eye cannot be used together. Whichever one is blocked is greyed out in the menu, which says why.
 
 ## Performance tips
 
-- Texture Quality: Medium or High, not Ultra. Ultra makes the game load textures in and out as you move, and in VR that costs the CPU several milliseconds every frame, even with plenty of video memory. On an RTX 5090 test PC, Medium took the busy areas from about 60 to a steady 72. Texture Filtering 16x is fine.
-- In SteamVR, set this game's Throttling Behavior to Limit at your headset's refresh rate (SteamVR Settings, Video, Per-Application Video Settings). On Auto, SteamVR can drop the game to half rate and keep it there.
-- If lowering Resolution does not raise the frame rate, the CPU is the limit, not the graphics card.
+- **Texture Quality: Medium or High, not Ultra.** Ultra makes the game load textures in and out as you move, and in VR that costs the CPU several milliseconds every frame, even with plenty of video memory. On an RTX 5090, Medium took the busiest areas from about 60 to a steady 72.
+- **SteamVR throttling:** in SteamVR settings, Video, Per-Application Video Settings, set this game's Throttling Behavior to Limit at your headset's refresh rate. On Auto, SteamVR can drop the game to half rate and keep it there.
+- Render resolution follows your headset runtime's resolution setting. If lowering it does not raise the frame rate, your CPU is the limit, not your graphics card.
 
-## Known issues
+## Good to know
 
+- Tested in real headsets on two setups: Pimax Dream Air through SteamVR, and Meta Quest 3 through Virtual Desktop's VDXR, with an RTX 5090. Other headsets and graphics cards should work through OpenXR but have not been tried. Reports are welcome.
+- The launcher is skipped. Splash screens and menus show on a flat screen in front of you.
+- In VR the game runs in a 2560x1440 window, and your monitor shows the left eye. The game is told VSync is off, so your headset sets the frame rate. Your saved game settings are not changed unless you save settings in the game's own menu while it runs.
 - One scripted ride can hang the GPU when its zoomed in cutscene shots are drawn in 3D. Cutscenes on a screen is set to Zoomed shots by default, which avoids it.
-- Frame generation and alternate eye cannot be used together. The menu greys out whichever one is blocked and says why.
-- Frame generation pacing Director has frozen the game on one test PC. Every launch starts on Framework.
-- Optical flow frame generation adds latency you may notice.
+- If something goes wrong, the log is `RiftApartVR.log` in the game folder, with earlier ones in `vrlab_logs`. Please attach it to an issue.
 
-## Logs
+## Support
 
-The mod writes `RiftApartVR.log` in the game's folder, and keeps earlier ones in `vrlab_logs`. Include them when reporting a problem.
+Rift Apart VR is free. If you enjoy it and want to support more VR mods, you can
+[buy me a coffee](https://buymeacoffee.com/scubasteve2365). Thank you!
 
-## Licence
+## Building from source
 
-MIT. Uses MinHook (BSD 2-Clause) and the OpenXR loader (Apache 2.0). DLSS files are the game's own.
+You need Visual Studio's C++ tools with CMake, and the Khronos [OpenXR loader](https://github.com/KhronosGroup/OpenXR-SDK-Source/releases) for Windows.
 
-The `ofxr` folder is a separate program, OFXR-BRIDGE by tig3rmast3r and contributors, under GPL-3.0, not under this mod's licence. Its licence, the exact upstream source commit and the patch used for this build are in that folder (`SOURCE.txt`, `source\riftapartvr.patch`).
+```
+cmake -S . -B ..\build\cmake -A x64 -DOPENXR_DIR=<OpenXR loader folder>
+cmake --build ..\build\cmake --config Release
+```
+
+`winhttp.dll` and `openxr_loader.dll` land in `..\build`. The `ofxr` folder is built separately from OFXR-BRIDGE's source; see `ofxr\SOURCE.txt` in the release.
+
+## Credits
+
+Built with [MinHook](https://github.com/TsudaKageyu/minhook) (BSD 2-Clause) and the Khronos [OpenXR loader](https://github.com/KhronosGroup/OpenXR-SDK-Source) (Apache-2.0). Frame generation is [OFXR-BRIDGE](https://github.com/tig3rmast3r/OFXR-Bridge) by tig3rmast3r and contributors (GPL-3.0), shipped as a separate program in the `ofxr` folder with its licence, source commit and our small patch. DLSS comes from the game's own files.
+
+Rift Apart VR is MIT licensed, by scubasteve2365. This is a fan mod, not made or approved by Insomniac Games, Nixxes or Sony Interactive Entertainment. It contains no game files.
