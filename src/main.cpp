@@ -828,9 +828,18 @@ static std::string NameAddress(uint64_t a) {
     sprintf_s(b, "+%llx", static_cast<unsigned long long>(off));
     return n + b;
 }
+static std::atomic<bool> g_autoStacks{false};  // [Lab] AutoStacks: game then busiest thread, every 90 s in 3D
 static DWORD WINAPI StackSampler(void*) {
+    uint64_t nextAuto = GetTickCount64() + 90000;
+    int autoStep = 0;
     for (;;) {
         Sleep(200);
+        if (g_autoStacks.load() && g_xrEyes.load() && GetTickCount64() >= nextAuto && g_stackWant.load() == 0) {
+            g_stackWhich = autoStep % 2 == 0 ? 0 : 2;
+            g_stackWant = 300;
+            nextAuto = GetTickCount64() + (autoStep % 2 == 0 ? 3000 : 87000);
+            ++autoStep;
+        }
         const int want = (std::min)(g_stackWant.exchange(0), static_cast<int>(sizeof(g_stackSamples) / sizeof(g_stackSamples[0])));
         if (want <= 0) continue;
         const int which = g_stackWhich.load();
@@ -3185,6 +3194,7 @@ static DWORD WINAPI ProbeThread(void*) {
         CreateThread(nullptr, 0, ThreadSampler, nullptr, 0, nullptr);
         CreateThread(nullptr, 0, StackSampler, nullptr, 0, nullptr);
         // Lab only: PIX's GPU capture layer must be in the process before the game makes its device. RigB path, off by default.
+        g_autoStacks = GetPrivateProfileIntW(L"Lab", L"AutoStacks", 1, early.c_str()) != 0;
         if (GetPrivateProfileIntW(L"Lab", L"PixCapturer", 0, early.c_str()) != 0) {
             const HMODULE pix = LoadLibraryW(L"C:\\VRLab\\bin\\pix\\Microsoft PIX\\2603.25\\WinPixGpuCapturer.dll");
             Log("PIX capturer %s", pix ? "loaded" : "not loaded");
