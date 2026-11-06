@@ -19,6 +19,7 @@
 #include <atomic>
 #include <cstddef>
 #include <map>
+#include <set>
 #include <mutex>
 #include <cmath>
 #include <cstdarg>
@@ -27,7 +28,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 97
+#define BUILD_NUMBER 98
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -2824,6 +2825,21 @@ static std::atomic<bool> g_skipLauncher{true};
 static std::atomic<bool> g_smallFlat{true};
 static void OverrideSetting(const wchar_t* name, void* data) {
     if (!name || !data) return;
+    {
+        // Every DWORD setting the game reads, once, with the value it had: so a log shows the player's game settings.
+        static std::mutex m;
+        static std::set<std::wstring> seen;
+        std::lock_guard<std::mutex> l(m);
+        if (seen.size() < 200 && seen.insert(name).second) Log("GAMESET %ls %d", name, *static_cast<int*>(data));
+    }
+    // The game paces itself to VSync and its RefreshRate setting even when the flat window is not shown at that rate. In VR the
+    // headset sets the pace, so the game is told VSync is off (RigB was held at 60 by this). GameVSyncOff=0 in the ini to keep it.
+    if (!_wcsicmp(name, L"VSync") && GetPrivateProfileIntW(L"VR", L"GameVSyncOff", 1, (g_dir + L"RiftApartVR.ini").c_str()) != 0 &&
+        static_cast<int>(GetPrivateProfileIntW(L"Force", L"VSync", -1, (g_dir + L"RiftApartVR.ini").c_str())) < 0) {
+        if (*static_cast<int*>(data) != 0) Log("REG VSync was %d, the game is told 0", *static_cast<int*>(data));
+        *static_cast<int*>(data) = 0;
+        return;
+    }
     if (g_skipLauncher && !_wcsicmp(name, L"ShowLauncher")) {
         Log("REG ShowLauncher was %d, the game is told 0", *static_cast<int*>(data));
         *static_cast<int*>(data) = 0;
