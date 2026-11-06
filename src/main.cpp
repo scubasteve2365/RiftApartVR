@@ -1241,10 +1241,48 @@ using FinalizeFn = void(__fastcall*)(int64_t, uint32_t);
 static FinalizeFn g_origFinalize;
 static std::atomic<uint64_t> g_usFinalize{0}, g_finalizeCalls{0}, g_finalizeItems{0}, g_finalizeNotReady{0};
 static std::atomic<bool> g_queryNoSpin{false};
+static std::atomic<int> g_queryDump{0};
+// Lab: what the query items are. Up to 60 items of one call: record words, the value, and any text the words point at.
+static void DumpQueryItems(int64_t list, uint32_t count) {
+    Log("QDUMP call with %u items, list %llx", count, static_cast<unsigned long long>(list));
+    for (uint32_t i = 0; i < count && i < 60; ++i) {
+        uint64_t pair[2] = {};
+        SafeCopy(pair, reinterpret_cast<void*>(list + 8 + 16 * i - 8), 16);
+        uint8_t* item = nullptr;
+        SafeCopy(&item, reinterpret_cast<void*>(list + 8 + 16 * i), 8);
+        uint64_t iw[8] = {}, rw[6] = {};
+        if (item) SafeCopy(iw, item, sizeof(iw));
+        uint8_t* rec = reinterpret_cast<uint8_t*>(iw[6]);
+        if (rec) SafeCopy(rw, rec, sizeof(rw));
+        std::string text;
+        for (uint64_t w : {iw[0], iw[1], iw[2], iw[3], iw[4], iw[5], iw[7], rw[0], rw[1], rw[3], rw[4], rw[5], pair[0]}) {
+            char b[48] = {};
+            if (w > 0x10000 && SafeCopy(b, reinterpret_cast<void*>(w), 40)) {
+                int n = 0;
+                while (n < 40 && b[n] >= 32 && b[n] < 127) ++n;
+                if (n >= 4 && (b[n] == 0 || n == 40)) {
+                    b[n] = 0;
+                    text += std::string("'") + b + "' ";
+                }
+            }
+        }
+        int32_t value = 0;
+        uint16_t flags = 0;
+        if (rec) {
+            SafeCopy(&value, rec + 0x14, 4);
+            SafeCopy(&flags, rec + 0x1e, 2);
+        }
+        Log("QDUMP %u pairword %llx item %p: %llx %llx %llx %llx %llx %llx q %llx | rec %p: %llx %llx %llx value %d flags %x %s", i,
+            static_cast<unsigned long long>(pair[0]), item, (unsigned long long)iw[0], (unsigned long long)iw[1], (unsigned long long)iw[2],
+            (unsigned long long)iw[3], (unsigned long long)iw[4], (unsigned long long)iw[5], (unsigned long long)iw[7], rec,
+            (unsigned long long)rw[0], (unsigned long long)rw[1], (unsigned long long)rw[2], value, flags, text.c_str());
+    }
+}
 static void __fastcall HookFinalize(int64_t list, uint32_t count) {
     const uint64_t t = PerfNow();
     if (!g_queryNoSpin.load()) {
         g_origFinalize(list, count);
+        if (g_queryDump.load() > 0 && g_queryDump.fetch_sub(1) > 0) DumpQueryItems(list, count);
     } else {
         void** const ctx = *reinterpret_cast<void***>(g_base + 0x6745b20);
         using GetDataFn = int(__fastcall*)(void*, void*, int64_t*, uint32_t, uint32_t);
@@ -2950,6 +2988,7 @@ static void RunCommand(const std::string& c) {
         g_stackWant = static_cast<int>(g_w);
     }
     else if (sscanf(c.c_str(), "querynospin %u", &g_w) == 1) g_queryNoSpin = g_w != 0;
+    else if (sscanf(c.c_str(), "querydump %u", &g_w) == 1) g_queryDump = static_cast<int>(g_w);
     else if (c == "seqcount") {
         Log("SEQCOUNT T %u M %u s %u A %u B %u m %u x %u G %u P %u o %u n %u c %u", g_seqCount['T'].exchange(0), g_seqCount['M'].exchange(0), g_seqCount['s'].exchange(0), g_seqCount['A'].exchange(0), g_seqCount['B'].exchange(0), g_seqCount['m'].exchange(0), g_seqCount['x'].exchange(0), g_seqCount['G'].exchange(0), g_seqCount['P'].exchange(0), g_seqCount['o'].exchange(0), g_seqCount['n'].exchange(0), g_seqCount['c'].exchange(0));
     }
