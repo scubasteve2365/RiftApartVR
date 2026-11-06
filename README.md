@@ -47,6 +47,14 @@ In VR the game runs in a 2560x1440 window, whatever your settings say, and your 
 
 DLSS is used when DLSS is chosen in the game's graphics menu. With any other choice the eyes draw at full size.
 
+The mod tells the game VSync is off while in VR, so the headset sets the frame rate. `GameVSyncOff=0` in the ini keeps the game's own VSync.
+
+## Performance tips
+
+- Texture Quality: Medium or High, not Ultra. Ultra makes the game load textures in and out as you move, and in VR that costs the CPU several milliseconds every frame, even with plenty of video memory. On an RTX 5090 test PC, Medium took the busy areas from about 60 to a steady 72. Texture Filtering 16x is fine.
+- In SteamVR, set this game's Throttling Behavior to Limit at your headset's refresh rate (SteamVR Settings, Video, Per-Application Video Settings). On Auto, SteamVR can drop the game to half rate and keep it there.
+- If lowering Resolution does not raise the frame rate, the CPU is the limit, not the graphics card.
+
 ## Licence
 
 MIT. Uses MinHook (BSD 2-Clause) and the OpenXR loader (Apache 2.0). DLSS files are the game's own.
