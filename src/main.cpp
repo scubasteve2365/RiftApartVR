@@ -30,7 +30,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 99
+#define BUILD_NUMBER 100
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -1313,6 +1313,17 @@ static FinalizeFn g_origFinalize;
 static std::atomic<uint64_t> g_usFinalize{0}, g_finalizeCalls{0}, g_finalizeItems{0}, g_finalizeNotReady{0};
 static std::atomic<bool> g_queryNoSpin{false};
 static std::atomic<int> g_queryDump{0};
+// 0 the game's own wait. 1 deferred: flush as the game does, ask each query once, keep the ones not ready with the call count, and
+// ask those first on later calls; after 6 calls they are dropped (the game reissues them). g_queryNoSpin (lab) is the old ask-once.
+static std::atomic<int> g_queryMode{0};
+struct PendingQuery {
+    uint8_t* rec;
+    void* query;
+    uint64_t call;
+};
+static std::vector<PendingQuery> g_pendingQueries;
+static uint64_t g_finalizeCall = 0;
+static std::atomic<uint64_t> g_deferLate{0}, g_deferDropped{0}, g_deferPending{0};
 // Lab: what the query items are. Up to 60 items of one call: record words, the value, and any text the words point at.
 static void DumpQueryItems(int64_t list, uint32_t count) {
     Log("QDUMP call with %u items, list %llx", count, static_cast<unsigned long long>(list));
@@ -1351,7 +1362,52 @@ static void DumpQueryItems(int64_t list, uint32_t count) {
 }
 static void __fastcall HookFinalize(int64_t list, uint32_t count) {
     const uint64_t t = PerfNow();
-    if (!g_queryNoSpin.load()) {
+    if (g_queryMode.load() == 1 && !g_queryNoSpin.load()) {
+        // Same flush the game does first (0x1289c30 with the device wrapper at 0x6745b20 and 1), then no waiting.
+        using FlushFn = bool(__fastcall*)(void*, char);
+        reinterpret_cast<FlushFn>(g_base + 0x1289c30)(g_base + 0x6745b20, 1);
+        void** const ctx = *reinterpret_cast<void***>(g_base + 0x6745b20);
+        using GetDataFn = int(__fastcall*)(void*, void*, int64_t*, uint32_t, uint32_t);
+        const GetDataFn getData = ctx ? reinterpret_cast<GetDataFn>((*reinterpret_cast<void***>(ctx))[0xe8 / 8]) : nullptr;
+        const auto store = [](uint8_t* rec, int64_t v) {
+            *reinterpret_cast<uint16_t*>(rec + 0x1e) |= 5;
+            *reinterpret_cast<int32_t*>(rec + 0x14) = v < 0x7fffffff ? static_cast<int32_t>(v) : 0x7fffffff;
+        };
+        ++g_finalizeCall;
+        if (getData) {
+            // Older ones first.
+            size_t keep = 0;
+            for (size_t i = 0; i < g_pendingQueries.size(); ++i) {
+                PendingQuery pq = g_pendingQueries[i];
+                if ((pq.rec[0x1e] & 4) != 0) continue;  // the game has it already
+                int64_t v = 0;
+                const int r = getData(ctx, pq.query, &v, 8, 1);
+                if (r == 0) {
+                    store(pq.rec, v);
+                    ++g_deferLate;
+                } else if (r == 1 && g_finalizeCall - pq.call < 6) {
+                    g_pendingQueries[keep++] = pq;
+                } else {
+                    ++g_deferDropped;
+                }
+            }
+            g_pendingQueries.resize(keep);
+            for (uint32_t i = 0; i < count && static_cast<int>(count) > 0; ++i) {
+                uint8_t* const item = *reinterpret_cast<uint8_t**>(list + 8 + 16 * i);
+                uint8_t* const rec = *reinterpret_cast<uint8_t**>(item + 0x30);
+                void* const query = *reinterpret_cast<void**>(item + 0x38);
+                if ((rec[0x1e] & 4) != 0 || !query) continue;
+                int64_t v = 0;
+                const int r = getData(ctx, query, &v, 8, 1);
+                if (r == 0) store(rec, v);
+                else if (r == 1) {
+                    g_pendingQueries.push_back({rec, query, g_finalizeCall});
+                    ++g_finalizeNotReady;
+                }
+            }
+            g_deferPending = g_pendingQueries.size();
+        }
+    } else if (!g_queryNoSpin.load()) {
         g_origFinalize(list, count);
         if (g_queryDump.load() > 0 && g_queryDump.fetch_sub(1) > 0) DumpQueryItems(list, count);
     } else {
@@ -3239,6 +3295,10 @@ static void RunCommand(const std::string& c) {
         g_stackWant = static_cast<int>(g_w);
     }
     else if (sscanf(c.c_str(), "querynospin %u", &g_w) == 1) g_queryNoSpin = g_w != 0;
+    else if (sscanf(c.c_str(), "querymode %u", &g_w) == 1) {
+        g_queryMode = static_cast<int>(g_w);
+        Log("QUERIES mode %s", g_w == 1 ? "deferred" : "game's wait");
+    }
     else if (sscanf(c.c_str(), "handoff %u", &g_w) == 1) {
         g_frameHandoffXr = g_w != 0;
         XrSetEndOnWorker(g_w != 0);
@@ -3445,6 +3505,7 @@ static DWORD WINAPI ProbeThread(void*) {
         g_occlSkip = 0;  // test row removed in build 99; lab command occlskip still works
         g_menuSound = static_cast<int>(GetPrivateProfileIntW(L"VR", L"MenuSound", 2, early.c_str())) & 3;
         g_frameHandoffXr = GetPrivateProfileIntW(L"VR", L"FrameHandoffXr", 0, early.c_str()) != 0;
+        g_queryMode = static_cast<int>(GetPrivateProfileIntW(L"VR", L"QueryDeferred", 0, early.c_str())) != 0 ? 1 : 0;
         Log("OCCLWAIT mode %d", g_occlSkip.load());
         Log("QUERYWAIT %s", g_queryNoSpin.load() ? "off" : "on");
         ApplyHudView();
@@ -3516,6 +3577,10 @@ static DWORD WINAPI ProbeThread(void*) {
     g_hudDistanceSetting = GetPrivateProfileIntW(L"VR", L"HudDistanceCm", 200, ini.c_str()) / 100.0f;
     XrSetHud(2.2f * g_hudDistanceSetting / 2.0f, g_hudDistanceSetting, 0.1f);
     Log("INI AutoStart %d Resolution %d WorldScale %.2f Pace %d", autoStart ? 1 : 0, resolution, g_worldScale.load(), g_pace.load() ? 1 : 0);
+    Log("SETTINGS pitch %d hud %.2f m skip launcher %d | frame gen %d type %d quality %d detail %d pacing %s stereo %s | vendor %d aim dot %d cutscenes %d menu sound %d | hand-off %s queries %s",
+        g_levelCamera.load(), g_hudDistanceSetting, g_skipLauncherSetting ? 1 : 0, g_fgMode, g_fgType, g_fgPreset, g_fgScale, g_fgDirector ? "Director" : "Framework",
+        !g_alternateSetting ? "native" : g_rebuildSetting ? "alternate rebuild" : "alternate plain", g_vendorOn ? 1 : 0, g_aimDot.load(), g_cutsceneCamera.load(), g_menuSound.load(),
+        g_frameHandoffXr.load() ? "XR thread" : "render thread", g_queryMode.load() == 1 ? "deferred" : "game's wait");
     const std::wstring cmdPath = g_dir + L"vrlab_command.txt";
     DeleteFileW(cmdPath.c_str());
     long pos = 0;
@@ -3624,6 +3689,7 @@ static DWORD WINAPI ProbeThread(void*) {
                         (unsigned long long)g_occlCalls[0].exchange(0), (unsigned long long)g_occlCalls[1].exchange(0), (unsigned long long)g_occlCalls[2].exchange(0),
                         (unsigned long long)g_occlBusy[0].exchange(0), (unsigned long long)g_occlBusy[1].exchange(0), (unsigned long long)g_occlBusy[2].exchange(0),
                         g_occlSkip.load() == 2 ? "skip all" : g_occlSkip.load() == 1 ? "skip game's view" : "game's wait");
+                    if (g_queryMode.load() == 1) Log("QUERIES deferred: read late %llu, dropped %llu, waiting now %llu", (unsigned long long)g_deferLate.exchange(0), (unsigned long long)g_deferDropped.exchange(0), (unsigned long long)g_deferPending.load());
                     Log("QUERIES ms per frame %.2f, calls %llu, items %llu, not ready %llu, mode %s", g_usFinalize.exchange(0) / f, static_cast<unsigned long long>(g_finalizeCalls.exchange(0)), static_cast<unsigned long long>(g_finalizeItems.exchange(0)), static_cast<unsigned long long>(g_finalizeNotReady.exchange(0)), g_queryNoSpin.load() ? "ask once" : "game's wait");
                 }
             }
