@@ -27,7 +27,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 95
+#define BUILD_NUMBER 96
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -196,6 +196,7 @@ static const Target kSlConstants{"SlConstants", 0x1238930, "\x48\x89\x5c\x24\x08
 static const Target kUpEval{"UpscalerEvaluate", 0x16e87b0, "\x40\x55\x53\x56\x57\x41\x54\x41\x55"};
 static const Target kUpEvalDlss{"DlssEvaluate", 0x16e8100, "\x48\x89\x5c\x24\x08\x48\x89\x74\x24\x10"};
 static const Target kFinalizeQueries{"FinalizeQueries", 0x1227c50, "\x40\x53\x56\x48\x83\xec\x48"};
+static const Target kOcclUpdate{"OcclUpdate", 0x1188fa0, "\x48\x8b\xc4\x48\x89\x58\x08\x48\x89\x70\x10\x48"};
 static const Target kCameraPush{"CameraPush", 0xfc7110, "\x40\x53\x57\x41\x56\x48\x81\xec\x30\x05"};
 static const size_t kManager = 0x6739a10;
     // ViewContextManager
@@ -1316,6 +1317,26 @@ static void __fastcall HookFinalize(int64_t list, uint32_t count) {
     g_finalizeItems += count;
 }
 
+// The occlusion step of a view's scene submit (0x1188fa0, called at 0x12bb8f4 with the view's +0x1bf0 object, the view, the
+// pass mask). While the object's byte +0x187 is set it waits on its condition variable (+0x230, lock +0x232, 100 ms steps):
+// last frame's occlusion data for this view is not done yet. Mask bit 1 clear makes it skip occlusion for the frame.
+// Lab: time it per view; occlskip 1 skips occlusion for a view whose data is still busy instead of waiting.
+using OcclFn = uint64_t(__fastcall*)(uint8_t*, uint8_t*, uint64_t, char);
+static OcclFn g_origOccl;
+static std::atomic<uint64_t> g_usOccl[3], g_occlCalls[3], g_occlBusy[3];
+static std::atomic<bool> g_occlSkip{false};
+static uint64_t __fastcall HookOccl(uint8_t* occl, uint8_t* view, uint64_t mask, char flag) {
+    const int k = view == g_eyeA.load() ? 0 : view == g_eyeB.load() ? 1 : 2;
+    const bool busy = occl && *(occl + 0x187) != 0;
+    if (busy) ++g_occlBusy[k];
+    if (busy && g_occlSkip.load()) mask &= ~1ull;
+    const uint64_t t = PerfNow();
+    const uint64_t r = g_origOccl(occl, view, mask, flag);
+    g_usOccl[k] += PerfNow() - t;
+    ++g_occlCalls[k];
+    return r;
+}
+
 static void* __fastcall HookSceneSubmit(uint8_t* view, void* a, uint32_t mask, char b) {
     if (view == ActiveView()) {
         static uint8_t saved = 1;
@@ -1424,6 +1445,10 @@ static void InstallHooks() {
     MH_Initialize();
     MH_CreateHook(g_base + kOffscreenRenderAll.rva, reinterpret_cast<void*>(&HookRenderAll), reinterpret_cast<void**>(&g_origRenderAll));
     MH_CreateHook(g_base + kSceneSubmit.rva, reinterpret_cast<void*>(&HookSceneSubmit), reinterpret_cast<void**>(&g_origSceneSubmit));
+    if (Check(kOcclUpdate)) {
+        Log("OCCL hook %s", MH_StatusToString(MH_CreateHook(g_base + kOcclUpdate.rva, reinterpret_cast<void*>(&HookOccl), reinterpret_cast<void**>(&g_origOccl))));
+        MH_EnableHook(g_base + kOcclUpdate.rva);
+    }
     if (Check(kFinalizeQueries)) {
         Log("QUERIES hook %s", MH_StatusToString(MH_CreateHook(g_base + kFinalizeQueries.rva, reinterpret_cast<void*>(&HookFinalize), reinterpret_cast<void**>(&g_origFinalize))));
         MH_EnableHook(g_base + kFinalizeQueries.rva);
@@ -1786,7 +1811,7 @@ static void OfxrApply() {
 static float g_hudDistanceSetting = 2.0f;
 static std::wstring g_iniPath;
 static std::vector<uint32_t> g_menuImage;
-static const int kMenuW = 1024, kMenuH = 1488, kMenuRows = 18;
+static const int kMenuW = 1024, kMenuH = 1560, kMenuRows = 19;
 
 static void SaveSetting(const wchar_t* name, int value) {
     WritePrivateProfileStringW(L"VR", name, std::to_wstring(value).c_str(), g_iniPath.c_str());
@@ -1862,6 +1887,10 @@ static void MenuRowText(int row, wchar_t (&name)[64], wchar_t (&value)[64]) {
         wcscpy_s(value, v == 2 ? L"Never (HUD freezes)" : v == 1 ? L"Full" : L"Light, HUD only");
         break;
     }
+    case 17:
+        wcscpy_s(name, L"Wait for GPU visibility tests (test)");
+        wcscpy_s(value, g_queryNoSpin.load() ? L"Off" : L"On, game's normal");
+        break;
     case 15: {
         static const wchar_t* const rules[3] = {L"Zoomed shots", L"All cutscenes", L"Never (can hang)"};
         wcscpy_s(name, L"Cutscenes on a screen");
@@ -2064,6 +2093,12 @@ static void MenuChange(int dir) {
         Log("HUDVIEW %d", g_hudView.load());
         break;
     }
+    case 17:
+        // Live. Off: the render handler asks each visibility query once instead of spinning until the GPU has answered.
+        g_queryNoSpin = !g_queryNoSpin.load();
+        SaveSetting(L"QueryWait", g_queryNoSpin.load() ? 0 : 1);
+        Log("QUERYWAIT %s", g_queryNoSpin.load() ? "off" : "on");
+        break;
     default:
         if (dir == 0) {
             MenuClose();
@@ -2997,6 +3032,7 @@ static void RunCommand(const std::string& c) {
         g_stackWant = static_cast<int>(g_w);
     }
     else if (sscanf(c.c_str(), "querynospin %u", &g_w) == 1) g_queryNoSpin = g_w != 0;
+    else if (sscanf(c.c_str(), "occlskip %u", &g_w) == 1) g_occlSkip = g_w != 0;
     else if (sscanf(c.c_str(), "querydump %u", &g_w) == 1) g_queryDump = static_cast<int>(g_w);
     else if (sscanf(c.c_str(), "pixcapture %u %63s", &g_w, g_text) == 2) {
         // Lab: PIX programmatic capture straight to a file, needs [Lab] PixCapturer=1 at launch.
@@ -3188,6 +3224,8 @@ static DWORD WINAPI ProbeThread(void*) {
         g_skipLauncher = GetPrivateProfileIntW(L"VR", L"SkipLauncher", 1, early.c_str()) != 0;
         g_smallFlat = GetPrivateProfileIntW(L"VR", L"SmallFlatView", 1, early.c_str()) != 0;
         g_hudView = static_cast<int>(GetPrivateProfileIntW(L"VR", L"HudView", 0, early.c_str())) % 3;
+        g_queryNoSpin = GetPrivateProfileIntW(L"VR", L"QueryWait", 1, early.c_str()) == 0;
+        Log("QUERYWAIT %s", g_queryNoSpin.load() ? "off" : "on");
         ApplyHudView();
         Log("HUDVIEW %d", g_hudView.load());
         g_cutsceneCamera = static_cast<int>(GetPrivateProfileIntW(L"VR", L"CutsceneCamera", 0, early.c_str())) % 3;
@@ -3358,6 +3396,11 @@ static DWORD WINAPI ProbeThread(void*) {
                     LogMemory();
                     LogThreads();
                     Log("PERF frames %llu, ms per frame: whole %.2f, pacing wait %.2f, all offscreen %.2f, eye submits %.2f, main submit %.2f", static_cast<unsigned long long>(n), g_usFrame.exchange(0) / f, g_usPace.exchange(0) / f, g_usOffscreen.exchange(0) / f, g_usEyeSubmit.exchange(0) / f, g_usMainSubmit.exchange(0) / f);
+                    Log("OCCL ms per frame left %.2f right %.2f other %.2f; calls %llu %llu %llu; busy at entry %llu %llu %llu; %s",
+                        g_usOccl[0].exchange(0) / f, g_usOccl[1].exchange(0) / f, g_usOccl[2].exchange(0) / f,
+                        (unsigned long long)g_occlCalls[0].exchange(0), (unsigned long long)g_occlCalls[1].exchange(0), (unsigned long long)g_occlCalls[2].exchange(0),
+                        (unsigned long long)g_occlBusy[0].exchange(0), (unsigned long long)g_occlBusy[1].exchange(0), (unsigned long long)g_occlBusy[2].exchange(0),
+                        g_occlSkip.load() ? "skip when busy" : "game's wait");
                     Log("QUERIES ms per frame %.2f, calls %llu, items %llu, not ready %llu, mode %s", g_usFinalize.exchange(0) / f, static_cast<unsigned long long>(g_finalizeCalls.exchange(0)), static_cast<unsigned long long>(g_finalizeItems.exchange(0)), static_cast<unsigned long long>(g_finalizeNotReady.exchange(0)), g_queryNoSpin.load() ? "ask once" : "game's wait");
                 }
             }
