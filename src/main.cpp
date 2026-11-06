@@ -1324,12 +1324,15 @@ static void __fastcall HookFinalize(int64_t list, uint32_t count) {
 using OcclFn = uint64_t(__fastcall*)(uint8_t*, uint8_t*, uint64_t, char);
 static OcclFn g_origOccl;
 static std::atomic<uint64_t> g_usOccl[3], g_occlCalls[3], g_occlBusy[3];
-static std::atomic<bool> g_occlSkip{false};
+// Fable (2026-11-05, static): the wait is for +0x188, set by the render thread's OcclDepthBufferReadback pass of last
+// frame. 0 game's wait, 1 skip it for the game's own view only, 2 skip it for every view. "busy" counts waits that would happen.
+static std::atomic<int> g_occlSkip{0};
 static uint64_t __fastcall HookOccl(uint8_t* occl, uint8_t* view, uint64_t mask, char flag) {
     const int k = view == g_eyeA.load() ? 0 : view == g_eyeB.load() ? 1 : 2;
-    const bool busy = occl && *(occl + 0x187) != 0;
+    const bool busy = occl && *(occl + 0x187) != 0 && *(occl + 0x188) == 0;
     if (busy) ++g_occlBusy[k];
-    if (busy && g_occlSkip.load()) mask &= ~1ull;
+    const int mode = g_occlSkip.load();
+    if (busy && (mode == 2 || (mode == 1 && k == 2))) mask &= ~1ull;
     const uint64_t t = PerfNow();
     const uint64_t r = g_origOccl(occl, view, mask, flag);
     g_usOccl[k] += PerfNow() - t;
@@ -1811,7 +1814,7 @@ static void OfxrApply() {
 static float g_hudDistanceSetting = 2.0f;
 static std::wstring g_iniPath;
 static std::vector<uint32_t> g_menuImage;
-static const int kMenuW = 1024, kMenuH = 1560, kMenuRows = 19;
+static const int kMenuW = 1024, kMenuH = 1632, kMenuRows = 20;
 
 static void SaveSetting(const wchar_t* name, int value) {
     WritePrivateProfileStringW(L"VR", name, std::to_wstring(value).c_str(), g_iniPath.c_str());
@@ -1887,6 +1890,10 @@ static void MenuRowText(int row, wchar_t (&name)[64], wchar_t (&value)[64]) {
         wcscpy_s(value, v == 2 ? L"Never (HUD freezes)" : v == 1 ? L"Full" : L"Light, HUD only");
         break;
     }
+    case 18:
+        wcscpy_s(name, L"Occlusion wait (test)");
+        wcscpy_s(value, g_occlSkip.load() == 2 ? L"Skip for all views" : g_occlSkip.load() == 1 ? L"Skip for game's view" : L"On, game's normal");
+        break;
     case 17:
         wcscpy_s(name, L"Wait for GPU visibility tests (test)");
         wcscpy_s(value, g_queryNoSpin.load() ? L"Off" : L"On, game's normal");
@@ -2098,6 +2105,12 @@ static void MenuChange(int dir) {
         g_queryNoSpin = !g_queryNoSpin.load();
         SaveSetting(L"QueryWait", g_queryNoSpin.load() ? 0 : 1);
         Log("QUERYWAIT %s", g_queryNoSpin.load() ? "off" : "on");
+        break;
+    case 18:
+        // Live. Skips the occlusion step of a view whose last-frame data is not back yet, instead of waiting.
+        g_occlSkip = (g_occlSkip.load() + (dir < 0 ? 2 : 1)) % 3;
+        SaveSetting(L"OcclusionWait", g_occlSkip.load());
+        Log("OCCLWAIT mode %d", g_occlSkip.load());
         break;
     default:
         if (dir == 0) {
@@ -3032,7 +3045,7 @@ static void RunCommand(const std::string& c) {
         g_stackWant = static_cast<int>(g_w);
     }
     else if (sscanf(c.c_str(), "querynospin %u", &g_w) == 1) g_queryNoSpin = g_w != 0;
-    else if (sscanf(c.c_str(), "occlskip %u", &g_w) == 1) g_occlSkip = g_w != 0;
+    else if (sscanf(c.c_str(), "occlskip %u", &g_w) == 1) g_occlSkip = static_cast<int>(g_w % 3);
     else if (sscanf(c.c_str(), "querydump %u", &g_w) == 1) g_queryDump = static_cast<int>(g_w);
     else if (sscanf(c.c_str(), "pixcapture %u %63s", &g_w, g_text) == 2) {
         // Lab: PIX programmatic capture straight to a file, needs [Lab] PixCapturer=1 at launch.
@@ -3225,6 +3238,8 @@ static DWORD WINAPI ProbeThread(void*) {
         g_smallFlat = GetPrivateProfileIntW(L"VR", L"SmallFlatView", 1, early.c_str()) != 0;
         g_hudView = static_cast<int>(GetPrivateProfileIntW(L"VR", L"HudView", 0, early.c_str())) % 3;
         g_queryNoSpin = GetPrivateProfileIntW(L"VR", L"QueryWait", 1, early.c_str()) == 0;
+        g_occlSkip = static_cast<int>(GetPrivateProfileIntW(L"VR", L"OcclusionWait", 0, early.c_str())) % 3;
+        Log("OCCLWAIT mode %d", g_occlSkip.load());
         Log("QUERYWAIT %s", g_queryNoSpin.load() ? "off" : "on");
         ApplyHudView();
         Log("HUDVIEW %d", g_hudView.load());
@@ -3400,7 +3415,7 @@ static DWORD WINAPI ProbeThread(void*) {
                         g_usOccl[0].exchange(0) / f, g_usOccl[1].exchange(0) / f, g_usOccl[2].exchange(0) / f,
                         (unsigned long long)g_occlCalls[0].exchange(0), (unsigned long long)g_occlCalls[1].exchange(0), (unsigned long long)g_occlCalls[2].exchange(0),
                         (unsigned long long)g_occlBusy[0].exchange(0), (unsigned long long)g_occlBusy[1].exchange(0), (unsigned long long)g_occlBusy[2].exchange(0),
-                        g_occlSkip.load() ? "skip when busy" : "game's wait");
+                        g_occlSkip.load() == 2 ? "skip all" : g_occlSkip.load() == 1 ? "skip game's view" : "game's wait");
                     Log("QUERIES ms per frame %.2f, calls %llu, items %llu, not ready %llu, mode %s", g_usFinalize.exchange(0) / f, static_cast<unsigned long long>(g_finalizeCalls.exchange(0)), static_cast<unsigned long long>(g_finalizeItems.exchange(0)), static_cast<unsigned long long>(g_finalizeNotReady.exchange(0)), g_queryNoSpin.load() ? "ask once" : "game's wait");
                 }
             }
