@@ -370,10 +370,22 @@ void XrPaceWait() {
     seen = g_predicted.load();
 }
 
+// Set when the runtime moves the seated (LOCAL) space, as SteamVR's recenter does. The game camera recenters from it too.
+static std::atomic<bool> g_spaceRecentered{false};
+bool XrTakeSpaceRecenter() { return g_spaceRecentered.exchange(false); }
+void XrRecenterScreen();
+
 static void PollEvents() {
     XrEventDataBuffer ev{XR_TYPE_EVENT_DATA_BUFFER};
     while (p_xrPollEvent(g_inst, &ev) == XR_SUCCESS) {
-        if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
+        if (ev.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
+            const auto& c = *reinterpret_cast<XrEventDataReferenceSpaceChangePending*>(&ev);
+            Log("XR reference space %d recentered by the runtime", static_cast<int>(c.referenceSpaceType));
+            if (c.referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL) {
+                XrRecenterScreen();
+                g_spaceRecentered = true;
+            }
+        } else if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
             const auto& s = *reinterpret_cast<XrEventDataSessionStateChanged*>(&ev);
             g_state = s.state;
             Log("XR session state %d", static_cast<int>(s.state));
@@ -406,19 +418,42 @@ void XrSetOverlap(bool on) {
     g_overlap = on;
     Log("XR overlap %d", on ? 1 : 0);
 }
+// Option: the render thread records and submits the copies, then leaves xrEndFrame to the worker, so it can go back to the game
+// at once. With frame generation xrEndFrame held the render thread 13 to 16 ms. g_endPending: layers are ready in g_endInfo.
+static std::atomic<bool> g_endOnWorker{false};
+static bool g_endPending = false;
+static XrFrameEndInfo g_endInfo{XR_TYPE_FRAME_END_INFO};
+static HANDLE g_endEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+void XrSetEndOnWorker(bool on) {
+    g_endOnWorker = on;
+    Log("XR frame hand-off on %s", on ? "the XR thread" : "the render thread");
+}
 static void WaitFrameClosed() {
     const ULONGLONG start = GetTickCount64();
     for (;;) {
         {
-            std::lock_guard<std::mutex> l(g_frameLock);
+            std::unique_lock<std::mutex> l(g_frameLock);
             if (!g_open) return;
+            if (g_endPending) {
+                const XrFrameEndInfo ei = g_endInfo;
+                l.unlock();
+                const uint64_t e0 = NowUs();
+                const XrResult r = p_xrEndFrame(g_sess, &ei);
+                g_usEnd += NowUs() - e0;
+                if (XR_FAILED(r)) Log("XR xrEndFrame failed %d", static_cast<int>(r));
+                ++g_endedWithImages;
+                l.lock();
+                g_endPending = false;
+                g_open = false;
+                return;
+            }
             if (GetTickCount64() - start > 200) {
                 EndEmpty(g_openTime);
                 g_open = false;
                 return;
             }
         }
-        Sleep(1);
+        WaitForSingleObject(g_endEvent, 1);
     }
 }
 
@@ -878,7 +913,7 @@ static int64_t ScreenFormatFor(int dxgi) {
 
 void XrOnPresentScreen(void* resource, int width, int height, int dxgiFormat) {
     std::lock_guard<std::mutex> l(g_frameLock);
-    if (!g_open) {
+    if (!g_open || g_endPending) {
         ++g_notReady;
         return;
     }
@@ -1149,7 +1184,7 @@ void XrCopyTimes(double* copyMs, double* betweenMs) {
 extern void SeqNote(char c);
 void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiImage* ui, int uiCount) {
     std::lock_guard<std::mutex> l(g_frameLock);
-    if (!g_open) {
+    if (!g_open || g_endPending) {
         ++g_notReady;
         SeqNote('c');
         return;
@@ -1228,7 +1263,9 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
         std::lock_guard<std::mutex> pl(g_poseLock);
         pose.views[1 - freshEye] = g_heldView[1 - freshEye];
     }
-    XrCompositionLayerProjectionView pv[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
+    static XrCompositionLayerProjectionView pv[2];
+    pv[0] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+    pv[1] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
     for (int e = 0; e < 2; ++e) {
         pv[e].pose = pose.views[e].pose;
         pv[e].fov = pose.views[e].fov;
@@ -1272,7 +1309,7 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
         if (fromRebuild) list->ResourceBarrier(1, &bar[1]);
         else list->ResourceBarrier(2, bar);
     }
-    XrCompositionLayerQuad quads[kUiSlots];
+    static XrCompositionLayerQuad quads[kUiSlots];
     uint32_t quadCount = 0;
     PlaceHud(pose);
     bool uiAcquired[kUiSlots] = {};
@@ -1331,9 +1368,10 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
         addQuad();
     }
     MirrorEye(list, static_cast<ID3D12Resource*>(resources[0]), static_cast<D3D12_RESOURCE_STATES>(states[0]));
-    XrCompositionLayerQuad menuLayer{XR_TYPE_COMPOSITION_LAYER_QUAD};
+    static XrCompositionLayerQuad menuLayer, dotLayer;
+    menuLayer = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+    dotLayer = {XR_TYPE_COMPOSITION_LAYER_QUAD};
     const bool haveMenu = MenuRecord(list, &menuLayer);
-    XrCompositionLayerQuad dotLayer{XR_TYPE_COMPOSITION_LAYER_QUAD};
     const bool haveDot = !g_cinema && DotRecord(list, &dotLayer, pose);
     if (copyTimed) {
         list->EndQuery(g_copyHeap, D3D12_QUERY_TYPE_TIMESTAMP, copyIndex + 1);
@@ -1364,13 +1402,14 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
             }
         }
     }
-    XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    static XrCompositionLayerProjection layer;
+    layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     layer.space = g_space;
     layer.viewCount = 2;
     layer.views = pv;
-    const XrCompositionLayerBaseHeader* layers[4 + kUiSlots];
+    static const XrCompositionLayerBaseHeader* layers[4 + kUiSlots];
     uint32_t layerCount = 0;
-    XrCompositionLayerQuad cinema[2];
+    static XrCompositionLayerQuad cinema[2];
     if (g_cinema) {
         // The middle band of each eye's image, 16 by 9, one quad per eye at the same place in the room. Same tick, real depth.
         const int bandH = std::min(g_chainH, g_chainW * 9 / 16);
@@ -1397,6 +1436,13 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
     ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
     ei.layerCount = layerCount;
     ei.layers = layers;
+    if (g_endOnWorker.load()) {
+        g_endInfo = ei;
+        g_endPending = true;
+        SetEvent(g_endEvent);
+        g_usPresent += NowUs() - present0;
+        return;
+    }
     const uint64_t e0 = NowUs();
     const XrResult r = p_xrEndFrame(g_sess, &ei);
     g_usEnd += NowUs() - e0;

@@ -18,6 +18,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
+#include <mmsystem.h>
+#pragma comment(lib, "winmm.lib")
 #include <map>
 #include <set>
 #include <mutex>
@@ -28,7 +30,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 98
+#define BUILD_NUMBER 99
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -1069,7 +1071,7 @@ static void __fastcall HookRenderAll() {
             XrEyePose eye[2];
             std::lock_guard<std::mutex> l(g_eyesLock);
             if (g_eyes.size() >= 2 && XrLocate(eye)) {
-                if (!g_haveCentre || g_wantRecenter.exchange(false)) {
+                if (!g_haveCentre || g_wantRecenter.exchange(false) || XrTakeSpaceRecenter()) {
                     // Centre: the head's position and yaw now become the game camera's.
                     const float cx = (eye[0].px + eye[1].px) * 0.5f, cy = (eye[0].py + eye[1].py) * 0.5f, cz = (eye[0].pz + eye[1].pz) * 0.5f;
                     g_centre[0] = cx;
@@ -1757,6 +1759,10 @@ static void StartXr(int percent) {
 // ---- mod menu ----
 // Opens with both sticks clicked and held half a second. Settings save to RiftApartVR.ini as they change.
 static std::atomic<bool> g_menuOpen{false};
+// After the menu closes, the pad stays hidden from the game until every button and trigger is let go, so the B or stick press
+// that closed it never reaches the game.
+static std::atomic<bool> g_padSwallow{false};
+static bool PadBlocked() { return g_menuOpen.load() || g_padSwallow.load(); }
 static int g_menuRow = 0;
 static int g_resolutionSetting = 100;
 static bool g_skipLauncherSetting = true;
@@ -1873,105 +1879,182 @@ static void OfxrApply() {
 static float g_hudDistanceSetting = 2.0f;
 static std::wstring g_iniPath;
 static std::vector<uint32_t> g_menuImage;
-static const int kMenuW = 1024, kMenuH = 1632, kMenuRows = 20;
+// ---- mod menu, build 99: tabs, a short explanation of the chosen row, and a click for each action (after PragmataVR). ----
+// LB/RB or LT/RT change tab, D-pad up/down choose, left/right or A change, B or both sticks close.
+static const int kMenuW = 1024, kMenuH = 800;
+enum MenuItem {
+    kItemRecenter, kItemWorldScale, kItemPitch, kItemHudDistance, kItemSkipLauncher,
+    kItemFrameGen, kItemFgType, kItemFgQuality, kItemFgDetail, kItemStereo,
+    kItemVendor, kItemAimDot, kItemCutscenes, kItemMenuSound,
+    kItemSnapshot, kItemFgPacing, kItemFrameHandoff,
+};
+struct MenuTab {
+    const wchar_t* name;
+    std::vector<MenuItem> items;
+};
+static const MenuTab kTabs[] = {
+    {L"GENERAL", {kItemRecenter, kItemWorldScale, kItemPitch, kItemHudDistance, kItemSkipLauncher}},
+    {L"PERFORMANCE", {kItemFrameGen, kItemFgType, kItemFgQuality, kItemFgDetail, kItemStereo}},
+    {L"OPTIONS", {kItemVendor, kItemAimDot, kItemCutscenes, kItemMenuSound}},
+    {L"DEVELOPER", {kItemSnapshot, kItemFgPacing, kItemFrameHandoff}},
+};
+static const int kTabCount = static_cast<int>(sizeof(kTabs) / sizeof(kTabs[0]));
+static int g_menuTab = 0;
+static std::atomic<int> g_menuSound{2};  // 0 off, 1 low, 2 medium, 3 high
+static std::atomic<bool> g_frameHandoffXr{false};
 
 static void SaveSetting(const wchar_t* name, int value) {
     WritePrivateProfileStringW(L"VR", name, std::to_wstring(value).c_str(), g_iniPath.c_str());
 }
 
-static void MenuRowText(int row, wchar_t (&name)[64], wchar_t (&value)[64]) {
+// ---- menu sounds: short tones made here, played from memory, so nothing extra ships. ----
+enum MenuSoundKind { kSoundMove, kSoundChange, kSoundTab, kSoundOpen, kSoundClose, kSoundCount };
+static void MenuSound(MenuSoundKind kind) {
+    const int level = g_menuSound.load();
+    if (level <= 0) return;
+    static std::vector<uint8_t> cache[kSoundCount][4];
+    std::vector<uint8_t>& wav = cache[kind][level];
+    if (wav.empty()) {
+        const int rate = 22050;
+        // Start and end pitch (Hz) and length (ms) of each sound: a soft tick, a brighter tick, a two-step sweep, rising and falling chimes.
+        static const float spec[kSoundCount][3] = {{1500, 1500, 22}, {2100, 2300, 26}, {1200, 1900, 46}, {700, 1500, 90}, {1500, 700, 90}};
+        static const float amp[4] = {0, 0.10f, 0.22f, 0.40f};
+        const int n = static_cast<int>(rate * spec[kind][2] / 1000);
+        std::vector<int16_t> pcm(n);
+        double phase = 0;
+        for (int i = 0; i < n; ++i) {
+            const double t = static_cast<double>(i) / n;
+            const double f = spec[kind][0] + (spec[kind][1] - spec[kind][0]) * t;
+            phase += 2 * 3.14159265358979 * f / rate;
+            const double env = (i < 40 ? i / 40.0 : 1.0) * exp(-4.0 * t);
+            pcm[i] = static_cast<int16_t>(32767 * amp[level] * env * (sin(phase) + 0.25 * sin(2 * phase)) / 1.25);
+        }
+        const uint32_t dataBytes = static_cast<uint32_t>(n * 2);
+        wav.resize(44 + dataBytes);
+        auto put32 = [&](size_t at, uint32_t v) { memcpy(&wav[at], &v, 4); };
+        auto put16 = [&](size_t at, uint16_t v) { memcpy(&wav[at], &v, 2); };
+        memcpy(&wav[0], "RIFF", 4);
+        put32(4, 36 + dataBytes);
+        memcpy(&wav[8], "WAVEfmt ", 8);
+        put32(16, 16);
+        put16(20, 1);
+        put16(22, 1);
+        put32(24, rate);
+        put32(28, rate * 2);
+        put16(32, 2);
+        put16(34, 16);
+        memcpy(&wav[36], "data", 4);
+        put32(40, dataBytes);
+        memcpy(&wav[44], pcm.data(), dataBytes);
+    }
+    PlaySoundW(reinterpret_cast<LPCWSTR>(wav.data()), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
+}
+
+// Name, value and a short explanation of one item.
+static void MenuItemText(MenuItem item, wchar_t (&name)[64], wchar_t (&value)[64], const wchar_t** tip) {
     value[0] = 0;
-    switch (row) {
-    case 0: wcscpy_s(name, L"Recenter view"); break;
-    case 1:
+    *tip = L"";
+    switch (item) {
+    case kItemRecenter:
+        wcscpy_s(name, L"Recenter view");
+        *tip = L"Press A to make the way you face now the front. SteamVR's own recenter does the same.";
+        break;
+    case kItemWorldScale:
         wcscpy_s(name, L"World scale");
         swprintf_s(value, L"%d%%", static_cast<int>(g_worldScale.load() * 100 + 0.5f));
+        *tip = L"How big the world feels. Higher makes it a miniature around you.";
         break;
-    case 2:
+    case kItemPitch:
         wcscpy_s(name, L"Decoupled pitch");
         wcscpy_s(value, g_levelCamera == 0 ? L"Off" : g_levelCamera == 1 ? L"On" : L"Auto");
+        *tip = L"On keeps the world level and only turns you with the camera. Off lets the camera tilt the world too. Auto stays level except on gravity walls.";
         break;
-    case 3:
+    case kItemHudDistance:
         wcscpy_s(name, L"HUD distance");
         swprintf_s(value, L"%.2f m", g_hudDistanceSetting);
+        *tip = L"How far away the HUD panel sits. It grows with distance, so it stays the same size to your eye.";
         break;
-    case 4:
-        wcscpy_s(name, L"Resolution (next launch)");
-        swprintf_s(value, L"%d%%", g_resolutionSetting);
-        break;
-    case 5:
-        wcscpy_s(name, L"Skip the launcher window (next launch)");
+    case kItemSkipLauncher:
+        wcscpy_s(name, L"Skip the launcher window");
         wcscpy_s(value, g_skipLauncherSetting ? L"On" : L"Off");
+        *tip = L"Goes straight past the game's launcher window. Takes effect at the next launch.";
         break;
-    case 6:
-        wcscpy_s(name, L"Vendor screen up close");
-        wcscpy_s(value, g_vendorOn ? L"On" : L"Off");
-        break;
-    case 7:
-        wcscpy_s(name, L"Aim dot");
-        wcscpy_s(value, g_aimDot == 0 ? L"Off" : g_aimDot == 1 ? L"While aiming" : L"Always");
-        break;
-    case 8:
-        wcscpy_s(name, L"Snapshot in 2 seconds");
-        break;
-    case 9:
-    {
+    case kItemFrameGen: {
         wcscpy_s(name, L"Frame generation");
         OfxrSnapshotV2 v;
         const bool loaded = OfxrSnapshot(&v);
         const bool threeX = g_fgMode == 2 && g_fgType != 1 && g_fgType != 3;
         swprintf_s(value, L"%ls%ls", g_fgMode == 0 ? L"Off" : threeX ? L"3X" : L"2X", g_fgMode == 0 ? L"" : g_alternateSetting ? L", off in alternate" : !loaded ? L" next launch" : v.errors ? L" failed" : L"");
+        *tip = L"Adds made-up frames between real ones for smoother motion, using OFXR. Costs some latency. Turned off while Stereo is on alternate.";
         break;
     }
-    case 10: {
+    case kItemFgType: {
         static const wchar_t* const types[4] = {L"Optical flow", L"FSR 3.1 (no frames)", L"DLSS-G", L"Hybrid"};
         wcscpy_s(name, L"Frame generation type");
         OfxrSnapshotV2 v;
         const bool notLive = !OfxrSnapshot(&v) || g_fgType != g_fgTypeAtLaunch && (g_fgType == 3 || g_fgTypeAtLaunch == 3);
         swprintf_s(value, L"%ls%ls", types[g_fgType], notLive && g_fgMode != 0 ? L" next launch" : L"");
+        *tip = L"How the made-up frames are built. Optical flow works on most cards. DLSS-G needs an RTX 40 or 50. Hybrid takes effect at the next launch.";
         break;
     }
-    case 11:
+    case kItemFgQuality:
         wcscpy_s(name, L"Optical flow quality");
         wcscpy_s(value, g_fgPreset == 2 ? L"Fast" : g_fgPreset == 1 ? L"Medium" : L"Slow");
+        *tip = L"Slow tracks motion best and costs the most.";
         break;
-    case 12:
+    case kItemFgDetail:
         wcscpy_s(name, L"Optical flow detail");
         wcscpy_s(value, g_fgScale == 0 ? L"100%" : g_fgScale == 1 ? L"75%" : g_fgScale == 2 ? L"50%" : L"25%");
+        *tip = L"Resolution of the motion tracking. Lower is cheaper and a little less precise.";
         break;
-    case 13:
-        wcscpy_s(name, L"Frame generation pacing");
-        wcscpy_s(value, g_fgDirector ? L"Director" : L"Framework");
+    case kItemStereo:
+        wcscpy_s(name, L"Stereo");
+        wcscpy_s(value, !g_alternateSetting ? L"Native" : g_rebuildSetting ? L"Alternate, depth rebuild" : L"Alternate, plain");
+        *tip = L"Native draws both eyes every frame. Alternate draws one eye per frame for speed; depth rebuild makes the other eye from it.";
         break;
-    case 16: {
-        const int v = g_hudView.load();
-        wcscpy_s(name, L"Game's own view");
-        wcscpy_s(value, v == 2 ? L"Never (HUD freezes)" : v == 1 ? L"Full" : L"Light, HUD only");
+    case kItemVendor:
+        wcscpy_s(name, L"Vendor screen up close");
+        wcscpy_s(value, g_vendorOn ? L"On" : L"Off");
+        *tip = L"When the game zooms onto a shop screen, it fills your view. Off leaves it in the world.";
         break;
-    }
-    case 18:
-        wcscpy_s(name, L"Occlusion wait (test)");
-        wcscpy_s(value, g_occlSkip.load() == 2 ? L"Skip for all views" : g_occlSkip.load() == 1 ? L"Skip for game's view" : L"On, game's normal");
+    case kItemAimDot:
+        wcscpy_s(name, L"Aim dot");
+        wcscpy_s(value, g_aimDot == 0 ? L"Off" : g_aimDot == 1 ? L"While aiming" : L"Always");
+        *tip = L"A small ring in the world where your shots go.";
         break;
-    case 17:
-        wcscpy_s(name, L"Wait for GPU visibility tests (test)");
-        wcscpy_s(value, g_queryNoSpin.load() ? L"Off" : L"On, game's normal");
-        break;
-    case 15: {
+    case kItemCutscenes: {
         static const wchar_t* const rules[3] = {L"Zoomed shots", L"All cutscenes", L"Never (can hang)"};
         wcscpy_s(name, L"Cutscenes on a screen");
         wcscpy_s(value, rules[g_cutsceneCamera.load() % 3]);
+        *tip = L"Zoomed shots puts very zoomed in cutscene shots on a screen and avoids a GPU hang at one scripted ride. All puts every cutscene on a screen.";
         break;
     }
-    case 14:
-        wcscpy_s(name, L"Stereo");
-        wcscpy_s(value, !g_alternateSetting ? L"Native" : g_rebuildSetting ? L"Alternate, depth rebuild" : L"Alternate, plain");
+    case kItemMenuSound: {
+        static const wchar_t* const levels[4] = {L"Off", L"Low", L"Medium", L"High"};
+        wcscpy_s(name, L"Menu sound");
+        wcscpy_s(value, levels[g_menuSound.load() & 3]);
+        *tip = L"The click this menu makes.";
         break;
-    default: wcscpy_s(name, L"Close"); break;
+    }
+    case kItemSnapshot:
+        wcscpy_s(name, L"Snapshot in 2 seconds");
+        *tip = L"Press A, close the menu, and the mod saves pictures of what it is showing, for reporting a problem.";
+        break;
+    case kItemFgPacing:
+        wcscpy_s(name, L"Frame generation pacing");
+        wcscpy_s(value, g_fgDirector ? L"Director" : L"Framework");
+        *tip = L"Director can lower latency with frame generation but has frozen the game on one PC. Every launch starts on Framework.";
+        break;
+    case kItemFrameHandoff:
+        wcscpy_s(name, L"Hand frames to SteamVR from");
+        wcscpy_s(value, g_frameHandoffXr.load() ? L"XR thread (test)" : L"Render thread");
+        *tip = L"Test. XR thread lets the game start drawing the next frame while SteamVR takes the last one. Can help with frame generation.";
+        break;
     }
 }
 
 // Draws the menu with GDI into a top-down buffer, then gives it to the headset as RGBA.
+// Styling after the game's own menus: deep blue panel, a slanted tab in gold for the open section, cyan selection, thin row lines.
 static void MenuDraw() {
     BITMAPINFO bi{};
     bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
@@ -1993,46 +2076,80 @@ static void MenuDraw() {
         FillRect(dc, &rc, br);
         DeleteObject(br);
     };
-    // After the game's Options screen: deep blue, a slanted title tab, cyan highlight, a thin line under each row.
+    auto poly = [&](const POINT* pts, int n, COLORREF c) {
+        HBRUSH br = CreateSolidBrush(c);
+        HGDIOBJ ob = SelectObject(dc, br);
+        HGDIOBJ op = SelectObject(dc, GetStockObject(NULL_PEN));
+        Polygon(dc, pts, n);
+        SelectObject(dc, ob);
+        SelectObject(dc, op);
+        DeleteObject(br);
+    };
+    const COLORREF cyan = RGB(40, 216, 232), gold = RGB(250, 196, 64), ink = RGB(8, 22, 52), pale = RGB(214, 228, 245);
     for (int y = 0; y < kMenuH; ++y) {
         const int t = y * 255 / kMenuH;
         fill(0, y, kMenuW, y + 1, RGB(8 + t / 40, 14 + t / 18, 52 + t / 5));
     }
-    {
-        const POINT tab[] = {{0, 26}, {kMenuW - 330, 26}, {kMenuW - 290, 66}, {kMenuW - 290, 96}, {0, 96}};
-        HBRUSH br = CreateSolidBrush(RGB(14, 72, 142));
-        HGDIOBJ oldBrush = SelectObject(dc, br);
-        HGDIOBJ oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
-        Polygon(dc, tab, 5);
-        SelectObject(dc, oldBrush);
-        SelectObject(dc, oldPen);
-        DeleteObject(br);
-    }
-    fill(0, 96, kMenuW, 99, RGB(40, 216, 232));
-    HFONT big = CreateFontW(50, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Bahnschrift");
-    HFONT mid = CreateFontW(36, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Bahnschrift");
-    HFONT small = CreateFontW(28, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Bahnschrift");
+    HFONT tabFont = CreateFontW(38, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Bahnschrift");
+    HFONT rowFont = CreateFontW(36, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Bahnschrift");
+    HFONT tipFont = CreateFontW(31, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Bahnschrift");
+    HFONT smallFont = CreateFontW(26, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Bahnschrift");
     SetBkMode(dc, TRANSPARENT);
-    HGDIOBJ oldFont = SelectObject(dc, big);
-    SetTextColor(dc, RGB(255, 255, 255));
-    RECT title{44, 30, kMenuW - 300, 92};
-    DrawTextW(dc, L"VR OPTIONS", -1, &title, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-    SelectObject(dc, mid);
-    for (int i = 0; i < kMenuRows; ++i) {
-        const int top = 116 + i * 72;
-        if (i == g_menuRow) fill(28, top, kMenuW - 28, top + 66, RGB(40, 216, 232));
-        else fill(48, top + 68, kMenuW - 48, top + 69, RGB(40, 78, 130));
-        wchar_t name[64], value[64];
-        MenuRowText(i, name, value);
-        SetTextColor(dc, i == g_menuRow ? RGB(8, 22, 52) : RGB(214, 228, 245));
-        RECT a{48, top, kMenuW - 48, top + 66};
-        DrawTextW(dc, name, -1, &a, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-        DrawTextW(dc, value, -1, &a, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+    HGDIOBJ oldFont = SelectObject(dc, tabFont);
+    // Tabs: the open one is a slanted blue tab with gold letters, the others plain.
+    const int tabTop = 24, tabBottom = 92, tabW = (kMenuW - 48) / kTabCount;
+    for (int t = 0; t < kTabCount; ++t) {
+        const int l = 24 + t * tabW, r = l + tabW;
+        if (t == g_menuTab) {
+            const POINT tab[] = {{l, tabTop}, {r - 24, tabTop}, {r, tabTop + 24}, {r, tabBottom}, {l, tabBottom}};
+            poly(tab, 5, RGB(14, 72, 142));
+        }
+        SetTextColor(dc, t == g_menuTab ? gold : RGB(122, 154, 196));
+        RECT a{l, tabTop, r - 8, tabBottom};
+        DrawTextW(dc, kTabs[t].name, -1, &a, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     }
-    SelectObject(dc, small);
+    fill(0, tabBottom, kMenuW, tabBottom + 3, cyan);
+    // Rows.
+    const MenuTab& tab = kTabs[g_menuTab];
+    const int rowTop = 116, rowH = 70;
+    SelectObject(dc, rowFont);
+    const wchar_t* tip = L"";
+    for (size_t i = 0; i < tab.items.size(); ++i) {
+        const int top = rowTop + static_cast<int>(i) * rowH;
+        const bool sel = static_cast<int>(i) == g_menuRow;
+        wchar_t name[64], value[64];
+        const wchar_t* t = L"";
+        MenuItemText(tab.items[i], name, value, &t);
+        if (sel) {
+            tip = t;
+            fill(28, top, kMenuW - 28, top + rowH - 6, cyan);
+            const POINT mark[] = {{14, top + 18}, {24, top + 32}, {14, top + 46}};
+            poly(mark, 3, gold);
+        } else {
+            fill(48, top + rowH - 4, kMenuW - 48, top + rowH - 3, RGB(40, 78, 130));
+        }
+        SetTextColor(dc, sel ? ink : pale);
+        RECT a{48, top, kMenuW - 48, top + rowH - 6};
+        DrawTextW(dc, name, -1, &a, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        if (value[0]) {
+            wchar_t shown[72];
+            swprintf_s(shown, sel ? L"\u2039  %ls  \u203a" : L"%ls", value);
+            DrawTextW(dc, shown, -1, &a, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+        }
+    }
+    // The chosen row's explanation, in a box under the rows.
+    const int tipTop = rowTop + 5 * rowH + 18, tipBottom = tipTop + 196;
+    fill(28, tipTop, kMenuW - 28, tipBottom, RGB(10, 30, 78));
+    fill(28, tipTop, 34, tipBottom, gold);
+    SelectObject(dc, tipFont);
+    SetTextColor(dc, RGB(226, 236, 250));
+    RECT tr{56, tipTop + 18, kMenuW - 52, tipBottom - 14};
+    DrawTextW(dc, tip, -1, &tr, DT_LEFT | DT_WORDBREAK);
+    // Controls.
+    SelectObject(dc, smallFont);
     SetTextColor(dc, RGB(150, 182, 214));
-    RECT help{44, kMenuH - 62, kMenuW - 44, kMenuH - 12};
-    DrawTextW(dc, L"D-pad: choose and change     A: select     B: close", -1, &help, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    RECT help{24, kMenuH - 64, kMenuW - 24, kMenuH - 16};
+    DrawTextW(dc, L"LB / RB or LT / RT: section     D-pad: choose and change     A: select     B: close", -1, &help, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     GdiFlush();
     g_menuImage.resize(static_cast<size_t>(kMenuW) * kMenuH);
     const uint32_t* src = static_cast<const uint32_t*>(bits);
@@ -2042,143 +2159,140 @@ static void MenuDraw() {
     }
     SelectObject(dc, oldFont);
     SelectObject(dc, oldBmp);
-    DeleteObject(big);
-    DeleteObject(mid);
-    DeleteObject(small);
+    DeleteObject(tabFont);
+    DeleteObject(rowFont);
+    DeleteObject(tipFont);
+    DeleteObject(smallFont);
     DeleteObject(bmp);
     DeleteDC(dc);
     XrMenuShow(g_menuImage.data(), kMenuW, kMenuH);
 }
 
 static void MenuClose() {
+    g_padSwallow = true;
     g_menuOpen = false;
     XrMenuHide();
+    MenuSound(kSoundClose);
     Log("MENU closed");
 }
 
 static void MenuOpen() {
     g_menuOpen = true;
     MenuDraw();
+    MenuSound(kSoundOpen);
     Log("MENU open");
 }
 
+static void MenuTabStep(int dir) {
+    g_menuTab = (g_menuTab + (dir < 0 ? kTabCount - 1 : 1)) % kTabCount;
+    g_menuRow = 0;
+    MenuSound(kSoundTab);
+    MenuDraw();
+}
+
+static void MenuRowStep(int dir) {
+    const int n = static_cast<int>(kTabs[g_menuTab].items.size());
+    g_menuRow = (g_menuRow + (dir < 0 ? n - 1 : 1)) % n;
+    MenuSound(kSoundMove);
+    MenuDraw();
+}
+
 static DWORD WINAPI SnapshotThread(void*);
-// dir: -1 or 1 changes the value, 0 is A.
+// dir: -1 or 1 changes the value, 0 is A (actions run, choices step forward).
 static void MenuChange(int dir) {
-    switch (g_menuRow) {
-    case 0:
-        if (dir == 0) {
-            g_wantRecenter = true;
-            XrRecenterScreen();
-            Log("MENU recenter");
-        }
+    const MenuItem item = kTabs[g_menuTab].items[std::clamp(g_menuRow, 0, static_cast<int>(kTabs[g_menuTab].items.size()) - 1)];
+    const int step = dir < 0 ? -1 : 1;
+    switch (item) {
+    case kItemRecenter:
+        if (dir != 0) return;
+        g_wantRecenter = true;
+        XrRecenterScreen();
+        Log("MENU recenter");
         break;
-    case 1: {
-        const int v = std::clamp(static_cast<int>(g_worldScale.load() * 100 + 0.5f) + dir * 25, 100, 1000);
+    case kItemWorldScale: {
+        const int v = std::clamp(static_cast<int>(g_worldScale.load() * 100 + 0.5f) + step * 25, 100, 1000);
         g_worldScale = v / 100.0f;
         SaveSetting(L"WorldScalePercent", v);
         break;
     }
-    case 2:
-        g_levelCamera = (g_levelCamera.load() + (dir < 0 ? 2 : 1)) % 3;
+    case kItemPitch:
+        g_levelCamera = (g_levelCamera.load() + (step < 0 ? 2 : 1)) % 3;
         SaveSetting(L"LevelCamera", g_levelCamera.load());
         break;
-    case 3:
-        g_hudDistanceSetting = std::clamp(g_hudDistanceSetting + dir * 0.25f, 1.0f, 5.0f);
+    case kItemHudDistance:
+        g_hudDistanceSetting = std::clamp(g_hudDistanceSetting + step * 0.25f, 1.0f, 5.0f);
         XrSetHud(2.2f * g_hudDistanceSetting / 2.0f, g_hudDistanceSetting, 0.1f);
         SaveSetting(L"HudDistanceCm", static_cast<int>(g_hudDistanceSetting * 100 + 0.5f));
         break;
-    case 4:
-        g_resolutionSetting = std::clamp(g_resolutionSetting + dir * 10, 50, 200);
-        SaveSetting(L"Resolution", g_resolutionSetting);
-        break;
-    case 5:
+    case kItemSkipLauncher:
         g_skipLauncherSetting = !g_skipLauncherSetting;
         SaveSetting(L"SkipLauncher", g_skipLauncherSetting ? 1 : 0);
         break;
-    case 6:
-        g_vendorOn = !g_vendorOn;
-        SaveSetting(L"VendorScreen", g_vendorOn ? 1 : 0);
-        break;
-    case 7:
-        g_aimDot = (g_aimDot.load() + (dir < 0 ? 2 : 1)) % 3;
-        SaveSetting(L"AimDot", g_aimDot.load());
-        break;
-    case 8:
-        if (dir == 0) {
-            CreateThread(nullptr, 0, SnapshotThread, nullptr, 0, nullptr);
-            MenuClose();
-            return;
-        }
-        break;
-    case 9:
-        g_fgMode = (g_fgMode + (dir < 0 ? 2 : 1)) % 3;
+    case kItemFrameGen:
+        g_fgMode = (g_fgMode + (step < 0 ? 2 : 1)) % 3;
         SaveSetting(L"FrameGen", g_fgMode);
         OfxrApply();
         break;
-    case 10:
-        g_fgType = (g_fgType + (dir < 0 ? 3 : 1)) % 4;
+    case kItemFgType:
+        g_fgType = (g_fgType + (step < 0 ? 3 : 1)) % 4;
         SaveSetting(L"FrameGenType", g_fgType);
         if (g_fgMode) OfxrApply();
         break;
-    case 11:
-        g_fgPreset = (g_fgPreset + (dir < 0 ? 1 : 2)) % 3;
+    case kItemFgQuality:
+        g_fgPreset = (g_fgPreset + (step < 0 ? 1 : 2)) % 3;
         SaveSetting(L"FrameGenQuality", g_fgPreset);
         if (g_fgMode) OfxrApply();
         break;
-    case 12:
-        g_fgScale = (g_fgScale + (dir < 0 ? 1 : 3)) % 4;
+    case kItemFgDetail:
+        g_fgScale = (g_fgScale + (step < 0 ? 1 : 3)) % 4;
         SaveSetting(L"FrameGenDetail", g_fgScale);
         if (g_fgMode) OfxrApply();
         break;
-    case 13:
-        g_fgDirector = !g_fgDirector;
-        if (!g_fgDirector) SaveSetting(L"FrameGenDirector", 0);
-        OfxrPacingUpdate();
-        break;
-    case 14:
-    {
+    case kItemStereo: {
         // Native, then alternate with the rebuild, then plain alternate.
         const int now = !g_alternateSetting ? 0 : g_rebuildSetting ? 1 : 2;
-        const int next = (now + (dir < 0 ? 2 : 1)) % 3;
+        const int next = (now + (step < 0 ? 2 : 1)) % 3;
         g_alternateSetting = next != 0;
         g_rebuildSetting = next == 1;
         SaveSetting(L"AlternateEye", next == 0 ? 0 : next == 1 ? 2 : 1);
         XrRebuildSetMode(next == 1 ? 1 : 0);
         break;
     }
-    case 15:
-        g_cutsceneCamera = (g_cutsceneCamera.load() + (dir < 0 ? 2 : 1)) % 3;
+    case kItemVendor:
+        g_vendorOn = !g_vendorOn;
+        SaveSetting(L"VendorScreen", g_vendorOn ? 1 : 0);
+        break;
+    case kItemAimDot:
+        g_aimDot = (g_aimDot.load() + (step < 0 ? 2 : 1)) % 3;
+        SaveSetting(L"AimDot", g_aimDot.load());
+        break;
+    case kItemCutscenes:
+        g_cutsceneCamera = (g_cutsceneCamera.load() + (step < 0 ? 2 : 1)) % 3;
         SaveSetting(L"CutsceneCamera", g_cutsceneCamera.load());
         break;
-    case 16: {
-        // Live. HudView in the ini.
-        g_hudView = (g_hudView.load() + (dir < 0 ? 2 : 1)) % 3;
-        ApplyHudView();
-        SaveSetting(L"HudView", g_hudView.load());
-        Log("HUDVIEW %d", g_hudView.load());
+    case kItemMenuSound:
+        g_menuSound = (g_menuSound.load() + (step < 0 ? 3 : 1)) % 4;
+        SaveSetting(L"MenuSound", g_menuSound.load());
+        break;
+    case kItemSnapshot:
+        if (dir != 0) return;
+        MenuSound(kSoundChange);
+        CreateThread(nullptr, 0, SnapshotThread, nullptr, 0, nullptr);
+        MenuClose();
+        return;
+    case kItemFgPacing:
+        g_fgDirector = !g_fgDirector;
+        if (!g_fgDirector) SaveSetting(L"FrameGenDirector", 0);
+        OfxrPacingUpdate();
+        break;
+    case kItemFrameHandoff:
+        g_frameHandoffXr = !g_frameHandoffXr.load();
+        XrSetEndOnWorker(g_frameHandoffXr.load());
+        SaveSetting(L"FrameHandoffXr", g_frameHandoffXr.load() ? 1 : 0);
         break;
     }
-    case 17:
-        // Live. Off: the render handler asks each visibility query once instead of spinning until the GPU has answered.
-        g_queryNoSpin = !g_queryNoSpin.load();
-        SaveSetting(L"QueryWait", g_queryNoSpin.load() ? 0 : 1);
-        Log("QUERYWAIT %s", g_queryNoSpin.load() ? "off" : "on");
-        break;
-    case 18:
-        // Live. Skips the occlusion step of a view whose last-frame data is not back yet, instead of waiting.
-        g_occlSkip = (g_occlSkip.load() + (dir < 0 ? 2 : 1)) % 3;
-        SaveSetting(L"OcclusionWait", g_occlSkip.load());
-        Log("OCCLWAIT mode %d", g_occlSkip.load());
-        break;
-    default:
-        if (dir == 0) {
-            MenuClose();
-            return;
-        }
-        break;
-    }
-    Log("MENU row %d dir %d: scale %.2f pitch decoupled %d hud %.2f resolution %d", g_menuRow, dir, g_worldScale.load(), g_levelCamera.load(), g_hudDistanceSetting, g_resolutionSetting);
+    MenuSound(kSoundChange);
+    Log("MENU tab %d row %d item %d dir %d: scale %.2f pitch decoupled %d hud %.2f", g_menuTab, g_menuRow, static_cast<int>(item), dir, g_worldScale.load(), g_levelCamera.load(), g_hudDistanceSetting);
     MenuDraw();
 }
 
@@ -2284,7 +2398,7 @@ template <XInputGetStateFn* Orig, int Slot>
 static DWORD WINAPI HookXInput(DWORD pad, void* state) {
     ++g_xinputCalls[Slot];
     const DWORD r = (*Orig)(pad, state);
-    if (r == 0 && g_menuOpen) {
+    if (r == 0 && PadBlocked()) {
         const DWORD packet = *static_cast<DWORD*>(state);
         memset(state, 0, 16);
         *static_cast<DWORD*>(state) = packet;
@@ -2333,7 +2447,7 @@ static std::atomic<uint32_t> g_wgiGamepadCalls{0}, g_wgiRawCalls{0}, g_wgiBlocke
 static HRESULT STDMETHODCALLTYPE HookWgiGamepad(void* self, GamepadReading* out) {
     const HRESULT r = g_origWgiGamepad(self, out);
     ++g_wgiGamepadCalls;
-    if (SUCCEEDED(r) && out && g_menuOpen) {
+    if (SUCCEEDED(r) && out && PadBlocked()) {
         out->buttons = 0;
         out->lt = out->rt = out->lx = out->ly = out->rx = out->ry = 0;
         ++g_wgiBlocked;
@@ -2346,7 +2460,7 @@ static HRESULT STDMETHODCALLTYPE HookWgiRaw(void* self, UINT32 nb, uint8_t* b, U
     // Rest values differ by controller, so axes hold what they read before the menu opened.
     static double lastAxes[16];
     if (SUCCEEDED(r)) {
-        if (g_menuOpen) {
+        if (PadBlocked()) {
             if (b) memset(b, 0, nb);
             if (sw) memset(sw, 0, ns * sizeof(int));
             if (a) memcpy(a, lastAxes, std::min<UINT32>(na, 16) * sizeof(double));
@@ -2432,9 +2546,12 @@ static void PollPad() {
     } st{};
     WORD buttons = 0;
     short ly = 0, lx = 0;
+    uint8_t lt = 0, rt = 0;
     for (DWORD pad = 0; pad < 4; ++pad) {
         if (get(pad, &st) == 0) {
             buttons |= st.buttons;
+            lt = std::max(lt, st.lt);
+            rt = std::max(rt, st.rt);
             if (abs(st.ly) > abs(ly)) ly = st.ly;
             if (abs(st.lx) > abs(lx)) lx = st.lx;
             if (st.lt > 40 || st.rt > 40) g_lastTrigger = GetTickCount64();
@@ -2456,10 +2573,12 @@ static void PollPad() {
         else MenuOpen();
         return;
     }
+    if (g_padSwallow && !g_menuOpen && buttons == 0 && lt < 30 && rt < 30 && abs(lx) < 8000 && abs(ly) < 8000) g_padSwallow = false;
     if (!g_menuOpen) return;
     // One step per press, then repeating after a short hold, so key repeat never skips rows.
-    enum { kUp, kDown, kLeft, kRight, kA, kB, kCount };
-    const bool now_down[kCount] = {(buttons & 1) != 0 || ly > 16000, (buttons & 2) != 0 || ly < -16000, (buttons & 4) != 0 || lx < -16000, (buttons & 8) != 0 || lx > 16000, (buttons & 0x1000) != 0, (buttons & 0x2000) != 0};
+    enum { kUp, kDown, kLeft, kRight, kA, kB, kTabLeft, kTabRight, kCount };
+    const bool now_down[kCount] = {(buttons & 1) != 0 || ly > 16000, (buttons & 2) != 0 || ly < -16000, (buttons & 4) != 0 || lx < -16000, (buttons & 8) != 0 || lx > 16000, (buttons & 0x1000) != 0, (buttons & 0x2000) != 0,
+                                   (buttons & 0x0100) != 0 || lt > 120, (buttons & 0x0200) != 0 || rt > 120};
     static ULONGLONG next[kCount] = {};
     static bool was[kCount] = {};
     for (int i = 0; i < kCount; ++i) {
@@ -2474,12 +2593,13 @@ static void PollPad() {
         was[i] = now_down[i];
         if (!press) continue;
         if (i == kUp || i == kDown) {
-            g_menuRow = (g_menuRow + (i == kUp ? kMenuRows - 1 : 1)) % kMenuRows;
-            MenuDraw();
+            MenuRowStep(i == kUp ? -1 : 1);
         } else if (i == kLeft || i == kRight) {
             MenuChange(i == kLeft ? -1 : 1);
         } else if (i == kA) {
-            if (g_menuRow == 0 || g_menuRow == 2 || g_menuRow >= 5) MenuChange(0);
+            MenuChange(0);
+        } else if (i == kTabLeft || i == kTabRight) {
+            MenuTabStep(i == kTabLeft ? -1 : 1);
         } else {
             MenuClose();
         }
@@ -3119,6 +3239,10 @@ static void RunCommand(const std::string& c) {
         g_stackWant = static_cast<int>(g_w);
     }
     else if (sscanf(c.c_str(), "querynospin %u", &g_w) == 1) g_queryNoSpin = g_w != 0;
+    else if (sscanf(c.c_str(), "handoff %u", &g_w) == 1) {
+        g_frameHandoffXr = g_w != 0;
+        XrSetEndOnWorker(g_w != 0);
+    }
     else if (sscanf(c.c_str(), "occlskip %u", &g_w) == 1) g_occlSkip = static_cast<int>(g_w % 3);
     else if (sscanf(c.c_str(), "querydump %u", &g_w) == 1) g_queryDump = static_cast<int>(g_w);
     else if (sscanf(c.c_str(), "pixcapture %u %63s", &g_w, g_text) == 2) {
@@ -3169,6 +3293,12 @@ static void RunCommand(const std::string& c) {
     } else if (c == "menu") {
         if (g_menuOpen) MenuClose();
         else MenuOpen();
+    } else if (sscanf(c.c_str(), "menutab %d", reinterpret_cast<int*>(&g_w)) == 1) {
+        MenuTabStep(static_cast<int>(g_w));
+    } else if (sscanf(c.c_str(), "menurow %d", reinterpret_cast<int*>(&g_w)) == 1) {
+        MenuRowStep(static_cast<int>(g_w));
+    } else if (sscanf(c.c_str(), "menuchange %d", reinterpret_cast<int*>(&g_w)) == 1) {
+        MenuChange(static_cast<int>(g_w));
     } else if (sscanf(c.c_str(), "menushot %63s", g_text) == 1) {
         MenuDraw();
         const std::wstring path = g_dir + L"vrlab_shots\\" + std::wstring(g_text, g_text + strlen(g_text)) + L".raw";
@@ -3310,9 +3440,11 @@ static DWORD WINAPI ProbeThread(void*) {
         g_regForce = !g_eyeDlss && GetPrivateProfileIntW(L"VR", L"ForceGameAA", 1, early.c_str()) != 0;
         g_skipLauncher = GetPrivateProfileIntW(L"VR", L"SkipLauncher", 1, early.c_str()) != 0;
         g_smallFlat = GetPrivateProfileIntW(L"VR", L"SmallFlatView", 1, early.c_str()) != 0;
-        g_hudView = static_cast<int>(GetPrivateProfileIntW(L"VR", L"HudView", 0, early.c_str())) % 3;
-        g_queryNoSpin = GetPrivateProfileIntW(L"VR", L"QueryWait", 1, early.c_str()) == 0;
-        g_occlSkip = static_cast<int>(GetPrivateProfileIntW(L"VR", L"OcclusionWait", 0, early.c_str())) % 3;
+        g_hudView = 0;  // Light, the only choice since build 99 (row removed); lab command hudview still works
+        g_queryNoSpin = false;  // test row removed in build 99; lab command querynospin still works
+        g_occlSkip = 0;  // test row removed in build 99; lab command occlskip still works
+        g_menuSound = static_cast<int>(GetPrivateProfileIntW(L"VR", L"MenuSound", 2, early.c_str())) & 3;
+        g_frameHandoffXr = GetPrivateProfileIntW(L"VR", L"FrameHandoffXr", 0, early.c_str()) != 0;
         Log("OCCLWAIT mode %d", g_occlSkip.load());
         Log("QUERYWAIT %s", g_queryNoSpin.load() ? "off" : "on");
         ApplyHudView();
@@ -3349,6 +3481,7 @@ static DWORD WINAPI ProbeThread(void*) {
     // Frame overlap is no longer a menu row: it made no measurable difference. Always off; lab command "overlap 1" for tests.
     g_overlapSetting = false;
     XrSetOverlap(false);
+    XrSetEndOnWorker(g_frameHandoffXr.load());
     {
         const UINT alt = GetPrivateProfileIntW(L"VR", L"AlternateEye", 0, ini.c_str());
         g_alternateSetting = alt != 0;

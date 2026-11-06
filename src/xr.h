@@ -44,6 +44,8 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
 // Present thread: no 3D world now, so show this picture on a flat screen fixed in the room.
 void XrOnPresentScreen(void* resource, int width, int height, int dxgiFormat);
 void XrRecenterScreen();
+bool XrTakeSpaceRecenter();  // true once after the runtime recentered the seated space
+void XrSetEndOnWorker(bool on);
 // HUD panel in metres.
 void XrSetHud(float width, float distance, float drop);
 // Any thread: the mod menu's picture, RGBA, top row first, width a multiple of 64. Placed ahead of the head when it opens.
