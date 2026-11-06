@@ -2989,6 +2989,16 @@ static void RunCommand(const std::string& c) {
     }
     else if (sscanf(c.c_str(), "querynospin %u", &g_w) == 1) g_queryNoSpin = g_w != 0;
     else if (sscanf(c.c_str(), "querydump %u", &g_w) == 1) g_queryDump = static_cast<int>(g_w);
+    else if (sscanf(c.c_str(), "pixcapture %u %63s", &g_w, g_text) == 2) {
+        // Lab: PIX programmatic capture straight to a file, needs [Lab] PixCapturer=1 at launch.
+        const HMODULE pix = GetModuleHandleW(L"WinPixGpuCapturer.dll");
+        using CaptureFn = HRESULT(WINAPI*)(PCWSTR, UINT32);
+        const auto capture = pix ? reinterpret_cast<CaptureFn>(GetProcAddress(pix, "CaptureNextFrame")) : nullptr;
+        const std::string name(g_text);
+        const std::wstring path = g_dir + L"vrlab_shots\\" + std::wstring(name.begin(), name.end()) + L".wpix";
+        const HRESULT hr = capture ? capture(path.c_str(), g_w) : E_FAIL;
+        Log("PIX capture of %u frames to %ls: %08lx", g_w, path.c_str(), static_cast<unsigned long>(hr));
+    }
     else if (c == "seqcount") {
         Log("SEQCOUNT T %u M %u s %u A %u B %u m %u x %u G %u P %u o %u n %u c %u", g_seqCount['T'].exchange(0), g_seqCount['M'].exchange(0), g_seqCount['s'].exchange(0), g_seqCount['A'].exchange(0), g_seqCount['B'].exchange(0), g_seqCount['m'].exchange(0), g_seqCount['x'].exchange(0), g_seqCount['G'].exchange(0), g_seqCount['P'].exchange(0), g_seqCount['o'].exchange(0), g_seqCount['n'].exchange(0), g_seqCount['c'].exchange(0));
     }
@@ -3174,6 +3184,11 @@ static DWORD WINAPI ProbeThread(void*) {
         g_cutsceneCamera = static_cast<int>(GetPrivateProfileIntW(L"VR", L"CutsceneCamera", 0, early.c_str())) % 3;
         CreateThread(nullptr, 0, ThreadSampler, nullptr, 0, nullptr);
         CreateThread(nullptr, 0, StackSampler, nullptr, 0, nullptr);
+        // Lab only: PIX's GPU capture layer must be in the process before the game makes its device. RigB path, off by default.
+        if (GetPrivateProfileIntW(L"Lab", L"PixCapturer", 0, early.c_str()) != 0) {
+            const HMODULE pix = LoadLibraryW(L"C:\\VRLab\\bin\\pix\\Microsoft PIX\\2603.25\\WinPixGpuCapturer.dll");
+            Log("PIX capturer %s", pix ? "loaded" : "not loaded");
+        }
         if (GetPrivateProfileIntW(L"VR", L"DeviceDiagnostics", 1, early.c_str()) != 0) {
             DredEnable();
             CreateThread(nullptr, 0, DredWatch, nullptr, 0, nullptr);
