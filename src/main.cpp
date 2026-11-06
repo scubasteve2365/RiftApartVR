@@ -31,6 +31,8 @@
 #include <vector>
 
 #define BUILD_NUMBER 102
+#define MOD_VERSION "1.0"
+#define MOD_VERSION_W L"1.0"
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -2074,7 +2076,9 @@ static void MenuItemText(MenuItem item, wchar_t (&name)[64], wchar_t (&value)[64
         OfxrSnapshotV2 v;
         const bool notLive = !OfxrSnapshot(&v) || g_fgType != g_fgTypeAtLaunch && (g_fgType == 3 || g_fgTypeAtLaunch == 3);
         swprintf_s(value, L"%ls%ls", types[g_fgType], notLive && g_fgMode != 0 ? L" next launch" : L"");
-        *tip = L"How the made-up frames are built. Optical flow works on most cards. DLSS-G needs an RTX 40 or 50. Hybrid takes effect at the next launch.";
+        if (g_fgType == 2) *tip = L"DLSS-G: NVIDIA's frame generation. Needs an RTX 40 or 50 card and DLSS chosen in the game's graphics menu. Leave the game's own Frame Generation off. Costs more than optical flow.";
+        else if (g_fgType == 3) *tip = L"Hybrid: optical flow helped by the game's own motion vectors, for cleaner moving edges. Needs DLSS chosen in the game's graphics menu. Takes effect at the next launch.";
+        else *tip = L"Optical flow: tracks motion in the picture itself. Works on any card and with any upscaler. The usual choice.";
         break;
     }
     case kItemFgQuality:
@@ -2231,6 +2235,9 @@ static void MenuDraw() {
     SetTextColor(dc, RGB(150, 182, 214));
     RECT help{24, kMenuH - 64, kMenuW - 24, kMenuH - 16};
     DrawTextW(dc, L"LB / RB or LT / RT: section     D-pad: choose and change     A: select     B: close", -1, &help, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    RECT ver{24, 0, kMenuW - 24, 22};
+    SetTextColor(dc, RGB(96, 124, 168));
+    DrawTextW(dc, L"RIFT APART VR " MOD_VERSION_W, -1, &ver, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
     GdiFlush();
     g_menuImage.resize(static_cast<size_t>(kMenuW) * kMenuH);
     const uint32_t* src = static_cast<const uint32_t*>(bits);
@@ -3771,7 +3778,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD why, LPVOID) {
     g_base = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
     SYSTEMTIME st;
     GetLocalTime(&st);
-    Log("RiftApartVR build %d loaded at %02d:%02d:%02d.%03d, real winhttp %p", BUILD_NUMBER, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, real);
+    Log("RiftApartVR " MOD_VERSION " (build %d) loaded at %02d:%02d:%02d.%03d, real winhttp %p", BUILD_NUMBER, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, real);
 
     if (HANDLE t = CreateThread(nullptr, 0, ProbeThread, nullptr, 0, nullptr)) CloseHandle(t);
     return TRUE;
