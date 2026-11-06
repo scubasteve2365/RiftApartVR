@@ -30,7 +30,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 101
+#define BUILD_NUMBER 102
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -2010,19 +2010,19 @@ static void MenuSound(MenuSoundKind kind) {
 static const wchar_t* MenuItemBlocked(MenuItem item) {
     switch (item) {
     case kItemFrameGen:
-        if (g_alternateSetting) return L"Not available while Stereo is on Alternate. Set Stereo to Native first.";
+        if (g_alternateSetting) return L"Not available with Alternate Eye Rendering. Set Stereo to Native first.";
         break;
     case kItemFgType:
     case kItemFgQuality:
     case kItemFgDetail:
-        if (g_alternateSetting) return L"Not available while Stereo is on Alternate. Set Stereo to Native first.";
+        if (g_alternateSetting) return L"Not available with Alternate Eye Rendering. Set Stereo to Native first.";
         if (g_fgMode == 0) return L"Only used with frame generation. Turn Frame generation on first.";
         break;
     case kItemFgPacing:
         if (g_alternateSetting || g_fgMode == 0) return L"Only used with frame generation.";
         break;
     case kItemStereo:
-        if (g_fgMode != 0) return L"Alternate is not available while Frame generation is on. Turn Frame generation off first.";
+        if (g_fgMode != 0) return L"Alternate Eye Rendering is not available while Frame generation is on. Turn Frame generation off first.";
         break;
     default:
         break;
@@ -2065,11 +2065,11 @@ static void MenuItemText(MenuItem item, wchar_t (&name)[64], wchar_t (&value)[64
         const bool loaded = OfxrSnapshot(&v);
         const bool threeX = g_fgMode == 2 && g_fgType != 1 && g_fgType != 3;
         swprintf_s(value, L"%ls%ls", g_fgMode == 0 || g_alternateSetting ? L"Off" : threeX ? L"3X" : L"2X", g_fgMode == 0 || g_alternateSetting ? L"" : !loaded ? L" next launch" : v.errors ? L" failed" : L"");
-        *tip = L"Adds made-up frames between real ones for smoother motion, using OFXR. Costs some latency. Cannot be used with Stereo on Alternate.";
+        *tip = L"Adds made-up frames between real ones for smoother motion, using OFXR. Costs some latency. Not with Alternate Eye Rendering.";
         break;
     }
     case kItemFgType: {
-        static const wchar_t* const types[4] = {L"Optical flow", L"FSR 3.1 (no frames)", L"DLSS-G", L"Hybrid"};
+        static const wchar_t* const types[4] = {L"Optical flow", L"Optical flow", L"DLSS-G", L"Hybrid"};
         wcscpy_s(name, L"Frame generation type");
         OfxrSnapshotV2 v;
         const bool notLive = !OfxrSnapshot(&v) || g_fgType != g_fgTypeAtLaunch && (g_fgType == 3 || g_fgTypeAtLaunch == 3);
@@ -2089,8 +2089,8 @@ static void MenuItemText(MenuItem item, wchar_t (&name)[64], wchar_t (&value)[64
         break;
     case kItemStereo:
         wcscpy_s(name, L"Stereo");
-        wcscpy_s(value, !g_alternateSetting ? L"Native" : g_rebuildSetting ? L"Alternate, depth rebuild" : L"Alternate, plain");
-        *tip = L"Native draws both eyes every frame. Alternate draws one eye per frame for speed; depth rebuild makes the other eye from it. Alternate cannot be used with frame generation.";
+        wcscpy_s(value, !g_alternateSetting ? L"Native" : g_rebuildSetting ? L"Alternate Eye Rendering, Depth Based" : L"Alternate Eye Rendering, Basic");
+        *tip = L"Native draws both eyes every frame. Alternate Eye Rendering draws one eye per frame for speed. Depth Based makes the other eye from it; Basic shows that eye's last image. Not with frame generation.";
         break;
     case kItemVendor:
         wcscpy_s(name, L"Vendor screen up close");
@@ -2320,7 +2320,13 @@ static void MenuChange(int dir) {
         OfxrApply();
         break;
     case kItemFgType:
-        g_fgType = (g_fgType + (step < 0 ? 3 : 1)) % 4;
+        {
+            // Optical flow (0), DLSS-G (2), Hybrid (3). FSR 3.1 (1) made no frames and was removed in build 102.
+            static const int order[3] = {0, 2, 3};
+            int i = 0;
+            for (int k = 0; k < 3; ++k) if (order[k] == g_fgType) i = k;
+            g_fgType = order[(i + (step < 0 ? 2 : 1)) % 3];
+        }
         SaveSetting(L"FrameGenType", g_fgType);
         if (g_fgMode) OfxrApply();
         break;
@@ -3567,6 +3573,7 @@ static DWORD WINAPI ProbeThread(void*) {
     g_fgPreset = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"VR", L"FrameGenQuality", 1, ini.c_str())), 0, 2);
     g_fgScale = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"VR", L"FrameGenDetail", 2, ini.c_str())), 0, 3);
     g_fgType = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"VR", L"FrameGenType", 0, ini.c_str())), 0, 3);
+    if (g_fgType == 1) g_fgType = 0;  // FSR 3.1 is gone: Optical flow
     g_fgTypeAtLaunch = g_fgType;
     g_fgDirector = GetPrivateProfileIntW(L"VR", L"FrameGenDirector", 0, ini.c_str()) != 0;
     // Frame overlap is no longer a menu row: it made no measurable difference. Always off; lab command "overlap 1" for tests.

@@ -45,9 +45,9 @@ Click and hold both thumbsticks for half a second to open the menu in the headse
 | General | HUD distance | How far away the HUD panel sits |
 | General | Skip the launcher window | Goes straight past the game's launcher. Next launch |
 | Performance | Frame generation | Off, 2X or 3X. Adds made-up frames between real ones, using OFXR-BRIDGE from the `ofxr` folder. Off by default |
-| Performance | Frame generation type | Optical flow, DLSS-G (RTX 40 and 50), or Hybrid (next launch). FSR 3.1 is listed but makes no frames yet |
+| Performance | Frame generation type | Optical flow, DLSS-G (RTX 40 and 50), or Hybrid (next launch) |
 | Performance | Optical flow quality, detail | How carefully motion is tracked, and at what resolution |
-| Performance | Stereo | Native draws both eyes every frame and is the default. Alternate draws one eye per frame for speed; depth rebuild makes the other eye from it and needs DLSS |
+| Performance | Stereo | Native draws both eyes every frame and is the default. Alternate Eye Rendering draws one eye per frame for speed: Depth Based makes the other eye from it and needs DLSS, Basic shows that eye's last image |
 | Options | Vendor screen up close | Shop screens fill your view when the game zooms onto one |
 | Options | Aim dot | A small ring in the world where your shots go |
 | Options | Cutscenes on a screen | Zoomed shots puts very zoomed in cutscene shots on a screen and the rest in 3D. All puts every cutscene on a screen |
@@ -56,7 +56,7 @@ Click and hold both thumbsticks for half a second to open the menu in the headse
 | Developer | Frame generation pacing | Framework or Director. Every launch starts on Framework |
 | Developer | Hand frames to SteamVR from | Render thread (default) or XR thread, a test |
 
-Frame generation and alternate eye cannot be used together. Whichever one is blocked is greyed out in the menu, which says why.
+Frame generation and Alternate Eye Rendering cannot be used together. Whichever one is blocked is greyed out in the menu, which says why.
 
 ## Performance tips
 
@@ -69,6 +69,7 @@ Frame generation and alternate eye cannot be used together. Whichever one is blo
 - Tested in real headsets on two setups: Pimax Dream Air through SteamVR, and Meta Quest 3 through Virtual Desktop's VDXR, with an RTX 5090. Other headsets and graphics cards should work through OpenXR but have not been tried. Reports are welcome.
 - The launcher is skipped. Splash screens and menus show on a flat screen in front of you.
 - In VR the game runs in a 2560x1440 window, and your monitor shows the left eye. The game is told VSync is off, so your headset sets the frame rate. Your saved game settings are not changed unless you save settings in the game's own menu while it runs.
+- Alternate Eye Rendering, Depth Based can make small bright lights and glows flicker between two spots, because they carry no depth for the other eye to be made from. Basic does not, but judders more.
 - One scripted ride can hang the GPU when its zoomed in cutscene shots are drawn in 3D. Cutscenes on a screen is set to Zoomed shots by default, which avoids it.
 - If something goes wrong, the log is `RiftApartVR.log` in the game folder, with earlier ones in `vrlab_logs`. Please attach it to an issue.
 

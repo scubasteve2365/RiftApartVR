@@ -80,7 +80,10 @@ bool XrInit(const wchar_t* dir) {
         const std::wstring folder = std::wstring(dir) + L"ofxr";
         const std::wstring manifest = folder + L"\\XR_APILAYER_OFXRBridge.json";
         const int fgMode = static_cast<int>(GetPrivateProfileIntW(L"VR", L"FrameGen", 0, ini.c_str()));
-        if (fgMode != 0) {
+        // FrameGenAlwaysLoad: load OFXR at every launch, idle (enabled=0) while frame generation is Off, so turning it on later
+        // in the menu works at once instead of at the next launch. OFXR can only join at the start.
+        const bool alwaysLoad = GetPrivateProfileIntW(L"VR", L"FrameGenAlwaysLoad", 1, ini.c_str()) != 0;
+        if (fgMode != 0 || alwaysLoad) {
             if (GetFileAttributesW(manifest.c_str()) != INVALID_FILE_ATTRIBUTES) {
                 // The menu's choices, as OFXR reads them at its start. pacing_mode 0: its director hangs at this game's title on
                 // RigB. lower_vram 1: the HUD layer keeps its real image, with no optical flow run over it.
@@ -93,7 +96,7 @@ bool XrInit(const wchar_t* dir) {
                 CopyFileW((std::wstring(dir) + L"amd_fidelityfx_dx12.dll").c_str(), (folder + L"\\ofxr_amd_fidelityfx_framegeneration_dx12.dll").c_str(), TRUE);
                 CopyFileW((std::wstring(dir) + L"nvngx_dlssg.dll").c_str(), (folder + L"\\nvngx_dlssg.dll").c_str(), TRUE);
                 char profile[400];
-                sprintf_s(profile, "[ofxr]\r\nenabled=1\r\nframe_generation=%d\r\nbackend=%d\r\nmotion_vectors=0\r\noverlay_position=0\r\nlower_vram=1\r\npacing_mode=0\r\npreset=%d\r\nscale=%d\r\ntriple_frame_gen=%d\r\ndiagnostics=%d\r\n", fgType, triple ? 3 : 2, preset, scale, triple ? 1 : 0, diagnostics);
+                sprintf_s(profile, "[ofxr]\r\nenabled=%d\r\nframe_generation=%d\r\nbackend=%d\r\nmotion_vectors=0\r\noverlay_position=0\r\nlower_vram=1\r\npacing_mode=0\r\npreset=%d\r\nscale=%d\r\ntriple_frame_gen=%d\r\ndiagnostics=%d\r\n", fgMode != 0 ? 1 : 0, fgType, triple ? 3 : 2, preset, scale, triple ? 1 : 0, diagnostics);
                 const std::wstring profilePath = folder + L"\\settings\\Profiles\\RiftApart.exe.ini";
                 if (FILE* f = _wfopen(profilePath.c_str(), L"wb")) {
                     fputs(profile, f);
@@ -103,7 +106,7 @@ bool XrInit(const wchar_t* dir) {
                 SetEnvironmentVariableW(L"XR_ENABLE_API_LAYERS", L"XR_APILAYER_OFXRBridge");
                 // Its settings stay in its own folder, apart from a tray install's.
                 SetEnvironmentVariableW(L"OFXR_BRIDGE_PROFILE_DIR", (folder + L"\\settings").c_str());
-                Log("XR frame generation on, mode %d type %d, layer in the ofxr folder", fgMode, fgType);
+                Log("XR frame generation layer loaded, mode %d type %d (%s)", fgMode, fgType, fgMode != 0 ? "on" : "idle until turned on");
             } else {
                 Log("XR frame generation chosen, but the ofxr folder has no layer: running without it");
             }
