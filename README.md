@@ -2,13 +2,21 @@
 
 Ratchet & Clank: Rift Apart in VR. Native stereo: both eyes from the same game tick. Third person, gamepad, OpenXR, DLSS in both eyes.
 
-Work in progress. Not released yet.
+Version 1.0.
+
+## What you need
+
+- Ratchet & Clank: Rift Apart on Steam (game version 3.630.1.0).
+- A PC VR headset with an OpenXR runtime: SteamVR, Virtual Desktop (VDXR), Pimax, and others.
+- A gamepad. There are no motion controls.
+- DLSS in both eyes needs an NVIDIA RTX card. On other cards choose another upscaler in the game; the eyes then draw at full size.
 
 ## Install
 
-1. Keep these three files together in any folder: `Install Rift Apart VR.bat`, `winhttp.dll`, `openxr_loader.dll`.
-2. Double-click the bat file. It finds the game through Steam and copies the two dll files into the game's folder.
+1. Unzip everything into any folder, keeping `Install Rift Apart VR.bat`, `winhttp.dll`, `openxr_loader.dll` and the `ofxr` folder together.
+2. Double-click the bat file. It finds the game through Steam and copies the mod into the game's folder. If Microsoft's Visual C++ runtime is missing it offers to download it from Microsoft (only frame generation's DLSS-G type needs it).
 3. Start your headset's OpenXR runtime, then start the game from Steam.
+4. In the game's graphics settings, set Texture Quality to Medium or High (see Performance tips).
 
 If it cannot find the game, or to remove the mod, run the bat file from a command prompt:
 
@@ -68,8 +76,19 @@ The mod tells the game VSync is off while in VR, so the headset sets the frame r
 - In SteamVR, set this game's Throttling Behavior to Limit at your headset's refresh rate (SteamVR Settings, Video, Per-Application Video Settings). On Auto, SteamVR can drop the game to half rate and keep it there.
 - If lowering Resolution does not raise the frame rate, the CPU is the limit, not the graphics card.
 
+## Known issues
+
+- One scripted ride can hang the GPU when its zoomed in cutscene shots are drawn in 3D. Cutscenes on a screen is set to Zoomed shots by default, which avoids it.
+- Frame generation and alternate eye cannot be used together. The menu greys out whichever one is blocked and says why.
+- Frame generation pacing Director has frozen the game on one test PC. Every launch starts on Framework.
+- Optical flow frame generation adds latency you may notice.
+
+## Logs
+
+The mod writes `RiftApartVR.log` in the game's folder, and keeps earlier ones in `vrlab_logs`. Include them when reporting a problem.
+
 ## Licence
 
 MIT. Uses MinHook (BSD 2-Clause) and the OpenXR loader (Apache 2.0). DLSS files are the game's own.
 
-The `ofxr` folder is a separate program, OFXR-BRIDGE by tig3rmast3r and contributors, under GPL-3.0, not under this mod's licence. Its licence and source link are in that folder.
+The `ofxr` folder is a separate program, OFXR-BRIDGE by tig3rmast3r and contributors, under GPL-3.0, not under this mod's licence. Its licence, the exact upstream source commit and the patch used for this build are in that folder (`SOURCE.txt`, `source\riftapartvr.patch`).

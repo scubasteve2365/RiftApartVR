@@ -30,7 +30,7 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 100
+#define BUILD_NUMBER 101
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -511,7 +511,7 @@ static std::atomic<ULONGLONG> g_lastTrigger{0};
 // 1 while the pause menu is up. Found by comparing .data, tools\\flag_watch.py. Beside the frame counter 0x6794fe8.
 static const size_t kPausedFlag = 0x6794fd0;
 // Logging and counters that only help development. LabProbes=0 in the ini, or `probes 0`, turns them off.
-static std::atomic<bool> g_labProbes{true};
+static std::atomic<bool> g_labProbes{false};
 static void UpdateMode() {
     uint8_t* main = ActiveView();
     bool world = false;
@@ -667,7 +667,7 @@ static void LogHeaps(double frames) {
 }
 
 static void LogMemory() {
-    InstallHeapProbe();
+    if (g_labProbes) InstallHeapProbe();
     MEMORYSTATUSEX m{};
     m.dwLength = sizeof(m);
     GlobalMemoryStatusEx(&m);
@@ -1964,7 +1964,7 @@ static void SaveSetting(const wchar_t* name, int value) {
 }
 
 // ---- menu sounds: short tones made here, played from memory, so nothing extra ships. ----
-enum MenuSoundKind { kSoundMove, kSoundChange, kSoundTab, kSoundOpen, kSoundClose, kSoundCount };
+enum MenuSoundKind { kSoundMove, kSoundChange, kSoundTab, kSoundOpen, kSoundClose, kSoundRefuse, kSoundCount };
 static void MenuSound(MenuSoundKind kind) {
     const int level = g_menuSound.load();
     if (level <= 0) return;
@@ -1973,7 +1973,7 @@ static void MenuSound(MenuSoundKind kind) {
     if (wav.empty()) {
         const int rate = 22050;
         // Start and end pitch (Hz) and length (ms) of each sound: a soft tick, a brighter tick, a two-step sweep, rising and falling chimes.
-        static const float spec[kSoundCount][3] = {{1500, 1500, 22}, {2100, 2300, 26}, {1200, 1900, 46}, {700, 1500, 90}, {1500, 700, 90}};
+        static const float spec[kSoundCount][3] = {{1500, 1500, 22}, {2100, 2300, 26}, {1200, 1900, 46}, {700, 1500, 90}, {1500, 700, 90}, {320, 260, 70}};
         static const float amp[4] = {0, 0.10f, 0.22f, 0.40f};
         const int n = static_cast<int>(rate * spec[kind][2] / 1000);
         std::vector<int16_t> pcm(n);
@@ -2004,6 +2004,30 @@ static void MenuSound(MenuSoundKind kind) {
         memcpy(&wav[44], pcm.data(), dataBytes);
     }
     PlaySoundW(reinterpret_cast<LPCWSTR>(wav.data()), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
+}
+
+// Frame generation and alternate eye exclude each other. A row that cannot be used now says why instead of its own explanation.
+static const wchar_t* MenuItemBlocked(MenuItem item) {
+    switch (item) {
+    case kItemFrameGen:
+        if (g_alternateSetting) return L"Not available while Stereo is on Alternate. Set Stereo to Native first.";
+        break;
+    case kItemFgType:
+    case kItemFgQuality:
+    case kItemFgDetail:
+        if (g_alternateSetting) return L"Not available while Stereo is on Alternate. Set Stereo to Native first.";
+        if (g_fgMode == 0) return L"Only used with frame generation. Turn Frame generation on first.";
+        break;
+    case kItemFgPacing:
+        if (g_alternateSetting || g_fgMode == 0) return L"Only used with frame generation.";
+        break;
+    case kItemStereo:
+        if (g_fgMode != 0) return L"Alternate is not available while Frame generation is on. Turn Frame generation off first.";
+        break;
+    default:
+        break;
+    }
+    return nullptr;
 }
 
 // Name, value and a short explanation of one item.
@@ -2040,8 +2064,8 @@ static void MenuItemText(MenuItem item, wchar_t (&name)[64], wchar_t (&value)[64
         OfxrSnapshotV2 v;
         const bool loaded = OfxrSnapshot(&v);
         const bool threeX = g_fgMode == 2 && g_fgType != 1 && g_fgType != 3;
-        swprintf_s(value, L"%ls%ls", g_fgMode == 0 ? L"Off" : threeX ? L"3X" : L"2X", g_fgMode == 0 ? L"" : g_alternateSetting ? L", off in alternate" : !loaded ? L" next launch" : v.errors ? L" failed" : L"");
-        *tip = L"Adds made-up frames between real ones for smoother motion, using OFXR. Costs some latency. Turned off while Stereo is on alternate.";
+        swprintf_s(value, L"%ls%ls", g_fgMode == 0 || g_alternateSetting ? L"Off" : threeX ? L"3X" : L"2X", g_fgMode == 0 || g_alternateSetting ? L"" : !loaded ? L" next launch" : v.errors ? L" failed" : L"");
+        *tip = L"Adds made-up frames between real ones for smoother motion, using OFXR. Costs some latency. Cannot be used with Stereo on Alternate.";
         break;
     }
     case kItemFgType: {
@@ -2066,7 +2090,7 @@ static void MenuItemText(MenuItem item, wchar_t (&name)[64], wchar_t (&value)[64
     case kItemStereo:
         wcscpy_s(name, L"Stereo");
         wcscpy_s(value, !g_alternateSetting ? L"Native" : g_rebuildSetting ? L"Alternate, depth rebuild" : L"Alternate, plain");
-        *tip = L"Native draws both eyes every frame. Alternate draws one eye per frame for speed; depth rebuild makes the other eye from it.";
+        *tip = L"Native draws both eyes every frame. Alternate draws one eye per frame for speed; depth rebuild makes the other eye from it. Alternate cannot be used with frame generation.";
         break;
     case kItemVendor:
         wcscpy_s(name, L"Vendor screen up close");
@@ -2176,20 +2200,21 @@ static void MenuDraw() {
         wchar_t name[64], value[64];
         const wchar_t* t = L"";
         MenuItemText(tab.items[i], name, value, &t);
+        const wchar_t* const blocked = MenuItemBlocked(tab.items[i]);
         if (sel) {
-            tip = t;
+            tip = blocked ? blocked : t;
             fill(28, top, kMenuW - 28, top + rowH - 6, cyan);
             const POINT mark[] = {{14, top + 18}, {24, top + 32}, {14, top + 46}};
             poly(mark, 3, gold);
         } else {
             fill(48, top + rowH - 4, kMenuW - 48, top + rowH - 3, RGB(40, 78, 130));
         }
-        SetTextColor(dc, sel ? ink : pale);
+        SetTextColor(dc, blocked ? (sel ? RGB(70, 98, 120) : RGB(92, 112, 140)) : sel ? ink : pale);
         RECT a{48, top, kMenuW - 48, top + rowH - 6};
         DrawTextW(dc, name, -1, &a, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
         if (value[0]) {
             wchar_t shown[72];
-            swprintf_s(shown, sel ? L"\u2039  %ls  \u203a" : L"%ls", value);
+            swprintf_s(shown, sel && !blocked ? L"\u2039  %ls  \u203a" : L"%ls", value);
             DrawTextW(dc, shown, -1, &a, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
         }
     }
@@ -2258,6 +2283,11 @@ static DWORD WINAPI SnapshotThread(void*);
 static void MenuChange(int dir) {
     const MenuItem item = kTabs[g_menuTab].items[std::clamp(g_menuRow, 0, static_cast<int>(kTabs[g_menuTab].items.size()) - 1)];
     const int step = dir < 0 ? -1 : 1;
+    if (MenuItemBlocked(item)) {
+        MenuSound(kSoundRefuse);
+        Log("MENU item %d is not available now", static_cast<int>(item));
+        return;
+    }
     switch (item) {
     case kItemRecenter:
         if (dir != 0) return;
@@ -3514,7 +3544,7 @@ static DWORD WINAPI ProbeThread(void*) {
         CreateThread(nullptr, 0, ThreadSampler, nullptr, 0, nullptr);
         CreateThread(nullptr, 0, StackSampler, nullptr, 0, nullptr);
         // Lab only: PIX's GPU capture layer must be in the process before the game makes its device. RigB path, off by default.
-        g_autoStacks = GetPrivateProfileIntW(L"Lab", L"AutoStacks", 1, early.c_str()) != 0;
+        g_autoStacks = GetPrivateProfileIntW(L"Lab", L"AutoStacks", 0, early.c_str()) != 0;
         if (GetPrivateProfileIntW(L"Lab", L"PixCapturer", 0, early.c_str()) != 0) {
             const HMODULE pix = LoadLibraryW(L"C:\\VRLab\\bin\\pix\\Microsoft PIX\\2603.25\\WinPixGpuCapturer.dll");
             Log("PIX capturer %s", pix ? "loaded" : "not loaded");
@@ -3544,13 +3574,18 @@ static DWORD WINAPI ProbeThread(void*) {
     XrSetOverlap(false);
     XrSetEndOnWorker(g_frameHandoffXr.load());
     {
-        const UINT alt = GetPrivateProfileIntW(L"VR", L"AlternateEye", 0, ini.c_str());
+        UINT alt = GetPrivateProfileIntW(L"VR", L"AlternateEye", 0, ini.c_str());
+        if (alt != 0 && g_fgMode != 0) {
+            Log("INI frame generation and alternate eye were both on: alternate eye off");
+            alt = 0;
+            WritePrivateProfileStringW(L"VR", L"AlternateEye", L"0", ini.c_str());
+        }
         g_alternateSetting = alt != 0;
         g_rebuildSetting = alt == 2;
         XrRebuildSetMode(alt == 2 ? 1 : 0);
     }
     g_aimDot = static_cast<int>(GetPrivateProfileIntW(L"VR", L"AimDot", 1, ini.c_str()));
-    g_labProbes = GetPrivateProfileIntW(L"VR", L"LabProbes", 1, ini.c_str()) != 0;
+    g_labProbes = GetPrivateProfileIntW(L"VR", L"LabProbes", 0, ini.c_str()) != 0;
     g_skipLauncher = g_skipLauncherSetting;
     InstallSlProbe();
     if (GetPrivateProfileIntW(L"VR", L"VtProbe", 0, ini.c_str())) {
@@ -3637,7 +3672,7 @@ static DWORD WINAPI ProbeThread(void*) {
         }
         {
             static ULONGLONG lastPerf = 0;
-            if (g_labProbes && now - lastPerf >= 5000) {
+            if (now - lastPerf >= 5000) {  // always: cheap counters, the main thing a player's log is read for
                 lastPerf = now;
                 const uint64_t n = g_perfFrames.exchange(0);
                 if (n) {

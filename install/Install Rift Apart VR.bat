@@ -9,12 +9,22 @@ set "RAVR_CODE=%ERRORLEVEL%"
 if not defined RAVR_NOPAUSE pause
 exit /b %RAVR_CODE%
 #>
-# Rift Apart VR installer. Copies two files into the game's folder, or takes them out again.
+# Rift Apart VR installer. Copies the mod's two files and its ofxr folder (frame generation) into the game's folder,
+# or takes them out again.
 # Double-click to install. To remove the mod, run it from a command prompt with: uninstall
 # To choose the folder yourself, run it with the game's folder in double quotes.
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -LiteralPath $env:RAVR_BAT
 $files = 'winhttp.dll', 'openxr_loader.dll'
+# Frame generation (OFXR-BRIDGE, GPL-3.0, see ofxr\SOURCE.txt). Copied as a folder, removed as a folder.
+$ofxrFolder = 'ofxr'
+$vcUrl = 'https://aka.ms/vs/17/release/vc_redist.x64.exe'
+
+function Test-VcRuntime {
+    $key = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64' -ErrorAction SilentlyContinue
+    if ($key -and $key.Installed -eq 1) { return $true }
+    return (Test-Path -LiteralPath (Join-Path $env:WINDIR 'System32\vcruntime140_1.dll'))
+}
 $appId = '1895880'
 $uninstall = $env:RAVR_A1 -ieq 'uninstall'
 $given = if ($uninstall) { $env:RAVR_A2 } else { $env:RAVR_A1 }
@@ -72,6 +82,11 @@ try {
             $saved = "$target.before-vr"
             if (Test-Path -LiteralPath $saved) { Move-Item -LiteralPath $saved $target -Force; Write-Host "Put back the earlier $file" }
         }
+        $ofxrTarget = Join-Path $game $ofxrFolder
+        if ((Test-Path -LiteralPath $marker) -and (Test-Path -LiteralPath $ofxrTarget)) {
+            Remove-Item -LiteralPath $ofxrTarget -Recurse -Force
+            Write-Host "Removed the $ofxrFolder folder"
+        }
         if (Test-Path -LiteralPath $marker) { Remove-Item -LiteralPath $marker -Force }
         Write-Host ''
         Write-Host 'Removed. Your settings file RiftApartVR.ini was left in place. Delete it if you want.'
@@ -79,9 +94,13 @@ try {
     }
     foreach ($file in $files) {
         if (-not (Test-Path -LiteralPath (Join-Path $here $file))) {
-            Write-Host "$file is missing. Keep this file next to the two dll files."
+            Write-Host "$file is missing. Keep this file next to the two dll files and the ofxr folder."
             exit 4
         }
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $here $ofxrFolder))) {
+        Write-Host "The $ofxrFolder folder is missing. Keep this file next to it."
+        exit 4
     }
     foreach ($file in $files) {
         $target = Join-Path $game $file
@@ -96,10 +115,43 @@ try {
         if ($a -ne $b) { Write-Host "$file did not copy correctly."; exit 5 }
         Write-Host "Installed $file"
     }
+    # The ofxr folder: copied whole, every file checked. Settings the player changed in it (ofxr\settings) are kept.
+    $source = Join-Path $here $ofxrFolder
+    foreach ($item in Get-ChildItem -LiteralPath $source -Recurse -File) {
+        $relative = $item.FullName.Substring($source.Length).TrimStart('\')
+        $target = Join-Path (Join-Path $game $ofxrFolder) $relative
+        if ($relative -like 'settings\*' -and (Test-Path -LiteralPath $target)) { continue }
+        New-Item -ItemType Directory -Force -Path (Split-Path -LiteralPath $target) | Out-Null
+        Copy-Item -LiteralPath $item.FullName $target -Force
+        if ((Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash) {
+            Write-Host "$ofxrFolder\$relative did not copy correctly."
+            exit 5
+        }
+    }
+    Write-Host "Installed the $ofxrFolder folder (frame generation)"
     Set-Content -LiteralPath $marker -Value 'Rift Apart VR is installed here.'
+    # Frame generation's DLSS-G part needs Microsoft's Visual C++ runtime. The mod itself does not.
+    if (-not (Test-VcRuntime)) {
+        Write-Host ''
+        Write-Host "Microsoft's Visual C++ runtime (x64) is not installed. The mod runs without it, but frame generation's DLSS-G type needs it."
+        $answer = Read-Host 'Download and install it from Microsoft now? (Y/N)'
+        if ($answer -match '^[Yy]') {
+            $setup = Join-Path $env:TEMP 'vc_redist.x64.exe'
+            try {
+                Invoke-WebRequest -Uri $vcUrl -OutFile $setup -UseBasicParsing
+                Start-Process -FilePath $setup -ArgumentList '/install', '/passive', '/norestart' -Wait
+                if (Test-VcRuntime) { Write-Host 'Visual C++ runtime installed.' } else { Write-Host "It did not install. You can get it here: $vcUrl" }
+            } catch {
+                Write-Host "The download failed. You can get it here: $vcUrl"
+            }
+        } else {
+            Write-Host "You can install it later from: $vcUrl"
+        }
+    }
     Write-Host ''
     Write-Host 'Done. Start your headset app and OpenXR runtime, then start the game from Steam.'
     Write-Host 'In the game, click and hold both thumbsticks for half a second for the VR menu.'
+    Write-Host 'Tip: set Texture Quality to Medium or High in the game, not Ultra (see the README).'
     exit 0
 } catch {
     Write-Host "Something went wrong: $_"
