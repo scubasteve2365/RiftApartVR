@@ -82,7 +82,7 @@ bool XrInit(const wchar_t* dir) {
         const int fgMode = static_cast<int>(GetPrivateProfileIntW(L"VR", L"FrameGen", 0, ini.c_str()));
         // FrameGenAlwaysLoad: load OFXR at every launch, idle (enabled=0) while frame generation is Off, so turning it on later
         // in the menu works at once instead of at the next launch. OFXR can only join at the start.
-        const bool alwaysLoad = GetPrivateProfileIntW(L"VR", L"FrameGenAlwaysLoad", 1, ini.c_str()) != 0;
+        const bool alwaysLoad = GetPrivateProfileIntW(L"VR", L"FrameGenAlwaysLoad", 0, ini.c_str()) != 0;  // off: idle OFXR cost about 0.6 ms GPU per frame on RigB
         if (fgMode != 0 || alwaysLoad) {
             if (GetFileAttributesW(manifest.c_str()) != INVALID_FILE_ATTRIBUTES) {
                 // The menu's choices, as OFXR reads them at its start. pacing_mode 0: its director hangs at this game's title on

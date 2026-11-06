@@ -55,7 +55,7 @@ Click and hold both thumbsticks for half a second to open the menu in the headse
 
 | Setting | What it does |
 |---|---|
-| Frame generation | Off, 2X or 3X. Adds made-up frames between real ones for smoother motion, using OFXR-BRIDGE in the `ofxr` folder. Costs some latency. Off by default |
+| Frame generation | Off, 2X or 3X. Adds made-up frames between real ones for smoother motion, using OFXR-BRIDGE in the `ofxr` folder. Costs some latency. Off by default. Turning it on from Off needs a restart of the game, since OFXR can only load at start. Switching between 2X and 3X, and Off, work at once; after Off, a restart frees the small cost of OFXR sitting idle |
 | Frame generation type | Optical flow tracks motion in the picture itself, works on any card and is the usual choice. DLSS-G is NVIDIA's frame generation, for RTX 40 and 50 cards; it costs more. Hybrid is optical flow helped by the game's own motion vectors, and takes effect at the next launch. DLSS-G and Hybrid need DLSS chosen in the game |
 | Optical flow quality | Fast, Medium or Slow. Slow tracks motion best and costs the most |
 | Optical flow detail | 25 to 100%. The resolution motion is tracked at |

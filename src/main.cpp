@@ -2067,7 +2067,7 @@ static void MenuItemText(MenuItem item, wchar_t (&name)[64], wchar_t (&value)[64
         const bool loaded = OfxrSnapshot(&v);
         const bool threeX = g_fgMode == 2 && g_fgType != 1 && g_fgType != 3;
         swprintf_s(value, L"%ls%ls", g_fgMode == 0 || g_alternateSetting ? L"Off" : threeX ? L"3X" : L"2X", g_fgMode == 0 || g_alternateSetting ? L"" : !loaded ? L" next launch" : v.errors ? L" failed" : L"");
-        *tip = L"Adds made-up frames between real ones for smoother motion, using OFXR. Costs some latency. Not with Alternate Eye Rendering.";
+        *tip = L"Adds made-up frames between real ones, using OFXR. Costs some latency. Not with Alternate Eye Rendering. Turning it on from Off needs a restart. Off works at once; a restart frees its last bit of cost.";
         break;
     }
     case kItemFgType: {

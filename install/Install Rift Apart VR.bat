@@ -15,6 +15,9 @@ exit /b %RAVR_CODE%
 # To choose the folder yourself, run it with the game's folder in double quotes.
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -LiteralPath $env:RAVR_BAT
+# The mod's files sit in a files folder beside this bat in the release zip.
+$filesDir = Join-Path $here 'files'
+if (-not (Test-Path -LiteralPath $filesDir)) { $filesDir = $here }
 $files = 'winhttp.dll', 'openxr_loader.dll'
 # Frame generation (OFXR-BRIDGE, GPL-3.0, see ofxr\SOURCE.txt). Copied as a folder, removed as a folder.
 $ofxrFolder = 'ofxr'
@@ -102,13 +105,13 @@ try {
         exit 0
     }
     foreach ($file in $files) {
-        if (-not (Test-Path -LiteralPath (Join-Path $here $file))) {
-            Write-Host "$file is missing. Keep this file next to the two dll files and the ofxr folder."
+        if (-not (Test-Path -LiteralPath (Join-Path $filesDir $file))) {
+            Write-Host "$file is missing. Keep this bat next to the files folder from the zip."
             exit 4
         }
     }
-    if (-not (Test-Path -LiteralPath (Join-Path $here $ofxrFolder))) {
-        Write-Host "The $ofxrFolder folder is missing. Keep this file next to it."
+    if (-not (Test-Path -LiteralPath (Join-Path $filesDir $ofxrFolder))) {
+        Write-Host "The $ofxrFolder folder is missing from the files folder. Unzip the whole release again."
         exit 4
     }
     foreach ($file in $files) {
@@ -118,14 +121,14 @@ try {
             Copy-Item -LiteralPath $target "$target.before-vr" -Force
             Write-Host "Kept the earlier $file as $file.before-vr"
         }
-        Copy-Item -LiteralPath (Join-Path $here $file) $target -Force
-        $a = (Get-FileHash -LiteralPath (Join-Path $here $file) -Algorithm SHA256).Hash
+        Copy-Item -LiteralPath (Join-Path $filesDir $file) $target -Force
+        $a = (Get-FileHash -LiteralPath (Join-Path $filesDir $file) -Algorithm SHA256).Hash
         $b = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
         if ($a -ne $b) { Write-Host "$file did not copy correctly."; exit 5 }
         Write-Host "Installed $file"
     }
     # The ofxr folder: copied whole, every file checked. Settings the player changed in it (ofxr\settings) are kept.
-    $source = Join-Path $here $ofxrFolder
+    $source = Join-Path $filesDir $ofxrFolder
     foreach ($item in Get-ChildItem -LiteralPath $source -Recurse -File) {
         $relative = $item.FullName.Substring($source.Length).TrimStart('\')
         $target = Join-Path (Join-Path $game $ofxrFolder) $relative
