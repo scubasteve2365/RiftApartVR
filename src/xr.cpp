@@ -31,6 +31,26 @@ static XrSwapchain g_chain[2];
 static std::vector<XrSwapchainImageD3D12KHR> g_images[2];
 static int g_chainW, g_chainH;
 static std::atomic<int> g_recW{0}, g_recH{0};
+static uint32_t g_maxW = 0, g_maxH = 0;
+// Picture setting: 0 Auto (Steady on Virtual Desktop, Panel on everything else), 1 Steady (projection layer), 2 Panel (quad layers).
+static std::atomic<int> g_pictureMode{0};
+static char g_runtimeName[128], g_systemName[256];
+static bool g_runtimeVd, g_picFailed;
+static bool PictureSteady() {
+    const int m = g_pictureMode.load();
+    return !g_picFailed && (m == 1 || (m == 0 && g_runtimeVd));
+}
+static void PictureLog() {
+    static const char* const names[3] = {"Auto", "Steady", "Panel"};
+    Log("PICTURE runtime '%s', headset '%s', setting %s, in use %s", g_runtimeName, g_systemName, names[g_pictureMode.load() % 3], PictureSteady() ? "Steady (projection layer)" : "Panel (quad layers)");
+}
+void XrPictureSet(int mode) {
+    g_pictureMode = ((mode % 3) + 3) % 3;
+    PictureLog();
+}
+int XrPictureGet() { return g_pictureMode.load(); }
+bool XrPictureSteady() { return PictureSteady(); }
+const char* XrRuntimeName() { return g_runtimeName; }
 static std::atomic<XrTime> g_predicted{0};
 static std::atomic<int> g_state{XR_SESSION_STATE_UNKNOWN};
 static std::atomic<int64_t> g_periodNs{0};
@@ -40,6 +60,7 @@ XRFN(xrEnumerateInstanceExtensionProperties)
 XRFN(xrCreateInstance)
 XRFN(xrGetSystem)
 XRFN(xrGetSystemProperties)
+XRFN(xrGetInstanceProperties)
 XRFN(xrEnumerateViewConfigurationViews)
 XRFN(xrCreateSession)
 XRFN(xrCreateReferenceSpace)
@@ -140,6 +161,14 @@ bool XrInit(const wchar_t* dir) {
         !Fn("xrCreateSwapchain", p_xrCreateSwapchain) || !Fn("xrDestroySwapchain", p_xrDestroySwapchain) || !Fn("xrEnumerateSwapchainImages", p_xrEnumerateSwapchainImages) || !Fn("xrAcquireSwapchainImage", p_xrAcquireSwapchainImage) ||
         !Fn("xrWaitSwapchainImage", p_xrWaitSwapchainImage) || !Fn("xrReleaseSwapchainImage", p_xrReleaseSwapchainImage) || !Fn("xrGetD3D12GraphicsRequirementsKHR", p_xrGetD3D12GraphicsRequirementsKHR))
         return false;
+    // The runtime's own name: the Picture setting's Auto will choose by it (VirtualDesktopXR, SteamVR/OpenXR, ...).
+    if (Fn("xrGetInstanceProperties", p_xrGetInstanceProperties)) {
+        XrInstanceProperties ip{XR_TYPE_INSTANCE_PROPERTIES};
+        if (XR_SUCCEEDED(p_xrGetInstanceProperties(g_inst, &ip)))
+            strncpy_s(g_runtimeName, ip.runtimeName, _TRUNCATE);
+            g_runtimeVd = strstr(ip.runtimeName, "VirtualDesktop") != nullptr;
+            Log("XR runtime %s %u.%u.%u", ip.runtimeName, XR_VERSION_MAJOR(ip.runtimeVersion), XR_VERSION_MINOR(ip.runtimeVersion), XR_VERSION_PATCH(ip.runtimeVersion));
+    }
     XrSystemGetInfo si{XR_TYPE_SYSTEM_GET_INFO};
     si.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
     r = p_xrGetSystem(g_inst, &si, &g_sys);
@@ -149,6 +178,7 @@ bool XrInit(const wchar_t* dir) {
     }
     XrSystemProperties sp{XR_TYPE_SYSTEM_PROPERTIES};
     p_xrGetSystemProperties(g_inst, g_sys, &sp);
+    strncpy_s(g_systemName, sp.systemName, _TRUNCATE);
     uint32_t n = 0;
     p_xrEnumerateViewConfigurationViews(g_inst, g_sys, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &n, nullptr);
     std::vector<XrViewConfigurationView> v(n, {XR_TYPE_VIEW_CONFIGURATION_VIEW});
@@ -156,8 +186,15 @@ bool XrInit(const wchar_t* dir) {
     if (n < 2) return false;
     g_recW = v[0].recommendedImageRectWidth;
     g_recH = v[0].recommendedImageRectHeight;
+    g_maxW = v[0].maxImageRectWidth;
+    g_maxH = v[0].maxImageRectHeight;
     Log("XR system '%s', recommended %ux%u per eye, max %ux%u", sp.systemName, v[0].recommendedImageRectWidth, v[0].recommendedImageRectHeight, v[0].maxImageRectWidth, v[0].maxImageRectHeight);
     return true;
+}
+
+void XrMaxEyeSize(int* w, int* h) {
+    *w = static_cast<int>(g_maxW);
+    *h = static_cast<int>(g_maxH);
 }
 
 void XrRecommended(int* w, int* h) {
@@ -579,6 +616,7 @@ bool XrStartSession(void* device, void* queue, int eyeW, int eyeH) {
     g_fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (HANDLE t = CreateThread(nullptr, 0, XrWorker, nullptr, 0, nullptr)) CloseHandle(t);
     Log("XR session created, swapchains %dx%d", eyeW, eyeH);
+    PictureLog();
     return true;
 }
 
@@ -609,6 +647,8 @@ static bool EnsureUiChain(UiChain& c, int w, int h) {
     Log("XR UI swapchain %dx%d", w, h);
     return true;
 }
+
+#include "picture.inc"
 
 // Places the HUD ahead of the head, level, and lets it lag: it only starts to follow past 20 degrees.
 static void PlaceHud(const PendingPose& pose) {
@@ -709,6 +749,7 @@ static bool MenuRecord(ID3D12GraphicsCommandList* list, XrCompositionLayerQuad* 
         g_menuDirty = true;
     }
     if (!g_menuPlaced && MenuPlace()) g_menuPlaced = true;
+    if (PictureSteady() && !PanelHave(kPanelMenu)) g_menuDirty = true;
     if (g_menuDirty.exchange(false)) {
         void* mapped = nullptr;
         if (SUCCEEDED(g_menuUpload->Map(0, nullptr, &mapped))) {
@@ -745,6 +786,7 @@ static bool MenuRecord(ID3D12GraphicsCommandList* list, XrCompositionLayerQuad* 
         list->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
         std::swap(bar.Transition.StateBefore, bar.Transition.StateAfter);
         list->ResourceBarrier(1, &bar);
+        PanelMirror(list, kPanelMenu, dst, w, h, g_format);
     }
     *out = {XR_TYPE_COMPOSITION_LAYER_QUAD};
     out->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
@@ -820,7 +862,7 @@ static bool DotRecord(ID3D12GraphicsCommandList* list, XrCompositionLayerQuad* o
         }
         g_dotUpload->Unmap(0, nullptr);
     }
-    if (!g_dotReady) {
+    if (!g_dotReady || (PictureSteady() && !PanelHave(kPanelDot))) {
         uint32_t idx = 0;
         p_xrAcquireSwapchainImage(g_dot.chain, nullptr, &idx);
         XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
@@ -848,6 +890,7 @@ static bool DotRecord(ID3D12GraphicsCommandList* list, XrCompositionLayerQuad* o
         list->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
         std::swap(bar.Transition.StateBefore, bar.Transition.StateAfter);
         list->ResourceBarrier(1, &bar);
+        PanelMirror(list, kPanelDot, dst, kDotSize, kDotSize, g_format);
         g_dotReady = true;
     }
     float dir[3], from[3];
@@ -1003,8 +1046,34 @@ void XrOnPresentScreen(void* resource, int width, int height, int dxgiFormat) {
     std::swap(bar[0].Transition.StateBefore, bar[0].Transition.StateAfter);
     std::swap(bar[1].Transition.StateBefore, bar[1].Transition.StateAfter);
     list->ResourceBarrier(2, bar);
+    PanelMirror(list, kPanelScreen, dst, width, height, fmt);
     XrCompositionLayerQuad menuLayer{XR_TYPE_COMPOSITION_LAYER_QUAD};
     const bool haveMenu = MenuRecord(list, &menuLayer);
+    XrCompositionLayerQuad q{XR_TYPE_COMPOSITION_LAYER_QUAD};
+    q.space = g_space;
+    q.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+    q.subImage.swapchain = g_screen.chain;
+    q.subImage.imageRect.extent = {width, height};
+    q.pose = g_screenPose;
+    q.size = {kScreenWidth, kScreenWidth * height / static_cast<float>(width)};
+    bool steady = false;
+    if (PictureSteady()) {
+        XrViewLocateInfo li{XR_TYPE_VIEW_LOCATE_INFO};
+        li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+        li.displayTime = g_openTime;
+        li.space = g_space;
+        XrViewState vs{XR_TYPE_VIEW_STATE};
+        uint32_t n = 0;
+        XrView v[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+        if (XR_SUCCEEDED(p_xrLocateViews(g_sess, &li, &vs, 2, &n, v)) && n == 2 && (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
+            PanelsBegin();
+            PanelAdd(kPanelScreen, q);
+            if (haveMenu) PanelAdd(kPanelMenu, menuLayer);
+            const XrPosef poses[2] = {v[0].pose, v[1].pose};
+            const XrFovf fovs[2] = {v[0].fov, v[1].fov};
+            steady = PanelsRender(list, poses, fovs, true);
+        }
+    }
     list->Close();
     ID3D12CommandList* lists[] = {list};
     g_queue->ExecuteCommandLists(1, lists);
@@ -1014,18 +1083,12 @@ void XrOnPresentScreen(void* resource, int width, int height, int dxgiFormat) {
     XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     p_xrReleaseSwapchainImage(g_screen.chain, &ri);
     MenuRelease();
-    XrCompositionLayerQuad q{XR_TYPE_COMPOSITION_LAYER_QUAD};
-    q.space = g_space;
-    q.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-    q.subImage.swapchain = g_screen.chain;
-    q.subImage.imageRect.extent = {width, height};
-    q.pose = g_screenPose;
-    q.size = {kScreenWidth, kScreenWidth * height / static_cast<float>(width)};
-    const XrCompositionLayerBaseHeader* layers[] = {reinterpret_cast<XrCompositionLayerBaseHeader*>(&q), reinterpret_cast<XrCompositionLayerBaseHeader*>(&menuLayer)};
+    PanelsRelease();
+    const XrCompositionLayerBaseHeader* layers[] = {steady ? reinterpret_cast<XrCompositionLayerBaseHeader*>(&g_picLayer) : reinterpret_cast<XrCompositionLayerBaseHeader*>(&q), reinterpret_cast<XrCompositionLayerBaseHeader*>(&menuLayer)};
     XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
     ei.displayTime = g_openTime;
     ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-    ei.layerCount = haveMenu ? 2 : 1;
+    ei.layerCount = !steady && haveMenu ? 2 : 1;
     ei.layers = layers;
     const XrResult r = p_xrEndFrame(g_sess, &ei);
     if (XR_FAILED(r)) Log("XR xrEndFrame failed %d (screen)", static_cast<int>(r));
@@ -1319,14 +1382,17 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
         std::swap(bar[1].Transition.StateBefore, bar[1].Transition.StateAfter);
         if (fromRebuild) list->ResourceBarrier(1, &bar[1]);
         else list->ResourceBarrier(2, bar);
+        if (g_cinema) PanelMirror(list, kPanelCinema + e, dst, g_chainW, g_chainH, g_format);
     }
     static XrCompositionLayerQuad quads[kUiSlots];
+    int quadSlot[kUiSlots] = {};
     uint32_t quadCount = 0;
     PlaceHud(pose);
     bool uiAcquired[kUiSlots] = {};
     for (int i = 0; i < uiCount && i < kUiSlots; ++i) {
         if (!ui[i].resource || !EnsureUiChain(g_ui[i], ui[i].width, ui[i].height)) continue;
         const auto addQuad = [&]() {
+            quadSlot[quadCount] = i;
             XrCompositionLayerQuad& q = quads[quadCount++];
             q = {XR_TYPE_COMPOSITION_LAYER_QUAD};
             q.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;  // premultiplied, as Coherent draws it
@@ -1376,6 +1442,7 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
         std::swap(bar[0].Transition.StateBefore, bar[0].Transition.StateAfter);
         std::swap(bar[1].Transition.StateBefore, bar[1].Transition.StateAfter);
         list->ResourceBarrier(2, bar);
+        PanelMirror(list, i, dst, ui[i].width, ui[i].height, g_format);
         addQuad();
     }
     MirrorEye(list, static_cast<ID3D12Resource*>(resources[0]), static_cast<D3D12_RESOURCE_STATES>(states[0]));
@@ -1384,6 +1451,20 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
     dotLayer = {XR_TYPE_COMPOSITION_LAYER_QUAD};
     const bool haveMenu = MenuRecord(list, &menuLayer);
     const bool haveDot = !g_cinema && DotRecord(list, &dotLayer, pose);
+    bool steady = false;
+    const int cinemaBandH = std::min(g_chainH, g_chainW * 9 / 16);
+    if (PictureSteady()) {
+        PanelsBegin();
+        if (g_cinema)
+            for (int e = 0; e < 2; ++e)
+                PanelAddRaw(kPanelCinema + e, g_screenPose, kScreenWidth, kScreenWidth * cinemaBandH / static_cast<float>(g_chainW), 0, (g_chainH - cinemaBandH) / 2, g_chainW, cinemaBandH, false, 1 << e);
+        for (uint32_t i = 0; i < quadCount; ++i) PanelAdd(quadSlot[i], quads[i]);
+        if (haveDot) PanelAdd(kPanelDot, dotLayer);
+        if (haveMenu) PanelAdd(kPanelMenu, menuLayer);
+        const XrPosef poses[2] = {pv[0].pose, pv[1].pose};
+        const XrFovf fovs[2] = {pv[0].fov, pv[1].fov};
+        steady = PanelsRender(list, poses, fovs, g_cinema);
+    }
     if (copyTimed) {
         list->EndQuery(g_copyHeap, D3D12_QUERY_TYPE_TIMESTAMP, copyIndex + 1);
         list->ResolveQueryData(g_copyHeap, D3D12_QUERY_TYPE_TIMESTAMP, copyIndex, 2, g_copyRead, static_cast<UINT64>(copyIndex) * 8);
@@ -1396,6 +1477,7 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
     g_ringIndex = (g_ringIndex + 1) % kRing;
     MenuRelease();
     DotRelease();
+    PanelsRelease();
     for (int e = 0; e < 2; ++e) {
         if (!copyEye[e]) continue;
         XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
@@ -1421,7 +1503,10 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
     static const XrCompositionLayerBaseHeader* layers[4 + kUiSlots];
     uint32_t layerCount = 0;
     static XrCompositionLayerQuad cinema[2];
-    if (g_cinema) {
+    if (steady) {
+        if (!g_cinema) layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer);
+        layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&g_picLayer);
+    } else if (g_cinema) {
         // The middle band of each eye's image, 16 by 9, one quad per eye at the same place in the room. Same tick, real depth.
         const int bandH = std::min(g_chainH, g_chainW * 9 / 16);
         for (int e = 0; e < 2; ++e) {
@@ -1439,9 +1524,11 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
     } else {
         layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer);
     }
-    for (uint32_t i = 0; i < quadCount; ++i) layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&quads[i]);
-    if (haveDot) layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&dotLayer);
-    if (haveMenu) layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&menuLayer);
+    if (!steady) {
+        for (uint32_t i = 0; i < quadCount; ++i) layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&quads[i]);
+        if (haveDot) layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&dotLayer);
+        if (haveMenu) layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&menuLayer);
+    }
     XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
     ei.displayTime = g_openTime;
     ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;

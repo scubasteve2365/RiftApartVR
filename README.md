@@ -1,6 +1,6 @@
 # Rift Apart VR: Ratchet & Clank: Rift Apart in VR
 
-True stereo VR for Ratchet & Clank: Rift Apart. Both eyes are drawn from the same game tick by default, so there is no alternate-eye shimmer and no warping. For more speed, Clank's Space & Frame Warp draws one eye per frame and rebuilds the other. You play in third person with a gamepad, in a solid 3D world that stays level around you; there are no motion controls. DLSS works in both eyes.
+True stereo VR for Ratchet & Clank: Rift Apart. By default the mod runs Clank's Space & Frame Warp, Depth Based, which draws one eye each frame and rebuilds the other for speed. Set it to Off in the menu and both eyes are drawn from the same game tick. For more speed, Clank's Space & Frame Warp draws one eye per frame and rebuilds the other. You play in third person with a gamepad, in a solid 3D world that stays level around you; there are no motion controls. DLSS works in both eyes.
 
 **Download:** see [Releases](../../releases).
 
@@ -55,7 +55,8 @@ Click and hold both thumbsticks for half a second to open the menu in the headse
 
 | Setting | What it does |
 |---|---|
-| Clank's Space & Frame Warp | Off draws both eyes every frame and is the default. Depth Based draws one eye each frame and rebuilds the other from its own last picture, moved with the game's depth and motion, for a big speed-up; moving things such as Ratchet come from the eye drawn that frame, and DLSS is given corrected motion so they do not trail. Needs DLSS. Basic shows the other eye's last picture as it was, and judders more |
+| Clank's Space & Frame Warp | Depth Based is the default. Off draws both eyes every frame. Depth Based draws one eye each frame and rebuilds the other from its own last picture, moved with the game's depth and motion, for a big speed-up; moving things such as Ratchet come from the eye drawn that frame, and DLSS is given corrected motion so they do not trail. Needs DLSS |
+| Optimize game graphics for frame rate | Press A to set the game's own graphics the way a new install does. Applies right away |
 | Frame generation | Off, 2X or 3X. Adds made-up frames between real ones for smoother motion, using OFXR-BRIDGE in the `ofxr` folder. Costs some latency. Off by default. Turning it on from Off needs a restart of the game, since OFXR can only load at start. Switching between 2X and 3X, and Off, work at once; after Off, a restart frees the small cost of OFXR sitting idle |
 | Frame generation type | Optical flow tracks motion in the picture itself, works on any card and is the usual choice. DLSS-G is NVIDIA's frame generation, for RTX 40 and 50 cards; it costs more. Hybrid is optical flow helped by the game's own motion vectors, and takes effect at the next launch. DLSS-G and Hybrid need DLSS chosen in the game |
 | Optical flow quality | Fast, Medium or Slow. Slow tracks motion best and costs the most |
@@ -69,6 +70,7 @@ Frame generation and Clank's Space & Frame Warp cannot be used together. Whichev
 
 | Setting | What it does |
 |---|---|
+| Picture | How the HUD, menus and title screens reach your headset. Auto uses Steady on Virtual Desktop and Panel on everything else; the tooltip shows what was detected and what is in use. Steady draws them into each eye, for runtimes that stretch panels when you turn your head. Panel sends them as separate panels |
 | Vendor screen up close | When the game zooms onto a shop screen, it fills your view. Off leaves it in the world |
 | Aim dot | A small ring in the world where your shots go: Off, While aiming, or Always |
 | Cutscenes on a screen | Zoomed shots puts very zoomed in cutscene shots on a screen and the rest in 3D. All puts every cutscene on a screen. Never keeps them all in 3D |
@@ -86,7 +88,9 @@ Frame generation and Clank's Space & Frame Warp cannot be used together. Whichev
 
 ## Game settings
 
-Set these in the game's own Graphics and Display menus. Names can differ slightly in your language.
+The first time the mod runs it sets these for you: Ambient Occlusion and Screen Space Reflections off, Film Grain and Motion Blur lowest, Vignette, Chromatic Aberration, Bloom and Depth of Field off, Level of Detail, Traffic, Hair and Particles low. You can change them afterwards in the game's menus. To put them back, use **Optimize game graphics for frame rate** on the mod menu's Performance page. It applies right away.
+
+The rest are yours to set in the game's own Graphics and Display menus. Names can differ slightly in your language.
 
 | Game setting | Set to | Why |
 |---|---|---|
@@ -98,8 +102,8 @@ Set these in the game's own Graphics and Display menus. Names can differ slightl
 | Ray-traced reflections, shadows and ambient occlusion | Off | Not supported in VR by this mod |
 | Dynamic Resolution | Off | The headset sets resolution |
 | NVIDIA Reflex | Off | Not needed; the headset paces the game |
-| Motion Blur, Depth of Field, Chromatic Aberration, Film Grain, Vignette, Screen Shake | Off, for comfort | Camera effects made for a flat screen |
-| Shadows, Level of Detail, Hair, Ambient Occlusion | To taste. Low or Medium if you need speed | Each eye is drawn in full, so these cost twice |
+| Screen Shake | Off, for comfort | A camera effect made for a flat screen |
+| Shadows | To taste. Low or Medium if you need speed | Each eye is drawn in full, so these cost twice |
 | VSync, display mode, window size | Anything | In VR the mod runs the game in a window sized to your monitor (2560x1440 or 1920x1080) with VSync off, and your headset sets the frame rate |
 
 The settings above were used for testing on an RTX 5090 with a Pimax Dream Air at 72 Hz, with a steady 72 in busy areas.
@@ -109,7 +113,7 @@ The settings above were used for testing on an RTX 5090 with a Pimax Dream Air a
 - **Texture Quality: Medium or High, not Ultra.** On an RTX 5090, Medium took the busiest areas from about 60 to a steady 72. See [Game settings](#game-settings).
 - **SteamVR throttling:** in SteamVR settings, Video, Per-Application Video Settings, set this game's Throttling Behavior to Limit at your headset's refresh rate. On Auto, SteamVR can drop the game to half rate and keep it there.
 - Render resolution follows your headset runtime's resolution setting (SteamVR's resolution, or Virtual Desktop's quality). If lowering it does not raise the frame rate, your CPU is the limit, not your graphics card.
-- For more speed: Clank's Space & Frame Warp set to Depth Based, or frame generation with Optical flow.
+- For more speed: leave Clank's Space & Frame Warp on Depth Based (the default), or use frame generation with Optical flow.
 
 ## Good to know
 

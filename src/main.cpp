@@ -32,9 +32,9 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 110
-#define MOD_VERSION "1.1"
-#define MOD_VERSION_W L"1.1"
+#define BUILD_NUMBER 120
+#define MOD_VERSION "1.2"
+#define MOD_VERSION_W L"1.2"
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -315,6 +315,8 @@ static std::atomic<float> g_eyeLod{0.f};  // lab: forced eye level of detail val
 static std::atomic<uint32_t> g_eyeLodOff{0x1d14};
 // Alternate eye, a menu option on top of native stereo: one eye drawn per tick. Off on the vendor screen and flat screens.
 static std::atomic<bool> g_alternateSetting{false}, g_alternateNow{false}, g_rebuildSetting{false};
+static std::atomic<int> g_reticleMode{7};  // 7 the game's reticle hidden (HideGameReticle in the ini), 0 left alone (lab: reticle 0)
+static std::atomic<bool> g_reticleHooked{false};
 static void* __fastcall HookTone(void* a, void* b, void* c, uint8_t* view, void* e, uint64_t generic) {
     if (g_toneFix && view) {
         uint8_t* owner = *reinterpret_cast<uint8_t**>(view + 0x1ff8);
@@ -516,6 +518,20 @@ static float g_aimRoom[3];
 static std::atomic<ULONGLONG> g_lastTrigger{0};
 // 1 while the pause menu is up. Found by comparing .data, tools\\flag_watch.py. Beside the frame counter 0x6794fe8.
 static const size_t kPausedFlag = 0x6794fd0;
+// Resolution, percent of what OpenXR recommends. Read at launch and fixed for the session: g_resActive is what this launch
+// uses, g_resNext what the ini now says for the next one. Changing it live would mean rebuilding the eye buffers.
+static std::atomic<int> g_resActive{0}, g_resNext{100};
+// The eye size for a percent: same rounding as ever, and scaled down to fit the runtime's largest image.
+static void EyeSizeFor(int percent, int* outW, int* outH) {
+    int w = 0, h = 0, maxW = 0, maxH = 0;
+    XrRecommended(&w, &h);
+    XrMaxEyeSize(&maxW, &maxH);
+    double scale = percent / 100.0;
+    if (w > 0 && maxW > 0 && w * scale > maxW) scale = static_cast<double>(maxW) / w;
+    if (h > 0 && maxH > 0 && h * scale > maxH) scale = static_cast<double>(maxH) / h;
+    *outW = static_cast<int>(w * scale + 7) & ~7;
+    *outH = static_cast<int>(h * scale + 7) & ~7;
+}
 static int g_hudHoleIdle = 0;  // small hole for the keyboard and mouse centre dot when not aiming
 // The game view's lens as the game set it (view +0x1c0, 16 floats). The mod may widen that view's lens for in-world prompts
 // (FlatCameraWiden), so everything that reads the game's own field of view (title, vendor zoom, zoomed cutscenes, aiming)
@@ -1164,7 +1180,7 @@ static void __fastcall HookRenderAll() {
                     // With a gamepad the game shows no reticle unless aiming (Steve's HUD snapshots 100045 and 124951); the centre
                     // dot seen on RigB is the keyboard and mouse one. So the hole is cut while aiming only, and prompts next to
                     // Ratchet, near the middle, stay whole. HudHoleIdle=1 in the ini brings back a small hole for that dot.
-                    XrSetHudHole(!g_vendorNow && dot != 0 && *reinterpret_cast<int*>(g_base + kPausedFlag) == 0 ? (aiming ? 2 : g_hudHoleIdle) : 0);
+                    XrSetHudHole(!(g_reticleHooked.load() && g_reticleMode.load() == 7) && !g_vendorNow && dot != 0 && *reinterpret_cast<int*>(g_base + kPausedFlag) == 0 ? (aiming ? 2 : g_hudHoleIdle) : 0);
                     g_aimRoom[0] = room[0];
                     g_aimRoom[1] = room[1];
                     g_aimRoom[2] = room[2];
@@ -1581,7 +1597,76 @@ static std::atomic<float> g_mainPinhole{0.f};  // half width of the lens as a ta
 // clips their prompts. FlatCameraWiden (percent of the lens's width, 100 the game's) widens that camera's lens, so more of
 // what the headset shows is inside it. Same condition as the Light mask: VR eyes on, no pause menu, no vendor screen.
 static std::atomic<int> g_flatWiden{100};
+// The game's own reticle, removed at its source (1.12). GUI2::ScreenUIElementReticle, vtable slot 21 (0x643590) sends the
+// reticle's data to the HTML UI. Every time it runs while the element is visible (+0x18), the element's own Hide is called.
+// Changing the data block instead (type, position, aiming byte) did not hide it.
+static const uint8_t kReticleFlushBytes[] = {0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57};
+using ReticleFlushFn = void(__fastcall*)(uint8_t*);
+static ReticleFlushFn g_origReticleFlush;
+static void __fastcall HookReticleFlush(uint8_t* self) {
+    if (g_reticleMode.load() == 7 && self[0x18]) {
+        // The element's own Hide (ScreenUIElement vtable slot 12, 0x170d4e0): clears its visible byte at +0x18 and tells the UI.
+        using HideFn = void(__fastcall*)(uint8_t*);
+        (*reinterpret_cast<HideFn**>(self))[12](self);
+        static int hides = 0;
+        if (++hides <= 5 || hides % 200 == 0) Log("RETICLE hidden, %d times", hides);
+    }
+    g_origReticleFlush(self);
+}
+
+// The game's live graphics settings (static, v3.630.1.0; RE_NOTES "1.13"). The platform object is at *[0x684bda0]; its vtable slot
+// 0x130/8 returns the current settings block (0x150 bytes) and the slot holding 0x1683a50 takes a new block, as the game's own
+// menu does when it commits: it validates, stores, saves and tells the game. Run on the game thread, from the camera hook.
+static const size_t kPlatformHolder = 0x684bda0, kPlatformSet = 0x1683a50, kPlatformGetSlot = 0x130 / 8;
+static const uint8_t kPlatformGetterBytes[] = {0x48, 0x8b, 0x05, 0xf9, 0x9e, 0x1c, 0x05, 0x48, 0x8b, 0x00, 0xc3};
+static const uint8_t kPlatformSetBytes[] = {0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x7c, 0x24, 0x10, 0x55, 0x48, 0x8d, 0xac, 0x24, 0xf0, 0xfc, 0xff, 0xff, 0x48, 0x81, 0xec, 0x10, 0x04, 0x00, 0x00};
+static std::atomic<int> g_gsWanted{0};  // 1 log the block, 2 apply the VR values now
+static std::atomic<bool> g_gsLiveOk{false};
+static std::atomic<ULONGLONG> g_gsAppliedAt{0};
+static void GameSettingsLive(int what) {
+    void** holder = *reinterpret_cast<void***>(g_base + kPlatformHolder);
+    void** plat = holder ? static_cast<void**>(*holder) : nullptr;
+    if (!plat) {
+        Log("GSLIVE no platform object yet");
+        return;
+    }
+    void** vt = *reinterpret_cast<void***>(plat);
+    int setSlot = -1;
+    for (int i = 0; i < 0x80; ++i)
+        if (vt[i] == g_base + kPlatformSet) setSlot = i;
+    using GetFn = const uint8_t*(__fastcall*)(void*);
+    using SetFn = void(__fastcall*)(void*, const void*);
+    const uint8_t* cur = reinterpret_cast<GetFn>(vt[kPlatformGetSlot])(plat);
+    const auto i32 = [](const uint8_t* b, size_t o) { return *reinterpret_cast<const int*>(b + o); };
+    const auto f32 = [](const uint8_t* b, size_t o) { return *reinterpret_cast<const float*>(b + o); };
+    const auto show = [&](const char* when, const uint8_t* b) {
+        Log("GSLIVE %s: dof %d ao %d blur %.4f grain %.4f bloom %u vignette %u chromatic %u lod %d traffic %d hair %d ssr %d particle %d", when, i32(b, 0x58), i32(b, 0x5c), f32(b, 0x60), f32(b, 0x64),
+            b[0x6c], b[0x6d], b[0x6e], i32(b, 0x70), i32(b, 0x74), i32(b, 0x7c), i32(b, 0x84), i32(b, 0x9c));
+    };
+    Log("GSLIVE platform %p set slot %d", plat, setSlot);
+    show("now", cur);
+    if (what != 2) return;
+    if (setSlot < 0) {
+        Log("GSLIVE the game's set function is not in the table, nothing changed");
+        return;
+    }
+    alignas(16) uint8_t block[0x150];
+    memcpy(block, cur, sizeof(block));
+    for (size_t o : {size_t(0x58), size_t(0x5c), size_t(0x70), size_t(0x74), size_t(0x7c), size_t(0x84), size_t(0x9c)}) *reinterpret_cast<int*>(block + o) = 0;
+    *reinterpret_cast<float*>(block + 0x60) = 0.001f;
+    *reinterpret_cast<float*>(block + 0x64) = 0.001f;
+    block[0x6c] = block[0x6d] = block[0x6e] = 0;
+    reinterpret_cast<SetFn>(vt[setSlot])(plat, block);
+    show("after", reinterpret_cast<GetFn>(vt[kPlatformGetSlot])(plat));
+    g_gsAppliedAt = GetTickCount64();
+    Log("GSLIVE applied");
+}
+
 static void __fastcall HookCameraSubmit(uint8_t* view, const uint8_t* desc) {
+    if (g_gsWanted.load() != 0 && view == ActiveView()) {
+        const int what = g_gsWanted.exchange(0);
+        if (what) GameSettingsLive(what);
+    }
     if (g_labProbes) {
         std::lock_guard<std::mutex> l(g_statsLock);
         ++g_cameraSubmits[{static_cast<size_t>(reinterpret_cast<uint8_t*>(_ReturnAddress()) - g_base), view}];
@@ -1632,6 +1717,15 @@ static void InstallHooks() {
         MH_EnableHook(g_base + kFinalizeQueries.rva);
     }
     MH_CreateHook(g_base + kCameraSubmit.rva, reinterpret_cast<void*>(&HookCameraSubmit), reinterpret_cast<void**>(&g_origCameraSubmit));
+    if (memcmp(g_base + 0x643590, kReticleFlushBytes, sizeof(kReticleFlushBytes)) == 0) {
+        const MH_STATUS s = MH_CreateHook(g_base + 0x643590, reinterpret_cast<void*>(&HookReticleFlush), reinterpret_cast<void**>(&g_origReticleFlush));
+        Log("RETICLE hook %s", MH_StatusToString(s));
+        g_gsLiveOk = memcmp(g_base + 0x1681ea0, kPlatformGetterBytes, sizeof(kPlatformGetterBytes)) == 0 && memcmp(g_base + kPlatformSet, kPlatformSetBytes, sizeof(kPlatformSetBytes)) == 0;
+        Log("GSLIVE code %s", g_gsLiveOk.load() ? "as expected" : "not as expected, the Optimize row waits for the next launch");
+        g_reticleHooked = s == MH_OK;
+    } else {
+        Log("RETICLE code not as expected, left alone");
+    }
     MH_CreateHook(g_base + kViewCreate.rva, reinterpret_cast<void*>(&HookViewCreate), reinterpret_cast<void**>(&g_origViewCreate));
     MH_CreateHook(g_base + kCameraPush.rva, reinterpret_cast<void*>(&HookCameraPush), reinterpret_cast<void**>(&g_origCameraPush));
     MH_CreateHook(g_base + kTone.rva, reinterpret_cast<void*>(&HookTone), reinterpret_cast<void**>(&g_origTone));
@@ -2015,8 +2109,8 @@ static std::vector<uint32_t> g_menuImage;
 static const int kMenuW = 1024, kMenuH = 800;
 enum MenuItem {
     kItemRecenter, kItemWorldScale, kItemPitch, kItemHudDistance, kItemSkipLauncher,
-    kItemFrameGen, kItemFgType, kItemFgQuality, kItemFgDetail, kItemStereo,
-    kItemVendor, kItemAimDot, kItemCutscenes, kItemMenuSound,
+    kItemFrameGen, kItemFgType, kItemFgQuality, kItemFgDetail, kItemStereo, kItemResolution, kItemOptimizeGame,
+    kItemVendor, kItemAimDot, kItemCutscenes, kItemPicture, kItemMenuSound,
     kItemSnapshot, kItemFgPacing, kItemFrameHandoff,
 };
 struct MenuTab {
@@ -2025,8 +2119,8 @@ struct MenuTab {
 };
 static const MenuTab kTabs[] = {
     {L"GENERAL", {kItemRecenter, kItemWorldScale, kItemPitch, kItemHudDistance, kItemSkipLauncher}},
-    {L"PERFORMANCE", {kItemStereo, kItemFrameGen, kItemFgType, kItemFgQuality, kItemFgDetail}},
-    {L"OPTIONS", {kItemVendor, kItemAimDot, kItemCutscenes, kItemMenuSound}},
+    {L"PERFORMANCE", {kItemStereo, kItemResolution, kItemFrameGen, kItemFgType, kItemFgQuality, kItemFgDetail, kItemOptimizeGame}},
+    {L"OPTIONS", {kItemVendor, kItemAimDot, kItemCutscenes, kItemPicture, kItemMenuSound}},
     {L"DEVELOPER", {kItemSnapshot, kItemFgPacing, kItemFrameHandoff}},
 };
 static const int kTabCount = static_cast<int>(sizeof(kTabs) / sizeof(kTabs[0]));
@@ -2134,6 +2228,18 @@ static void MenuItemText(MenuItem item, wchar_t (&name)[64], wchar_t (&value)[64
         wcscpy_s(value, g_skipLauncherSetting ? L"On" : L"Off");
         *tip = L"Goes straight past the game's launcher window. Takes effect at the next launch.";
         break;
+    case kItemResolution: {
+        wcscpy_s(name, L"Resolution (needs game restart)");
+        const int next = g_resNext.load(), active = g_resActive.load();
+        if (next != active) swprintf_s(value, 64, L"%d%% after restart", next);
+        else swprintf_s(value, 64, L"%d%%", next);
+        int aw = g_forceW.load(), ah = g_forceH.load(), nw = 0, nh = 0;
+        EyeSizeFor(next, &nw, &nh);
+        static wchar_t text[256];
+        swprintf_s(text, L"100%% is the resolution your headset asks for. Running now: %d x %d per eye (%d%%). Next launch: %d x %d per eye (%d%%). This setting does not take effect until you restart the game.", aw, ah, active, nw, nh, next);
+        *tip = text;
+        break;
+    }
     case kItemFrameGen: {
         wcscpy_s(name, L"Frame generation");
         OfxrSnapshotV2 v;
@@ -2166,8 +2272,19 @@ static void MenuItemText(MenuItem item, wchar_t (&name)[64], wchar_t (&value)[64
         break;
     case kItemStereo:
         wcscpy_s(name, L"Clank's Space & Frame Warp");
-        wcscpy_s(value, !g_alternateSetting ? L"Off" : g_rebuildSetting ? L"Depth Based" : L"Basic");
-        *tip = L"Draws one eye each frame and rebuilds the other from its own last picture, moved with depth and the game's motion: a big speed-up. Depth Based is the full rebuild; Basic shows that eye's last picture as it was. Off draws both eyes every frame. Not with frame generation.";
+        wcscpy_s(value, !g_alternateSetting ? L"Off" : L"Depth Based");
+        *tip = L"Draws one eye each frame and rebuilds the other from its own last picture, moved with depth and the game's motion: a big speed-up. Off draws both eyes every frame. Not with frame generation.";
+        break;
+    case kItemOptimizeGame:
+        wcscpy_s(name, L"Optimize game graphics for frame rate");
+        if (g_gsLiveOk.load()) {
+            const ULONGLONG at = g_gsAppliedAt.load();
+            wcscpy_s(value, at && GetTickCount64() - at < 4000 ? L"Done" : L"Press A");
+            *tip = L"Sets the game's own graphics the way a new install does: ambient occlusion, reflections, film grain, motion blur, vignette, chromatic aberration, bloom, depth of field, level of detail, traffic, hair and particles to their lowest or off. Applies right away.";
+        } else {
+            wcscpy_s(value, GetPrivateProfileIntW(L"VR", L"OptimizeGameSettings", 0, g_iniPath.c_str()) != 0 ? L"At next launch" : L"Press A");
+            *tip = L"Sets the game's own graphics the way a new install does: ambient occlusion, reflections, film grain, motion blur, vignette, chromatic aberration, bloom, depth of field, level of detail, traffic, hair and particles to their lowest or off. Takes effect when you restart the game. Press A again to cancel.";
+        }
         break;
     case kItemVendor:
         wcscpy_s(name, L"Vendor screen up close");
@@ -2184,6 +2301,20 @@ static void MenuItemText(MenuItem item, wchar_t (&name)[64], wchar_t (&value)[64
         wcscpy_s(name, L"Cutscenes on a screen");
         wcscpy_s(value, rules[g_cutsceneCamera.load() % 3]);
         *tip = L"Zoomed shots puts very zoomed in cutscene shots on a screen and avoids a GPU hang at one scripted ride. All puts every cutscene on a screen.";
+        break;
+    }
+    case kItemPicture: {
+        static const wchar_t* const modes[3] = {L"Auto", L"Steady", L"Panel"};
+        const int mode = XrPictureGet();
+        const bool steady = XrPictureSteady();
+        wcscpy_s(name, L"Picture");
+        if (mode == 0) swprintf_s(value, 64, L"Auto (%ls)", steady ? L"Steady" : L"Panel");
+        else wcscpy_s(value, modes[mode % 3]);
+        wchar_t rt[128] = {};
+        MultiByteToWideChar(CP_UTF8, 0, XrRuntimeName(), -1, rt, 127);
+        static wchar_t text[360];
+        swprintf_s(text, L"How the HUD, menus and title screens reach your headset. Steady draws them into each eye, for runtimes that stretch them when you turn your head. Panel sends them separately. Auto: Steady on Virtual Desktop, Panel elsewhere. Detected: %ls. In use now: %ls.", rt[0] ? rt : L"unknown", steady ? L"Steady (projection layer)" : L"Panel (quad layers)");
+        *tip = text;
         break;
     }
     case kItemMenuSound: {
@@ -2268,7 +2399,7 @@ static void MenuDraw() {
     fill(0, tabBottom, kMenuW, tabBottom + 3, cyan);
     // Rows.
     const MenuTab& tab = kTabs[g_menuTab];
-    const int rowTop = 116, rowH = 70;
+    const int rowTop = 116, rowH = 56;  // room for seven rows
     SelectObject(dc, rowFont);
     const wchar_t* tip = L"";
     for (size_t i = 0; i < tab.items.size(); ++i) {
@@ -2281,7 +2412,7 @@ static void MenuDraw() {
         if (sel) {
             tip = blocked ? blocked : t;
             fill(28, top, kMenuW - 28, top + rowH - 6, cyan);
-            const POINT mark[] = {{14, top + 18}, {24, top + 32}, {14, top + 46}};
+            const POINT mark[] = {{14, top + 11}, {24, top + 25}, {14, top + 39}};
             poly(mark, 3, gold);
         } else {
             fill(48, top + rowH - 4, kMenuW - 48, top + rowH - 3, RGB(40, 78, 130));
@@ -2296,7 +2427,7 @@ static void MenuDraw() {
         }
     }
     // The chosen row's explanation, in a box under the rows.
-    const int tipTop = rowTop + 5 * rowH + 18, tipBottom = tipTop + 196;
+    const int tipTop = rowTop + 7 * rowH + 8, tipBottom = kMenuH - 70;
     fill(28, tipTop, kMenuW - 28, tipBottom, RGB(10, 30, 78));
     fill(28, tipTop, 34, tipBottom, gold);
     SelectObject(dc, tipFont);
@@ -2394,6 +2525,12 @@ static void MenuChange(int dir) {
         g_skipLauncherSetting = !g_skipLauncherSetting;
         SaveSetting(L"SkipLauncher", g_skipLauncherSetting ? 1 : 0);
         break;
+    case kItemResolution: {
+        const int rounded = (g_resNext.load() + 2) / 5 * 5;
+        g_resNext = std::clamp(rounded + step * 5, 50, 200);
+        SaveSetting(L"Resolution", g_resNext.load());
+        break;
+    }
     case kItemFrameGen:
         g_fgMode = (g_fgMode + (step < 0 ? 2 : 1)) % 3;
         SaveSetting(L"FrameGen", g_fgMode);
@@ -2421,15 +2558,25 @@ static void MenuChange(int dir) {
         if (g_fgMode) OfxrApply();
         break;
     case kItemStereo: {
-        // Native, then alternate with the rebuild, then plain alternate.
-        const int now = !g_alternateSetting ? 0 : g_rebuildSetting ? 1 : 2;
-        const int next = (now + (step < 0 ? 2 : 1)) % 3;
-        g_alternateSetting = next != 0;
-        g_rebuildSetting = next == 1;
-        SaveSetting(L"AlternateEye", next == 0 ? 0 : next == 1 ? 2 : 1);
-        XrRebuildSetMode(next == 1 ? 1 : 0);
+        // Off or Depth Based. The plain alternate eye (Basic) was removed from the menu in 1.14 (Steve, 2026-11-08).
+        (void)step;
+        const bool on = !g_alternateSetting;
+        g_alternateSetting = on;
+        g_rebuildSetting = on;
+        SaveSetting(L"AlternateEye", on ? 2 : 0);
+        XrRebuildSetMode(on ? 1 : 0);
         break;
     }
+    case kItemOptimizeGame:
+        if (dir != 0) return;
+        if (g_gsLiveOk.load()) {
+            g_gsWanted = 2;
+            g_gsAppliedAt = GetTickCount64();
+            Log("MENU optimize game settings now");
+        } else {
+            SaveSetting(L"OptimizeGameSettings", GetPrivateProfileIntW(L"VR", L"OptimizeGameSettings", 0, g_iniPath.c_str()) != 0 ? 0 : 1);
+        }
+        break;
     case kItemVendor:
         g_vendorOn = !g_vendorOn;
         SaveSetting(L"VendorScreen", g_vendorOn ? 1 : 0);
@@ -2441,6 +2588,10 @@ static void MenuChange(int dir) {
     case kItemCutscenes:
         g_cutsceneCamera = (g_cutsceneCamera.load() + (step < 0 ? 2 : 1)) % 3;
         SaveSetting(L"CutsceneCamera", g_cutsceneCamera.load());
+        break;
+    case kItemPicture:
+        XrPictureSet(XrPictureGet() + (step < 0 ? 2 : 1));
+        SaveSetting(L"Picture", XrPictureGet());
         break;
     case kItemMenuSound:
         g_menuSound = (g_menuSound.load() + (step < 0 ? 3 : 1)) % 4;
@@ -3193,8 +3344,49 @@ static void PickFlatWindow() {
     g_flatW = want * 16 / 9;
     Log("FLAT window %dx%d (main monitor %dx%d)", g_flatW, g_flatH, sw, sh);
 }
+// The game's own graphics settings the mod sets for VR: on a new install and from the Performance page's button
+// (OptimizeGameSettings=1 in the ini means "at the next launch"). Written to the real registry before the game reads it,
+// because the game saves its own values over the registry when it exits. Film grain and motion blur stay at 1, the value
+// Steve's lowest settings saved. Names and values: RE_NOTES, "Game settings".
+static const wchar_t kGameGraphicsKey[] = L"Software\\Insomniac Games\\Ratchet & Clank - Rift Apart\\Graphics";
+struct VrGameSetting { const wchar_t* name; DWORD value; };
+static const VrGameSetting kVrGameSettings[] = {
+    {L"AmbientOcclusionQuality", 0}, {L"ScreenSpaceReflections", 0}, {L"FilmGrainStrength", 1}, {L"MotionBlurScale", 1},
+    {L"Vignette", 0}, {L"ChromaticAberration", 0}, {L"Bloom", 0}, {L"DOFQuality", 0},
+    {L"LevelOfDetail", 0}, {L"VehicleDetail", 0}, {L"HairQuality", 0}, {L"ParticleLighting", 0},
+};
+static std::atomic<bool> g_gameSettingsThisRun{false};  // also answered at the read, in case a first run writes its own first
+static void ApplyVrGameSettings(const wchar_t* ini) {
+    if (GetPrivateProfileIntW(L"VR", L"OptimizeGameSettings", 1, ini) == 0) return;
+    HKEY key = nullptr;
+    const LSTATUS open = RegCreateKeyExW(HKEY_CURRENT_USER, kGameGraphicsKey, 0, nullptr, 0, KEY_READ | KEY_SET_VALUE, nullptr, &key, nullptr);
+    if (open != ERROR_SUCCESS) {
+        Log("GAME SETTINGS could not open the registry key: %ld. Left for the next launch.", static_cast<long>(open));
+        return;
+    }
+    int changed = 0;
+    for (const VrGameSetting& s : kVrGameSettings) {
+        DWORD old = 0, size = sizeof(old), type = 0;
+        const bool had = RegQueryValueExW(key, s.name, nullptr, &type, reinterpret_cast<BYTE*>(&old), &size) == ERROR_SUCCESS;
+        if (!had || old != s.value) {
+            Log("GAME SETTINGS %ls %s%lu -> %lu", s.name, had ? "" : "unset ", had ? old : 0ul, s.value);
+            ++changed;
+        }
+        RegSetValueExW(key, s.name, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&s.value), sizeof(s.value));
+    }
+    RegCloseKey(key);
+    g_gameSettingsThisRun = true;
+    WritePrivateProfileStringW(L"VR", L"OptimizeGameSettings", L"0", ini);
+    Log("GAME SETTINGS set for VR, %d changed", changed);
+}
 static void OverrideSetting(const wchar_t* name, void* data) {
     if (!name || !data) return;
+    if (g_gameSettingsThisRun.load())
+        for (const VrGameSetting& s : kVrGameSettings)
+            if (!_wcsicmp(name, s.name)) {
+                *static_cast<DWORD*>(data) = s.value;
+                return;
+            }
     {
         // Every DWORD setting the game reads, once, with the value it had: so a log shows the player's game settings.
         static std::mutex m;
@@ -3294,9 +3486,8 @@ static DWORD WINAPI XrStartThread(void* arg) {
     const int percent = static_cast<int>(reinterpret_cast<intptr_t>(arg));
     if (!XrInit(g_dir.c_str())) return 0;
     int w = 0, h = 0;
-    XrRecommended(&w, &h);
-    w = (w * percent / 100 + 7) & ~7;
-    h = (h * percent / 100 + 7) & ~7;
+    EyeSizeFor(percent, &w, &h);
+    g_resActive = percent;
     Log("XR eye size %dx%d (%d percent of recommended)", w, h, percent);
     g_forceW = w;
     g_forceH = h;
@@ -3468,6 +3659,17 @@ static void RunCommand(const std::string& c) {
     else if (sscanf(c.c_str(), "sltag %u", &g_w) == 1) { g_slTagLogLeft = static_cast<int>(g_w); g_slEvalLogLeft = static_cast<int>(g_w); }
     else if (sscanf(c.c_str(), "eyedefer %u", &g_w) == 1) g_eyeDefer = g_w != 0;
     else if (sscanf(c.c_str(), "eyeshare %u", &g_w) == 1) g_eyeShare = g_w != 0;
+    else if (c == "gsdump") g_gsWanted = 1;
+    else if (c == "gsapply") g_gsWanted = 2;
+    else if (sscanf(c.c_str(), "picture %u", &g_w) == 1) XrPictureSet(static_cast<int>(g_w));
+    else if (sscanf(c.c_str(), "picdump %63s", g_text) == 1) {
+        const std::wstring name(g_text, g_text + strlen(g_text));
+        XrPictureDump((g_dir + L"vrlab_shots\\" + name).c_str());
+    }
+    else if (sscanf(c.c_str(), "reticle %u", &g_w) == 1) {
+        g_reticleMode = static_cast<int>(g_w);
+        Log("RETICLE mode %d", g_reticleMode.load());
+    }
     else if (sscanf(c.c_str(), "flatwiden %u", &g_w) == 1) {
         g_flatWiden = std::clamp(static_cast<int>(g_w), 50, 300);
         Log("MAIN flat camera widen %d", g_flatWiden.load());
@@ -3735,6 +3937,7 @@ static DWORD WINAPI ProbeThread(void*) {
         if (GetPrivateProfileIntW(L"VR", L"MotionFix", 1, early.c_str()) == 0) MvFixSetMode(0, 2.f, 1);
         g_dlssPreset = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"VR", L"DlssPreset", 0, early.c_str())), 0, 15);
         g_hudHoleIdle = GetPrivateProfileIntW(L"VR", L"HudHoleIdle", 0, early.c_str()) != 0 ? 1 : 0;
+        g_reticleMode = GetPrivateProfileIntW(L"VR", L"HideGameReticle", 1, early.c_str()) != 0 ? 7 : 0;
         g_flatWiden = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"VR", L"FlatCameraWiden", 100, early.c_str())), 50, 300);
         g_queryMode = static_cast<int>(GetPrivateProfileIntW(L"VR", L"QueryDeferred", 0, early.c_str())) != 0 ? 1 : 0;
         Log("OCCLWAIT mode %d", g_occlSkip.load());
@@ -3754,6 +3957,7 @@ static DWORD WINAPI ProbeThread(void*) {
             DredEnable();
             CreateThread(nullptr, 0, DredWatch, nullptr, 0, nullptr);
         }
+        ApplyVrGameSettings(early.c_str());
         MH_Initialize();
         InstallRegHooks();
     }
@@ -3776,17 +3980,23 @@ static DWORD WINAPI ProbeThread(void*) {
     XrSetOverlap(false);
     XrSetEndOnWorker(g_frameHandoffXr.load());
     {
-        UINT alt = GetPrivateProfileIntW(L"VR", L"AlternateEye", 0, ini.c_str());
+        UINT alt = GetPrivateProfileIntW(L"VR", L"AlternateEye", 2, ini.c_str());  // Depth Based is the default (Steve, 2026-11-08)
         if (alt != 0 && g_fgMode != 0) {
             Log("INI frame generation and alternate eye were both on: alternate eye off");
             alt = 0;
             WritePrivateProfileStringW(L"VR", L"AlternateEye", L"0", ini.c_str());
         }
         g_alternateSetting = alt != 0;
+        if (alt == 1) {  // an ini saved when Basic still existed
+            Log("INI AlternateEye 1 (Basic) is gone: Depth Based");
+            alt = 2;
+            WritePrivateProfileStringW(L"VR", L"AlternateEye", L"2", ini.c_str());
+        }
         g_rebuildSetting = alt == 2;
         XrRebuildSetMode(alt == 2 ? 1 : 0);
     }
     g_aimDot = static_cast<int>(GetPrivateProfileIntW(L"VR", L"AimDot", 1, ini.c_str()));
+    XrPictureSet(static_cast<int>(GetPrivateProfileIntW(L"VR", L"Picture", 0, ini.c_str())));
     g_labProbes = GetPrivateProfileIntW(L"VR", L"LabProbes", 0, ini.c_str()) != 0;
     g_skipLauncher = g_skipLauncherSetting;
     InstallSlProbe();
@@ -3807,6 +4017,7 @@ static DWORD WINAPI ProbeThread(void*) {
     CreateThread(nullptr, 0, PadThread, nullptr, 0, nullptr);
     const bool autoStart = GetPrivateProfileIntW(L"VR", L"AutoStart", 1, ini.c_str()) != 0;
     const int resolution = GetPrivateProfileIntW(L"VR", L"Resolution", 100, ini.c_str());
+    g_resNext = resolution;
     g_worldScale = GetPrivateProfileIntW(L"VR", L"WorldScalePercent", 300, ini.c_str()) / 100.0f;
     g_levelCamera = static_cast<int>(GetPrivateProfileIntW(L"VR", L"LevelCamera", 2, ini.c_str()));
     g_pace = GetPrivateProfileIntW(L"VR", L"Pace", 1, ini.c_str()) != 0;

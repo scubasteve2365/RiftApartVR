@@ -10,6 +10,13 @@ struct XrEyePose {
 // Loads openxr_loader.dll from dir and asks the runtime for the recommended eye size. The session comes later.
 bool XrInit(const wchar_t* dir);
 void XrRecommended(int* w, int* h);
+void XrMaxEyeSize(int* w, int* h);
+// Picture setting: 0 Auto, 1 Steady (projection layer), 2 Panel (quad layers). Auto: Steady on Virtual Desktop, Panel elsewhere.
+void XrPictureSet(int mode);
+int XrPictureGet();
+bool XrPictureSteady();
+const char* XrRuntimeName();
+void XrPictureDump(const wchar_t* base);
 // Starts the session on the game's device and queue, with swapchains of this size.
 bool XrStartSession(void* device, void* queue, int eyeW, int eyeH);
 // Game thread: newest head pose for this frame's eyes. False until the runtime gives a frame.
