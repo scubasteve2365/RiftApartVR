@@ -6,6 +6,7 @@
 #include <MinHook.h>
 #include "capture.h"
 #include "xr.h"
+#include "mvfix.h"
 #include <d3d12.h>
 #include <wincodec.h>
 #include <psapi.h>
@@ -22,6 +23,7 @@
 #pragma comment(lib, "winmm.lib")
 #include <map>
 #include <set>
+#include <array>
 #include <mutex>
 #include <cmath>
 #include <cstdarg>
@@ -30,9 +32,9 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 103
-#define MOD_VERSION "1.0"
-#define MOD_VERSION_W L"1.0"
+#define BUILD_NUMBER 110
+#define MOD_VERSION "1.1"
+#define MOD_VERSION_W L"1.1"
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -309,6 +311,8 @@ static std::atomic<int> g_wantHudShot{0};
 static std::string g_rbShotName;
 static const size_t kOverlayResource = 0x67334c0 + 0x230 + 0x98, kNeutralResource = 0x678e710;
 static std::atomic<uint8_t*> g_eyeA{nullptr}, g_eyeB{nullptr};
+static std::atomic<float> g_eyeLod{0.f};  // lab: forced eye level of detail value, 0 the game's
+static std::atomic<uint32_t> g_eyeLodOff{0x1d14};
 // Alternate eye, a menu option on top of native stereo: one eye drawn per tick. Off on the vendor screen and flat screens.
 static std::atomic<bool> g_alternateSetting{false}, g_alternateNow{false}, g_rebuildSetting{false};
 static void* __fastcall HookTone(void* a, void* b, void* c, uint8_t* view, void* e, uint64_t generic) {
@@ -512,6 +516,15 @@ static float g_aimRoom[3];
 static std::atomic<ULONGLONG> g_lastTrigger{0};
 // 1 while the pause menu is up. Found by comparing .data, tools\\flag_watch.py. Beside the frame counter 0x6794fe8.
 static const size_t kPausedFlag = 0x6794fd0;
+static int g_hudHoleIdle = 0;  // small hole for the keyboard and mouse centre dot when not aiming
+// The game view's lens as the game set it (view +0x1c0, 16 floats). The mod may widen that view's lens for in-world prompts
+// (FlatCameraWiden), so everything that reads the game's own field of view (title, vendor zoom, zoomed cutscenes, aiming)
+// reads this copy, taken at each camera submit, not the view.
+static float g_mainLensGame[16];
+static std::atomic<bool> g_mainLensValid{false};
+static const float* MainLens(const uint8_t* main) {
+    return g_mainLensValid.load() ? g_mainLensGame : reinterpret_cast<const float*>(main + 0x1c0);
+}
 // Logging and counters that only help development. LabProbes=0 in the ini, or `probes 0`, turns them off.
 static std::atomic<bool> g_labProbes{false};
 static void UpdateMode() {
@@ -519,7 +532,7 @@ static void UpdateMode() {
     bool world = false;
     if (main) {
         const float* cam = reinterpret_cast<const float*>(main);
-        const float* proj = reinterpret_cast<const float*>(main + 0x1c0);
+        const float* proj = MainLens(main);
         const bool atOrigin = fabsf(cam[12]) + fabsf(cam[13]) + fabsf(cam[14]) < 1.0f;
         const double vfov = proj[5] != 0 ? 2.0 * atan(1.0 / fabs(proj[5])) * 57.29577951 : 0;
         // The title's fly-by holds one spot with a 33.3 degree lens.
@@ -1140,7 +1153,7 @@ static void __fastcall HookRenderAll() {
                     const float vz = -(d0 * cam[8] + d1 * cam[9] + d2 * cam[10]);
                     const float yc = cosf(-g_centreYaw), ys = sinf(-g_centreYaw);
                     const float room[3] = {yc * vx - ys * vz, vy, ys * vx + yc * vz};
-                    const float* lensNow = reinterpret_cast<const float*>(main + 0x1c0);
+                    const float* lensNow = MainLens(main);
                     const double lens = lensNow[5] != 0 ? 2.0 * atan(1.0 / fabs(lensNow[5])) * 57.29577951 : 0;
                     // Aiming lens, or a trigger touched in the last two seconds: the game's reticle is up.
                     const bool aiming = fabs(lens - 32.64) < 0.5 || GetTickCount64() - g_lastTrigger.load() < 2000;
@@ -1148,7 +1161,10 @@ static void __fastcall HookRenderAll() {
                     const bool dotOn = !g_vendorNow && (dot == 2 || (dot == 1 && aiming));
                     XrSetAimDot(dotOn ? room : nullptr, g_centre);
                     // Paused or in a cutscene the HUD image holds menus: otherwise the game's reticle never shows, aiming or not.
-                    XrSetHudHole(!g_vendorNow && dot != 0 && *reinterpret_cast<int*>(g_base + kPausedFlag) == 0);
+                    // With a gamepad the game shows no reticle unless aiming (Steve's HUD snapshots 100045 and 124951); the centre
+                    // dot seen on RigB is the keyboard and mouse one. So the hole is cut while aiming only, and prompts next to
+                    // Ratchet, near the middle, stay whole. HudHoleIdle=1 in the ini brings back a small hole for that dot.
+                    XrSetHudHole(!g_vendorNow && dot != 0 && *reinterpret_cast<int*>(g_base + kPausedFlag) == 0 ? (aiming ? 2 : g_hudHoleIdle) : 0);
                     g_aimRoom[0] = room[0];
                     g_aimRoom[1] = room[1];
                     g_aimRoom[2] = room[2];
@@ -1221,7 +1237,7 @@ static void __fastcall HookRenderAll() {
                         memcpy(eyePose, main, sizeof(eyePose));
                         XrTagPose(e, eyePose + 12);
                         // Width as the game has it; height fills the eye image, of which the middle 16 by 9 band is shown.
-                        const float* noJitter = reinterpret_cast<const float*>(main + 0x1c0);
+                        const float* noJitter = MainLens(main);
                         const float tanX = 1.0f / fabsf(noJitter[0]);
                         const float tanY = tanX * static_cast<float>(g_forceH) / static_cast<float>(g_forceW);
                         reinterpret_cast<LensPerspFn>(g_base + kLensPersp.rva)(desc, nearZ, farZ, -tanX, tanX, -tanY, tanY, 0, 0, jx, jy, 0, 0);
@@ -1240,7 +1256,7 @@ static void __fastcall HookRenderAll() {
             if (g_eyes.size() >= 2) {
                 float pose[16];
                 memcpy(pose, main, sizeof(pose));
-                const float* noJitter = reinterpret_cast<const float*>(main + 0x1c0);
+                const float* noJitter = MainLens(main);
                 const float tanX = 1.0f / fabsf(noJitter[0]), tanY = 1.0f / fabsf(noJitter[5]);
                 const float nearZ = *reinterpret_cast<float*>(main + 0x3f8), farZ = *reinterpret_cast<float*>(main + 0x3fc);
                 float jx = 0, jy = 0;
@@ -1510,6 +1526,8 @@ static void* __fastcall HookSceneSubmit(uint8_t* view, void* a, uint32_t mask, c
             return nullptr;
         }
     }
+    // Lab: the eyes' level of detail value (view +0x1d14, the game sets 0.675 for the eyes, 0.863 for its own view).
+    if (const float lod = g_eyeLod.load(); lod > 0 && (view == g_eyeA.load() || view == g_eyeB.load())) *reinterpret_cast<float*>(view + g_eyeLodOff.load()) = lod;
     uint8_t* main = g_shareLum ? ActiveView() : nullptr;
     // Lab. 0: both eyes read the game's own view's exposure. 1: each eye keeps its own. 2: left keeps its own, right reads left's.
     const int lumFrom = g_lumFrom.load();
@@ -1554,10 +1572,48 @@ static void* __fastcall HookSceneSubmit(uint8_t* view, void* a, uint32_t mask, c
     return r;
 }
 
+// Lab, 1.03: in play the game's own view only feeds the HUD (pass mask Light), yet it still finds and prepares everything its
+// camera sees, about 2.3 ms a tick on RigB. With this on, its camera gets a pinhole lens there, so almost nothing is in view,
+// while the HUD passes still run. Same condition as the Light mask: VR eyes on, no pause menu, no vendor screen.
+static std::atomic<float> g_mainPinhole{0.f};  // half width of the lens as a tangent, 0 off
+// 1.03: in play the game's own view only places the HUD, and in-world prompts (a vendor's button, say) are placed by its
+// camera: with the game's 47 degree lens, things you can see in the headset are often outside it, so the game hides or
+// clips their prompts. FlatCameraWiden (percent of the lens's width, 100 the game's) widens that camera's lens, so more of
+// what the headset shows is inside it. Same condition as the Light mask: VR eyes on, no pause menu, no vendor screen.
+static std::atomic<int> g_flatWiden{100};
 static void __fastcall HookCameraSubmit(uint8_t* view, const uint8_t* desc) {
     if (g_labProbes) {
         std::lock_guard<std::mutex> l(g_statsLock);
         ++g_cameraSubmits[{static_cast<size_t>(reinterpret_cast<uint8_t*>(_ReturnAddress()) - g_base), view}];
+    }
+    const bool isMain = view == ActiveView();
+    if (isMain) {
+        memcpy(g_mainLensGame, desc + 0x1c0, sizeof(g_mainLensGame));
+        g_mainLensValid = true;
+    }
+    const float pin = g_mainPinhole.load();
+    const int widen = g_flatWiden.load();
+    if ((pin > 0 || widen != 100) && isMain && g_xrEyes.load() && g_mainMask.load() && *reinterpret_cast<int*>(g_base + kPausedFlag) == 0 && !g_vendorNow.load()) {
+        // The description is laid out as a view: pose at +0, lens without jitter at +0x1c0, near and far at +0x3f8 and +0x3fc.
+        alignas(16) static uint8_t newDesc[0x600];
+        memcpy(newDesc, desc, sizeof(newDesc));
+        float pose[16];
+        memcpy(pose, desc, sizeof(pose));
+        const float* lens = reinterpret_cast<const float*>(desc + 0x1c0);
+        const float nearZ = *reinterpret_cast<const float*>(desc + 0x3f8), farZ = *reinterpret_cast<const float*>(desc + 0x3fc);
+        float tx = pin, ty = pin;
+        if (pin <= 0 && lens[0] != 0 && lens[5] != 0) {
+            tx = 1.0f / fabsf(lens[0]) * widen / 100.0f;
+            ty = 1.0f / fabsf(lens[5]) * widen / 100.0f;
+        }
+        if (tx > 0 && ty > 0) {
+            reinterpret_cast<LensPerspFn>(g_base + kLensPersp.rva)(newDesc, nearZ, farZ, -tx, tx, -ty, ty, 0, 0, 0, 0, 0, 0);
+            reinterpret_cast<LensPoseFn>(g_base + kLensPose.rva)(newDesc, pose);
+            static int said = 0;
+            if (said++ == 0) Log("MAIN lens widened to tan %.3f x %.3f (widen %d, pinhole %.4f), near %.3f far %.1f", tx, ty, widen, pin, nearZ, farZ);
+            g_origCameraSubmit(view, newDesc);
+            return;
+        }
     }
     g_origCameraSubmit(view, desc);
 }
@@ -1762,6 +1818,21 @@ static void OnPresentForXr(void* backBuffer, unsigned bbW, unsigned bbH, int bbF
     // The engine rebuilds eye textures when graphics settings change. Send nothing until that has settled.
     const bool rebuilding = GetTickCount64() - g_rebuildTick.load() < 1500;
     void* res[2] = {rebuilding ? nullptr : EyeTexture(g_eyes[0]), rebuilding ? nullptr : EyeTexture(g_eyes[1])};
+    {
+        // Lab: does an eye's output texture change between presents (double buffering)? Counts changes and distinct pointers.
+        static void* last[2] = {};
+        static std::set<void*> seen[2];
+        static uint64_t changes[2] = {}, presents = 0;
+        ++presents;
+        for (int e = 0; e < 2; ++e) {
+            if (res[e] && res[e] != last[e]) {
+                if (last[e]) ++changes[e];
+                last[e] = res[e];
+                if (seen[e].size() < 16) seen[e].insert(res[e]);
+            }
+        }
+        if (g_labProbes && presents % 600 == 0) Log("EYE textures over %llu presents: left changed %llu times, %zu distinct; right %llu, %zu", presents, changes[0], seen[0].size(), changes[1], seen[1].size());
+    }
     uint32_t st[2] = {};
     if (res[0] && res[1]) {
         SafeCopy(&st[0], EyeRecord(g_eyes[0]) + 0x28, 4);
@@ -1793,15 +1864,17 @@ static void OnPresentForXr(void* backBuffer, unsigned bbW, unsigned bbH, int bbF
     XrOnPresent(res, st, ui, g_uiCount.load());
     if (!g_rbShotName.empty() && XrRebuildResult() && res[0] && res[1]) {
         // Lab: the real eyes and the rebuilt one from the same frame, to compare.
-        static std::wstring paths[3];
+        static std::wstring paths[4];
         const std::wstring base(g_rbShotName.begin(), g_rbShotName.end());
         paths[0] = g_dir + L"vrlab_shots\\" + base + L"_L.bmp";
         paths[1] = g_dir + L"vrlab_shots\\" + base + L"_R.bmp";
         paths[2] = g_dir + L"vrlab_shots\\" + base + L"_B.bmp";
-        void* r[3] = {res[0], res[1], XrRebuildResult()};
-        uint32_t s3[3] = {st[0], st[1], D3D12_RESOURCE_STATE_COPY_SOURCE};
-        const wchar_t* pp[3] = {paths[0].c_str(), paths[1].c_str(), paths[2].c_str()};
-        Log("REBUILD shot: %s", CaptureRequest(r, s3, pp, 3) ? "queued" : "not ready");
+        paths[3] = g_dir + L"vrlab_shots\\" + base + L"_A.bmp";  // the paired second rebuild, when on
+        void* const alt = XrRebuildAltResult();
+        void* r[4] = {res[0], res[1], XrRebuildResult(), alt};
+        uint32_t s3[4] = {st[0], st[1], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE};
+        const wchar_t* pp[4] = {paths[0].c_str(), paths[1].c_str(), paths[2].c_str(), paths[3].c_str()};
+        Log("REBUILD shot: %s", CaptureRequest(r, s3, pp, alt ? 4 : 3) ? "queued" : "not ready");
         g_rbShotName.clear();
     }
 }
@@ -1952,7 +2025,7 @@ struct MenuTab {
 };
 static const MenuTab kTabs[] = {
     {L"GENERAL", {kItemRecenter, kItemWorldScale, kItemPitch, kItemHudDistance, kItemSkipLauncher}},
-    {L"PERFORMANCE", {kItemFrameGen, kItemFgType, kItemFgQuality, kItemFgDetail, kItemStereo}},
+    {L"PERFORMANCE", {kItemStereo, kItemFrameGen, kItemFgType, kItemFgQuality, kItemFgDetail}},
     {L"OPTIONS", {kItemVendor, kItemAimDot, kItemCutscenes, kItemMenuSound}},
     {L"DEVELOPER", {kItemSnapshot, kItemFgPacing, kItemFrameHandoff}},
 };
@@ -2012,19 +2085,19 @@ static void MenuSound(MenuSoundKind kind) {
 static const wchar_t* MenuItemBlocked(MenuItem item) {
     switch (item) {
     case kItemFrameGen:
-        if (g_alternateSetting) return L"Not available with Alternate Eye Rendering. Set Stereo to Native first.";
+        if (g_alternateSetting) return L"Not available with Clank's Space & Frame Warp. Turn it Off first.";
         break;
     case kItemFgType:
     case kItemFgQuality:
     case kItemFgDetail:
-        if (g_alternateSetting) return L"Not available with Alternate Eye Rendering. Set Stereo to Native first.";
+        if (g_alternateSetting) return L"Not available with Clank's Space & Frame Warp. Turn it Off first.";
         if (g_fgMode == 0) return L"Only used with frame generation. Turn Frame generation on first.";
         break;
     case kItemFgPacing:
         if (g_alternateSetting || g_fgMode == 0) return L"Only used with frame generation.";
         break;
     case kItemStereo:
-        if (g_fgMode != 0) return L"Alternate Eye Rendering is not available while Frame generation is on. Turn Frame generation off first.";
+        if (g_fgMode != 0) return L"Not available while Frame generation is on. Turn Frame generation off first.";
         break;
     default:
         break;
@@ -2067,7 +2140,7 @@ static void MenuItemText(MenuItem item, wchar_t (&name)[64], wchar_t (&value)[64
         const bool loaded = OfxrSnapshot(&v);
         const bool threeX = g_fgMode == 2 && g_fgType != 1 && g_fgType != 3;
         swprintf_s(value, L"%ls%ls", g_fgMode == 0 || g_alternateSetting ? L"Off" : threeX ? L"3X" : L"2X", g_fgMode == 0 || g_alternateSetting ? L"" : !loaded ? L" next launch" : v.errors ? L" failed" : L"");
-        *tip = L"Adds made-up frames between real ones, using OFXR. Costs some latency. Not with Alternate Eye Rendering. Turning it on from Off needs a restart. Off works at once; a restart frees its last bit of cost.";
+        *tip = L"Adds made-up frames between real ones, using OFXR. Costs some latency. Not with Clank's Space & Frame Warp. Turning it on from Off needs a restart. Off works at once; a restart frees its last bit of cost.";
         break;
     }
     case kItemFgType: {
@@ -2092,9 +2165,9 @@ static void MenuItemText(MenuItem item, wchar_t (&name)[64], wchar_t (&value)[64
         *tip = L"Resolution of the motion tracking. Lower is cheaper and a little less precise.";
         break;
     case kItemStereo:
-        wcscpy_s(name, L"Stereo");
-        wcscpy_s(value, !g_alternateSetting ? L"Native" : g_rebuildSetting ? L"Alternate Eye Rendering, Depth Based" : L"Alternate Eye Rendering, Basic");
-        *tip = L"Native draws both eyes every frame. Alternate Eye Rendering draws one eye per frame for speed. Depth Based makes the other eye from it; Basic shows that eye's last image. Not with frame generation.";
+        wcscpy_s(name, L"Clank's Space & Frame Warp");
+        wcscpy_s(value, !g_alternateSetting ? L"Off" : g_rebuildSetting ? L"Depth Based" : L"Basic");
+        *tip = L"Draws one eye each frame and rebuilds the other from its own last picture, moved with depth and the game's motion: a big speed-up. Depth Based is the full rebuild; Basic shows that eye's last picture as it was. Off draws both eyes every frame. Not with frame generation.";
         break;
     case kItemVendor:
         wcscpy_s(name, L"Vendor screen up close");
@@ -2190,7 +2263,7 @@ static void MenuDraw() {
         }
         SetTextColor(dc, t == g_menuTab ? gold : RGB(122, 154, 196));
         RECT a{l, tabTop, r - 8, tabBottom};
-        DrawTextW(dc, kTabs[t].name, -1, &a, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        DrawTextW(dc, kTabs[t].name, -1, &a, DT_CENTER | DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER);
     }
     fill(0, tabBottom, kMenuW, tabBottom + 3, cyan);
     // Rows.
@@ -2215,11 +2288,11 @@ static void MenuDraw() {
         }
         SetTextColor(dc, blocked ? (sel ? RGB(70, 98, 120) : RGB(92, 112, 140)) : sel ? ink : pale);
         RECT a{48, top, kMenuW - 48, top + rowH - 6};
-        DrawTextW(dc, name, -1, &a, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        DrawTextW(dc, name, -1, &a, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER);
         if (value[0]) {
             wchar_t shown[72];
             swprintf_s(shown, sel && !blocked ? L"\u2039  %ls  \u203a" : L"%ls", value);
-            DrawTextW(dc, shown, -1, &a, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+            DrawTextW(dc, shown, -1, &a, DT_RIGHT | DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER);
         }
     }
     // The chosen row's explanation, in a box under the rows.
@@ -2229,15 +2302,15 @@ static void MenuDraw() {
     SelectObject(dc, tipFont);
     SetTextColor(dc, RGB(226, 236, 250));
     RECT tr{56, tipTop + 18, kMenuW - 52, tipBottom - 14};
-    DrawTextW(dc, tip, -1, &tr, DT_LEFT | DT_WORDBREAK);
+    DrawTextW(dc, tip, -1, &tr, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
     // Controls.
     SelectObject(dc, smallFont);
     SetTextColor(dc, RGB(150, 182, 214));
     RECT help{24, kMenuH - 64, kMenuW - 24, kMenuH - 16};
-    DrawTextW(dc, L"LB / RB or LT / RT: section     D-pad: choose and change     A: select     B: close", -1, &help, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    DrawTextW(dc, L"LB / RB or LT / RT: section     D-pad: choose and change     A: select     B: close", -1, &help, DT_CENTER | DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER);
     RECT ver{24, 0, kMenuW - 24, 22};
     SetTextColor(dc, RGB(96, 124, 168));
-    DrawTextW(dc, L"RIFT APART VR " MOD_VERSION_W, -1, &ver, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+    DrawTextW(dc, L"RIFT APART VR " MOD_VERSION_W, -1, &ver, DT_RIGHT | DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER);
     GdiFlush();
     g_menuImage.resize(static_cast<size_t>(kMenuW) * kMenuH);
     const uint32_t* src = static_cast<const uint32_t*>(bits);
@@ -2466,7 +2539,7 @@ static DWORD WINAPI SnapshotThread(void*) {
     char state[256] = "";
     if (uint8_t* v = ActiveView()) {
         const float* c = reinterpret_cast<const float*>(v);
-        const float* proj = reinterpret_cast<const float*>(v + 0x1c0);
+        const float* proj = MainLens(v);
         sprintf_s(state, "cam %.2f %.2f %.2f fwd %.3f %.3f %.3f lens %.2f vendor %d paused %d pitch %d", c[12], c[13], c[14], c[8], c[9], c[10], proj[5] != 0 ? 2.0 * atan(1.0 / fabs(proj[5])) * 57.29577951 : 0.0, g_vendorNow.load() ? 1 : 0, *reinterpret_cast<int*>(g_base + kPausedFlag), g_levelCamera.load());
     }
     Log("SNAP %d queued %d: %s %s", n, static_cast<int>(res.size()), queued ? "yes" : "no", state);
@@ -2866,6 +2939,8 @@ static int __cdecl HookSlEvaluate(uint32_t feature, const void* frame, const voi
             if (on) DlssTimerEnd(l, i);
         }
     } end{timing, timed, timerIndex};
+    int mvIndex = -1;
+    const SlTag* depthTag = nullptr, *mvTag = nullptr;
     if ((vp == 1 || vp == 2) && feature == 0) {
         for (uint32_t i = 0; i < n; ++i) {
             const SlBase* b = static_cast<const SlBase*>(inputs[i]);
@@ -2873,7 +2948,25 @@ static int __cdecl HookSlEvaluate(uint32_t feature, const void* frame, const voi
             memcpy(&g, b->type, 4);
             if (g == 0x4c6a5aad) {
                 const SlTag* t = reinterpret_cast<const SlTag*>(b);
-                if (t->bufferType == 0 && t->resource) XrRebuildCopyDepth(vp - 1, cmd, t->resource->native);
+                if (t->bufferType == 0 && t->resource) {
+                    // Lab check: each eye has its own depth buffer, so a buffer seen under both viewport numbers means the
+                    // number was wrong for one of those calls (set on one thread, read on another).
+                    static std::mutex vpm;
+                    static std::map<void*, std::array<uint64_t, 3>> seen;
+                    static uint64_t calls = 0;
+                    std::lock_guard<std::mutex> l(vpm);
+                    ++seen[t->resource->native][vp];
+                    if (++calls % 2000 == 0) {
+                        for (const auto& kv : seen) Log("DLSS depth %p under viewport 1: %llu, 2: %llu (thread %lu)", kv.first, kv.second[1], kv.second[2], GetCurrentThreadId());
+                    }
+                    XrRebuildCopyDepth(vp - 1, cmd, t->resource->native);
+                }
+                if (t->bufferType == 0 && t->resource) depthTag = t;
+                if (t->bufferType == 1 && t->resource) {
+                    XrRebuildCopyMotion(vp - 1, cmd, t->resource->native, t->resource->state);
+                    mvTag = t;
+                    mvIndex = static_cast<int>(i);
+                }
             }
         }
     }
@@ -2882,6 +2975,19 @@ static int __cdecl HookSlEvaluate(uint32_t feature, const void* frame, const voi
     memcpy(local, inputs, n * sizeof(void*));
     ViewportCopy copy(inputs[0]);
     local[0] = copy.bytes;
+    // 1.06: in alternate eye, DLSS gets motion vectors with the objects' own movement scaled to the eye's history age.
+    alignas(16) uint8_t tagCopy[sizeof(SlTag) + 16], resCopy[sizeof(SlResource) + 16];
+    if (mvTag && depthTag && mvIndex > 0 && MvFixMode() != 0) {
+        if (void* fixed = MvFixRun(vp, cmd, depthTag->resource->native, mvTag->resource->native, mvTag->resource->state, g_alternateNow.load())) {
+            memcpy(resCopy, mvTag->resource, sizeof(SlResource));
+            memcpy(tagCopy, mvTag, sizeof(SlTag));
+            auto* rc = reinterpret_cast<SlResource*>(resCopy);
+            rc->native = fixed;
+            rc->state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            reinterpret_cast<SlTag*>(tagCopy)->resource = rc;
+            local[mvIndex] = tagCopy;
+        }
+    }
     const int r = g_origSlEvaluate(feature, frame, local, n, cmd);
     ++g_slCount[3];
     if (r != 0 && g_slLogLeft.fetch_sub(1) > 0) Log("SL evaluate viewport %d result %d", vp, r);
@@ -2920,6 +3026,14 @@ static int __cdecl HookSlSetTag(const void* viewport, const SlTag* tags, uint32_
 static std::atomic<int> g_slConstLogLeft{0};
 static int __cdecl HookSlSetConst(const void* values, const void* frame, const void* viewport) {
     ++g_slCount[2];
+    if (values && (g_slViewport.load() == 1 || g_slViewport.load() == 2)) {
+        // The game's motion vector scale, for the alternate eye rebuild. After five 4x4 matrices: jitter, then mvec scale.
+        const float* f = reinterpret_cast<const float*>(static_cast<const uint8_t*>(values) + sizeof(SlBase));
+        const float* a = f + 80;
+        XrRebuildMvScale(a[2], a[3]);
+        // Matrices: cameraViewToClip, clipToCameraView, clipToLensClip, clipToPrevClip (+48), prevClipToClip.
+        MvFixSetMatrix(g_slViewport.load(), f + 48, a[2], a[3]);
+    }
     if (g_slConstLogLeft.load() > 0 && g_slConstLogLeft.fetch_sub(1) > 0 && values) {
         const float* f = reinterpret_cast<const float*>(static_cast<const uint8_t*>(values) + sizeof(SlBase));
         const uint32_t* u = reinterpret_cast<const uint32_t*>(f);
@@ -2934,8 +3048,32 @@ static int __cdecl HookSlSetConst(const void* values, const void* frame, const v
     if (r != 0 && g_slLogLeft.fetch_sub(1) > 0) Log("SL constants viewport %d result %d", g_slViewport.load(), r);
     return r;
 }
+// DLSS preset (sl::DLSSOptions, Streamline 2.4 as the game ships it with DLSS 3.7.0): after the 32 byte base, mode at +32,
+// output size, sharpness, exposure, three one-byte flags, then the presets as uint32 at +60 (DLAA), +64 (quality),
+// +68 (balanced), +72 (performance), +76 (ultra performance). 0 is the DLL's default; 1 to 6 are A to F.
+// DlssPreset in the ini (or lab "dlsspreset n") puts one preset in every mode for the eyes; 0 leaves the game's.
+static std::atomic<int> g_dlssPreset{0};
 static int __cdecl HookSlSetOptions(const void* viewport, const void* options) {
     ++g_slCount[4];
+    if (options) {
+        const uint8_t* o = static_cast<const uint8_t*>(options);
+        static uint32_t lastMode = 0xffffffff, lastPerf = 0xffffffff;
+        const uint32_t mode = *reinterpret_cast<const uint32_t*>(o + 32), perf = *reinterpret_cast<const uint32_t*>(o + 72);
+        if (mode != lastMode || perf != lastPerf) {
+            lastMode = mode;
+            lastPerf = perf;
+            const uint32_t* pr = reinterpret_cast<const uint32_t*>(o + 60);
+            Log("DLSS options viewport %d: mode %u, output %ux%u, presets DLAA %u quality %u balanced %u performance %u ultra performance %u, forced %d",
+                g_slViewport.load(), mode, *reinterpret_cast<const uint32_t*>(o + 36), *reinterpret_cast<const uint32_t*>(o + 40), pr[0], pr[1], pr[2], pr[3], pr[4], g_dlssPreset.load());
+        }
+    }
+    const int preset = g_dlssPreset.load();
+    alignas(8) uint8_t local[128];
+    if (preset > 0 && options && g_slViewport.load() != 0) {
+        memcpy(local, options, 88);
+        for (int i = 0; i < 5; ++i) reinterpret_cast<uint32_t*>(local + 60)[i] = static_cast<uint32_t>(preset);
+        options = local;
+    }
     if (g_slViewport.load() == 0) return g_origSlSetOptions(viewport, options);
     ViewportCopy copy(viewport);
     const int r = g_origSlSetOptions(copy.bytes, options);
@@ -3306,10 +3444,43 @@ static void RunCommand(const std::string& c) {
         XrRebuildTest(g_w != 0);
     }
     else if (sscanf(c.c_str(), "rbstage %u", &g_w) == 1) XrRebuildStage(static_cast<int>(g_w));
+    else if (sscanf(c.c_str(), "rborder %u", &g_w) == 1) XrRebuildOrder(static_cast<int>(g_w));
+    else if (sscanf(c.c_str(), "rbmotion %u %f %f", &g_w, &g_f, &g_fh[0]) == 3) XrRebuildMotion(static_cast<int>(g_w), g_f, g_fh[0]);
+    else if (sscanf(c.c_str(), "rbfill %u %u %f", &g_w, &g_h, &g_f) == 3) XrRebuildFill(static_cast<int>(g_w), static_cast<int>(g_h), g_f);
+    else if (sscanf(c.c_str(), "rbedge %u", &g_w) == 1) XrRebuildEdge(static_cast<int>(g_w));
+    else if (sscanf(c.c_str(), "rbband %u", &g_w) == 1) XrRebuildBand(static_cast<int>(g_w));
+    else if (sscanf(c.c_str(), "rbview %u", &g_w) == 1) XrRebuildDebugView(g_w != 0);
+    else if (sscanf(c.c_str(), "rbprevheld %u", &g_w) == 1) XrRebuildUsePrevHeld(g_w != 0);
+    else if (sscanf(c.c_str(), "rbstats %u", &g_w) == 1) XrRebuildStats(g_w != 0);
+    else if (sscanf(c.c_str(), "rbobj %f", &g_f) == 1) XrRebuildObjFactor(g_f);
+    else if (sscanf(c.c_str(), "mvfix %u %f %u", &g_w, &g_f, &g_h) == 3) MvFixSetMode(static_cast<int>(g_w), g_f, static_cast<int>(g_h));
+    else if (c == "rbalt off") {
+        const float off[6] = {-1, 0, 0, 0, 0, 0};
+        XrRebuildAlt(off);
+    } else if (float v[6]; sscanf(c.c_str(), "rbalt %f %f %f %f %f %f", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) == 6) XrRebuildAlt(v);
+    else if (sscanf(c.c_str(), "dlsspreset %u", &g_w) == 1) {
+        g_dlssPreset = static_cast<int>(g_w);
+        Log("DLSS preset forced %d (0 the game's; takes effect when the game next sets its options)", g_dlssPreset.load());
+    }
+    else if (sscanf(c.c_str(), "rbfill %u %u", &g_w, &g_h) == 2) XrRebuildFill(static_cast<int>(g_w), static_cast<int>(g_h), -1.f);
+    else if (sscanf(c.c_str(), "slconst %u", &g_w) == 1) g_slConstLogLeft = static_cast<int>(g_w);
     else if (sscanf(c.c_str(), "rbshot %63s", g_text) == 1) g_rbShotName = g_text;
     else if (sscanf(c.c_str(), "sltag %u", &g_w) == 1) { g_slTagLogLeft = static_cast<int>(g_w); g_slEvalLogLeft = static_cast<int>(g_w); }
     else if (sscanf(c.c_str(), "eyedefer %u", &g_w) == 1) g_eyeDefer = g_w != 0;
     else if (sscanf(c.c_str(), "eyeshare %u", &g_w) == 1) g_eyeShare = g_w != 0;
+    else if (sscanf(c.c_str(), "flatwiden %u", &g_w) == 1) {
+        g_flatWiden = std::clamp(static_cast<int>(g_w), 50, 300);
+        Log("MAIN flat camera widen %d", g_flatWiden.load());
+    }
+    else if (sscanf(c.c_str(), "mainpin %f", &g_f) == 1) {
+        g_mainPinhole = g_f;
+        Log("MAIN pinhole set %.4f", g_f);
+    }
+    else if (sscanf(c.c_str(), "eyelod %x %f", &g_w, &g_f) == 2) {
+        g_eyeLodOff = g_w;
+        g_eyeLod = g_f;
+        Log("EYE field +%#x forced %.3f at submit (0 = the game's)", g_w, g_f);
+    }
     else if (c == "viewinfo") {
         uint8_t* const vs[3] = {ActiveView(), g_eyeA.load(), g_eyeB.load()};
         for (uint8_t* v : vs) {
@@ -3561,6 +3732,10 @@ static DWORD WINAPI ProbeThread(void*) {
         g_occlSkip = 0;  // test row removed in build 99; lab command occlskip still works
         g_menuSound = static_cast<int>(GetPrivateProfileIntW(L"VR", L"MenuSound", 2, early.c_str())) & 3;
         g_frameHandoffXr = GetPrivateProfileIntW(L"VR", L"FrameHandoffXr", 0, early.c_str()) != 0;
+        if (GetPrivateProfileIntW(L"VR", L"MotionFix", 1, early.c_str()) == 0) MvFixSetMode(0, 2.f, 1);
+        g_dlssPreset = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"VR", L"DlssPreset", 0, early.c_str())), 0, 15);
+        g_hudHoleIdle = GetPrivateProfileIntW(L"VR", L"HudHoleIdle", 0, early.c_str()) != 0 ? 1 : 0;
+        g_flatWiden = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"VR", L"FlatCameraWiden", 100, early.c_str())), 50, 300);
         g_queryMode = static_cast<int>(GetPrivateProfileIntW(L"VR", L"QueryDeferred", 0, early.c_str())) != 0 ? 1 : 0;
         Log("OCCLWAIT mode %d", g_occlSkip.load());
         Log("QUERYWAIT %s", g_queryNoSpin.load() ? "off" : "on");

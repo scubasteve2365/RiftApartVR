@@ -1,6 +1,6 @@
 # Rift Apart VR: Ratchet & Clank: Rift Apart in VR
 
-True stereo VR for Ratchet & Clank: Rift Apart. Both eyes are drawn from the same game tick, so there is no alternate-eye shimmer and no warping. You play in third person with a gamepad, in a solid 3D world that stays level around you; there are no motion controls. DLSS works in both eyes.
+True stereo VR for Ratchet & Clank: Rift Apart. Both eyes are drawn from the same game tick by default, so there is no alternate-eye shimmer and no warping. For more speed, Clank's Space & Frame Warp draws one eye per frame and rebuilds the other. You play in third person with a gamepad, in a solid 3D world that stays level around you; there are no motion controls. DLSS works in both eyes.
 
 **Download:** see [Releases](../../releases).
 
@@ -55,13 +55,13 @@ Click and hold both thumbsticks for half a second to open the menu in the headse
 
 | Setting | What it does |
 |---|---|
+| Clank's Space & Frame Warp | Off draws both eyes every frame and is the default. Depth Based draws one eye each frame and rebuilds the other from its own last picture, moved with the game's depth and motion, for a big speed-up; moving things such as Ratchet come from the eye drawn that frame, and DLSS is given corrected motion so they do not trail. Needs DLSS. Basic shows the other eye's last picture as it was, and judders more |
 | Frame generation | Off, 2X or 3X. Adds made-up frames between real ones for smoother motion, using OFXR-BRIDGE in the `ofxr` folder. Costs some latency. Off by default. Turning it on from Off needs a restart of the game, since OFXR can only load at start. Switching between 2X and 3X, and Off, work at once; after Off, a restart frees the small cost of OFXR sitting idle |
 | Frame generation type | Optical flow tracks motion in the picture itself, works on any card and is the usual choice. DLSS-G is NVIDIA's frame generation, for RTX 40 and 50 cards; it costs more. Hybrid is optical flow helped by the game's own motion vectors, and takes effect at the next launch. DLSS-G and Hybrid need DLSS chosen in the game |
 | Optical flow quality | Fast, Medium or Slow. Slow tracks motion best and costs the most |
 | Optical flow detail | 25 to 100%. The resolution motion is tracked at |
-| Stereo | Native draws both eyes every frame and is the default. Alternate Eye Rendering draws one eye per frame for more speed: Depth Based makes the other eye from it and needs DLSS; Basic shows that eye's last image and judders more |
 
-Frame generation and Alternate Eye Rendering cannot be used together. Whichever one is blocked is greyed out, and the menu says why.
+Frame generation and Clank's Space & Frame Warp cannot be used together. Whichever one is blocked is greyed out, and the menu says why.
 
 ### Options
 
@@ -90,7 +90,7 @@ Set these in the game's own Graphics and Display menus. Names can differ slightl
 
 | Game setting | Set to | Why |
 |---|---|---|
-| Upscale method | NVIDIA DLSS on RTX cards | DLSS works in both eyes and is the fastest way to a sharp picture. Alternate Eye Rendering Depth Based, DLSS-G and Hybrid need it |
+| Upscale method | NVIDIA DLSS on RTX cards | DLSS works in both eyes and is the fastest way to a sharp picture. Clank's Space & Frame Warp Depth Based, DLSS-G and Hybrid need it |
 | Upscale quality | Performance, or Balanced / Quality if you have headroom | Sets each eye's internal resolution |
 | **Texture Quality** | **Medium or High, not Ultra** | Ultra makes the game load textures in and out as you move, which costs the CPU several milliseconds every frame in VR, even with plenty of video memory |
 | Texture Filtering | 16x is fine | Very cheap |
@@ -109,14 +109,14 @@ The settings above were used for testing on an RTX 5090 with a Pimax Dream Air a
 - **Texture Quality: Medium or High, not Ultra.** On an RTX 5090, Medium took the busiest areas from about 60 to a steady 72. See [Game settings](#game-settings).
 - **SteamVR throttling:** in SteamVR settings, Video, Per-Application Video Settings, set this game's Throttling Behavior to Limit at your headset's refresh rate. On Auto, SteamVR can drop the game to half rate and keep it there.
 - Render resolution follows your headset runtime's resolution setting (SteamVR's resolution, or Virtual Desktop's quality). If lowering it does not raise the frame rate, your CPU is the limit, not your graphics card.
-- For more speed: Stereo set to Alternate Eye Rendering, Depth Based, or frame generation with Optical flow.
+- For more speed: Clank's Space & Frame Warp set to Depth Based, or frame generation with Optical flow.
 
 ## Good to know
 
 - Tested in real headsets on two setups: Pimax Dream Air through SteamVR, and Meta Quest 3 through Virtual Desktop's VDXR, with an RTX 5090. Other headsets and graphics cards should work through OpenXR but have not been tried. Reports are welcome.
 - The launcher is skipped. Splash screens and menus show on a flat screen in front of you.
 - In VR the game runs in a window sized to your monitor (2560x1440, or 1920x1080 on smaller screens; `FlatWindowHeight=1080` in `RiftApartVR.ini` picks one), and your monitor shows the left eye. The game is told VSync is off, so your headset sets the frame rate. Your saved game settings are not changed unless you save settings in the game's own menu while it runs.
-- Alternate Eye Rendering, Depth Based can make small bright lights and glows flicker between two spots, because they carry no depth for the other eye to be made from. Basic does not, but judders more.
+- Clank's Space & Frame Warp, Depth Based: animated effects such as smoke, sparks and blinking signs show their previous frame in the rebuilt eye, so they can look slightly out of step between your eyes. `MotionFix=0` in `RiftApartVR.ini` turns off the corrected DLSS motion, for comparison.
 - One scripted ride can hang the GPU when its zoomed in cutscene shots are drawn in 3D. Cutscenes on a screen is set to Zoomed shots by default, which avoids it.
 - If something goes wrong, the log is `RiftApartVR.log` in the game folder, with earlier ones in `vrlab_logs`. Please attach it to an issue.
 

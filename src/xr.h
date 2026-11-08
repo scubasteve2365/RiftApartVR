@@ -31,6 +31,30 @@ void* XrRebuildResult();
 // Lab: rebuild the right eye from the left in native stereo, to compare with the real right eye.
 void XrRebuildTest(bool on);
 void XrRebuildStage(int stage);
+// Rebuild source order: 0 the drawn eye first (1.0), 1 the eye's own last image first (default), 2 own image only (lab).
+void XrRebuildOrder(int order);
+// The eye's motion vectors at its DLSS call (state as given to DLSS), and the game's scale for them (to image units).
+void XrRebuildCopyMotion(int eye, void* cmd, void* mv, uint32_t state);
+void XrRebuildMvScale(float x, float y);
+// Lab: motion on or off, and a multiplier on the vectors (sign checks).
+void XrRebuildMotion(int on, float mulX, float mulY);
+// Gap filling in the rebuild: 0 nearest neighbour (1.02), 1 from the background side (default); search radius in depth texels.
+// moving: movement per tick over distance above which a surface comes from the drawn eye (0 off, negative keeps).
+void XrRebuildFill(int mode, int radius, float moving);
+// Edges in the rebuild: 1 best of the four nearest depth texels per output pixel (default), 0 nearest (1.04).
+void XrRebuildEdge(int on);
+// Depth texels around moving things that also come from the drawn eye (default 2), 0 off (1.05).
+void XrRebuildBand(int texels);
+// Lab: colour each rebuilt pixel by where it came from.
+void XrRebuildDebugView(bool on);
+void XrRebuildUsePrevHeld(bool on);
+// Lab: count and log rebuilt frames whose own image fell back almost everywhere.
+void XrRebuildStats(bool on);
+void XrRebuildObjFactor(float f);
+// Lab, paired tests: a second rebuild of the same frame with other settings (fill mode, radius, moving threshold, edge, band,
+// order), only in the native lab test. v[0] < 0 turns it off. XrRebuildAltResult gives its image or null.
+void XrRebuildAlt(const float v[6]);
+void* XrRebuildAltResult();
 // Game thread: wait for the headset's next frame, at most one and a half periods.
 void XrPaceWait();
 // Present thread: copy both eye images to the swapchains and end the open frame.
@@ -58,7 +82,8 @@ void XrCopyTimes(double* copyMs, double* betweenMs);
 // Game thread: a small dot along this direction in room space, from this point, while aiming. Null hides it.
 void XrSetAimDot(const float* roomDir, const float* roomFrom = nullptr);
 // Game thread: cut the middle out of the first HUD image, where the game's reticle sits.
-void XrSetHudHole(bool on);
+// Blank the game's reticle out of the HUD layer: 0 none, 1 the centre dot only, 2 the aiming reticle.
+void XrSetHudHole(int mode);
 // Lab only: dump the HUD image as sent, hole included, at the next fresh copy.
 void XrDumpHudAfter(const wchar_t* path);
 // Present thread, before XrOnPresent: show the left eye in this back buffer, cropped to it. Null leaves the game's picture.

@@ -15,7 +15,7 @@ add_library(minhook STATIC
   third_party/minhook/src/hde/hde64.c)
 target_include_directories(minhook PUBLIC third_party/minhook/include)
 
-add_library(winhttp SHARED src/main.cpp src/capture.cpp src/xr.cpp src/winhttp_stubs.asm src/winhttp.def)
+add_library(winhttp SHARED src/main.cpp src/capture.cpp src/xr.cpp src/mvfix.cpp src/winhttp_stubs.asm src/winhttp.def)
 target_compile_features(winhttp PRIVATE cxx_std_17)
 target_compile_definitions(winhttp PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(winhttp PRIVATE minhook)

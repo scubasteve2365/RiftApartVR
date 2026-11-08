@@ -1033,7 +1033,7 @@ void XrOnPresentScreen(void* resource, int width, int height, int dxgiFormat) {
     g_open = false;
 }
 
-static std::atomic<bool> g_hudHole{false};
+static std::atomic<int> g_hudHole{0};  // 0 none, 1 small (the centre dot), 2 large (the aiming reticle)
 static std::wstring g_hudAfterPath;
 static std::atomic<bool> g_hudAfterWanted{false};
 void XrDumpHudAfter(const wchar_t* path) {
@@ -1042,21 +1042,26 @@ void XrDumpHudAfter(const wchar_t* path) {
 }
 static bool g_uiFilled[kUiSlots];
 static void* g_uiLastDst;
-void XrSetHudHole(bool on) { g_hudHole = on; }
+void XrSetHudHole(int mode) { g_hudHole = mode; }
 static ID3D12Resource* g_holeUpload;
 static void* g_mirror;
 void XrSetMirror(void* backBuffer) { g_mirror = backBuffer; }
 
-// Blank a box in the middle of a HUD image already holding its copy. dst is in the copy-dest state.
-static void HudHole(ID3D12GraphicsCommandList* list, ID3D12Resource* dst, int w, int h) {
-    const int hw = (w * 14 / 100 + 3) & ~3, hh = h * 24 / 100;
-    const UINT pitch = (hw * 4 + 255) & ~255;
+// Blank a box in the middle of a HUD image already holding its copy. dst is in the copy-dest state. Large covers the game's
+// aiming reticle; small only its centre dot, about 3.3 by 5.9 percent of the HUD (RigB, 1.03), so prompts that the game puts
+// next to Ratchet, near the middle, are not cut away (1.0 to 1.02 blanked the large box whenever the aim dot was on).
+static void HudHole(ID3D12GraphicsCommandList* list, ID3D12Resource* dst, int w, int h, int mode) {
+    const int bigW = (w * 14 / 100 + 3) & ~3, bigH = h * 24 / 100;
+    // The dot sits a little right of the middle (x 0.505 to 0.533 seen on RigB), so the small box is centred at 0.51.
+    const int hw = mode >= 2 ? bigW : (w * 60 / 1000 + 3) & ~3, hh = mode >= 2 ? bigH : h * 70 / 1000;
+    const int left = mode >= 2 ? (w - hw) / 2 : w * 51 / 100 - hw / 2;
+    const UINT pitch = (bigW * 4 + 255) & ~255;
     if (!g_holeUpload) {
         D3D12_HEAP_PROPERTIES hp{};
         hp.Type = D3D12_HEAP_TYPE_UPLOAD;
         D3D12_RESOURCE_DESC rd{};
         rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        rd.Width = static_cast<UINT64>(pitch) * hh;
+        rd.Width = static_cast<UINT64>(pitch) * bigH;
         rd.Height = 1;
         rd.DepthOrArraySize = 1;
         rd.MipLevels = 1;
@@ -1065,7 +1070,7 @@ static void HudHole(ID3D12GraphicsCommandList* list, ID3D12Resource* dst, int w,
         if (FAILED(g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_holeUpload)))) return;
         void* m = nullptr;
         if (FAILED(g_holeUpload->Map(0, nullptr, &m))) return;
-        memset(m, 0, static_cast<size_t>(pitch) * hh);
+        memset(m, 0, static_cast<size_t>(pitch) * bigH);
         g_holeUpload->Unmap(0, nullptr);
     }
     D3D12_TEXTURE_COPY_LOCATION d{}, s{};
@@ -1078,7 +1083,7 @@ static void HudHole(ID3D12GraphicsCommandList* list, ID3D12Resource* dst, int w,
     s.PlacedFootprint.Footprint.Height = hh;
     s.PlacedFootprint.Footprint.Depth = 1;
     s.PlacedFootprint.Footprint.RowPitch = pitch;
-    list->CopyTextureRegion(&d, (w - hw) / 2, (h - hh) / 2, 0, &s, nullptr);
+    list->CopyTextureRegion(&d, left, (h - hh) / 2, 0, &s, nullptr);
 }
 
 // The left eye on the monitor: the middle of the eye at one to one, or centred if the window is larger.
@@ -1203,6 +1208,7 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
         if (g_renderedSerial > g_usedSerial && g_poses[g_renderedSerial % kPoses].serial == g_renderedSerial) {
             pose = g_poses[g_renderedSerial % kPoses];
             g_ageSum += g_poseSerial - g_renderedSerial;
+            g_rbPrevUsedSerial = g_usedSerial;
             g_usedSerial = g_renderedSerial;
             havePose = true;
             if (g_alternate.load()) {
@@ -1254,10 +1260,12 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
     const bool copyTimed = CopyTimerBegin(list, &copyIndex);
     // The rebuilt eye: from the drawn eye's image and depth, for this tick's camera.
     bool rebuilt = false;
+    g_rbCurSerial = pose.serial;
     if (g_rebuildMode.load() != 0 && freshEye >= 0 && pose.cameras[0].valid && pose.cameras[1].valid) {
         rebuilt = RbRun(list, freshEye, pose.cameras, static_cast<ID3D12Resource*>(resources[freshEye]), static_cast<D3D12_RESOURCE_STATES>(states[freshEye]), pose.nearZ);
     } else if (g_rbTest.load() && g_rebuildMode.load() != 0 && freshEye < 0 && pose.cameras[0].valid && pose.cameras[1].valid) {
-        RbRun(list, 0, pose.cameras, static_cast<ID3D12Resource*>(resources[0]), static_cast<D3D12_RESOURCE_STATES>(states[0]), pose.nearZ);
+        RbRun(list, 0, pose.cameras, static_cast<ID3D12Resource*>(resources[0]), static_cast<D3D12_RESOURCE_STATES>(states[0]), pose.nearZ,
+              static_cast<ID3D12Resource*>(resources[1]), static_cast<D3D12_RESOURCE_STATES>(states[1]));
     }
     int rebuiltEye = -1;
     if (rebuilt) rebuiltEye = 1 - freshEye;
@@ -1364,7 +1372,7 @@ void XrOnPresent(void* const resources[2], const uint32_t states[2], const XrUiI
         s.pResource = src;
         s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         list->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
-        if (i == 0 && g_hudHole && !g_cinema) HudHole(list, dst, ui[i].width, ui[i].height);
+        if (i == 0 && g_hudHole.load() != 0 && !g_cinema) HudHole(list, dst, ui[i].width, ui[i].height, g_hudHole.load());
         std::swap(bar[0].Transition.StateBefore, bar[0].Transition.StateAfter);
         std::swap(bar[1].Transition.StateBefore, bar[1].Transition.StateAfter);
         list->ResourceBarrier(2, bar);
