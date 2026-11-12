@@ -12,7 +12,7 @@ True stereo VR for Ratchet & Clank: Rift Apart. By default the mod runs Clank's 
 - A PC VR headset with a 64-bit OpenXR runtime. Two have been tested:
   - SteamVR, set as your OpenXR runtime (SteamVR settings, OpenXR)
   - Virtual Desktop's VDXR, for headsets like the Meta Quest 3
-- A gamepad
+- A gamepad. Xbox style pads are tested. PS5 DualSense support is added but untested: see [Good to know](#good-to-know)
 - For DLSS in both eyes, an NVIDIA RTX card. With another upscaler chosen in the game, the eyes draw at full size
 
 ## Install
@@ -29,6 +29,8 @@ The mod is not signed, so Windows may warn you about the bat file. It is plain t
 ## Settings
 
 Click and hold both thumbsticks for half a second to open the menu in the headset. The game does not see your gamepad while it is open. Every change is saved straight away and takes effect at once, unless it says next launch. The bottom of the menu explains the setting you are on.
+
+No gamepad at hand? Press **Insert** on the keyboard to open and close the menu (`MenuKey` in `RiftApartVR.ini` picks another key, as a Windows virtual key code). Arrow keys choose and change, Enter selects, Page Up and Page Down (or Q and E) switch section, Esc or Insert closes. While the menu is open the game does not see your key presses.
 
 | Control | In the menu |
 |---|---|
@@ -103,6 +105,7 @@ The rest are yours to set in the game's own Graphics and Display menus. Names ca
 | Dynamic Resolution | Off | The headset sets resolution |
 | NVIDIA Reflex | Off | Not needed; the headset paces the game |
 | Screen Shake | Off, for comfort | A camera effect made for a flat screen |
+| HDR | Off (the mod turns it off) | With HDR on, splash screens and menus are black in the headset. The mod tells the game HDR is off at start, and the game saves that |
 | Shadows | To taste. Low or Medium if you need speed | Each eye is drawn in full, so these cost twice |
 | VSync, display mode, window size | Anything | In VR the mod runs the game in a window sized to your monitor (2560x1440 or 1920x1080) with VSync off, and your headset sets the frame rate |
 
@@ -122,6 +125,8 @@ The settings above were used for testing on an RTX 5090 with a Pimax Dream Air a
 - In VR the game runs in a window sized to your monitor (2560x1440, or 1920x1080 on smaller screens; `FlatWindowHeight=1080` in `RiftApartVR.ini` picks one), and your monitor shows the left eye. The game is told VSync is off, so your headset sets the frame rate. Your saved game settings are not changed unless you save settings in the game's own menu while it runs.
 - Clank's Space & Frame Warp, Depth Based: animated effects such as smoke, sparks and blinking signs show their previous frame in the rebuilt eye, so they can look slightly out of step between your eyes. `MotionFix=0` in `RiftApartVR.ini` turns off the corrected DLSS motion, for comparison.
 - One scripted ride can hang the GPU when its zoomed in cutscene shots are drawn in 3D. Cutscenes on a screen is set to Zoomed shots by default, which avoids it.
+- **PS5 DualSense:** support is added but untested. The mod reads the DualSense itself, so clicking both sticks opens the menu. If the DualSense gives you trouble, turn on Steam Input for the game (in Steam: right click the game, Properties, Controller, Enable Steam Input). Steam then shows it to the game as an Xbox controller, which works with the mod, but the game shows Xbox buttons and you lose the DualSense rumble and trigger effects.
+- **HDR:** the mod turns the game's HDR off when it starts, because HDR makes splash screens and menus black in the headset. If you turn HDR back on in the game's menu while playing, menus go black again until you restart the game.
 - If something goes wrong, the log is `RiftApartVR.log` in the game folder, with earlier ones in `vrlab_logs`. Please attach it to an issue.
 
 ## Support

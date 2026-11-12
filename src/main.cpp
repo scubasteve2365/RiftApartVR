@@ -32,9 +32,9 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 120
-#define MOD_VERSION "1.2"
-#define MOD_VERSION_W L"1.2"
+#define BUILD_NUMBER 126
+#define MOD_VERSION "1.3"
+#define MOD_VERSION_W L"1.2.4"
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -606,6 +606,28 @@ static void UpdateMode() {
         // Only the title's own spots are flat. A rule on its 39.43 lens used to be here, and gameplay's aim zoom can pass through
         // that lens: a tester's log has it at 39.41, the flat screen came on, and no menu option could stop it.
         world = !atOrigin && !titleSpot;
+        // Pause menu tabs move the game's camera to their own stages: the map at 0 200 0, armor and gadgets near 0 -1000 38.
+        // Those pictures are drawn by the game's own view only, so the eyes showed black there (Steve, 1.2.1). While paused and
+        // far from where play stopped, it is a menu stage: flat screen, showing the game's own picture.
+        {
+            static float playCam[3];
+            static bool havePlayCam = false;
+            const bool paused = *reinterpret_cast<int*>(g_base + kPausedFlag) != 0;
+            if (!paused && world) {
+                playCam[0] = cam[12];
+                playCam[1] = cam[13];
+                playCam[2] = cam[14];
+                havePlayCam = true;
+            }
+            const float away = havePlayCam ? fabsf(cam[12] - playCam[0]) + fabsf(cam[13] - playCam[1]) + fabsf(cam[14] - playCam[2]) : 0.0f;
+            const bool menuStage = paused && world && havePlayCam && away > 30.0f;
+            static bool seenStage = false;
+            if (menuStage != seenStage) {
+                Log("MODE menu stage %s, camera %.2f %.2f %.2f, %.0f from play", menuStage ? "starts" : "ends", cam[12], cam[13], cam[14], away);
+                seenStage = menuStage;
+            }
+            if (menuStage) world = false;
+        }
         static bool seenWorld = false;
         if (world != seenWorld) {
             Log("MODE %s spot, camera %.2f %.2f %.2f lens %.2f", world ? "world" : "title", cam[12], cam[13], cam[14], vfov);
@@ -1305,16 +1327,29 @@ static PassQueueFn g_origPassQueue;
 // The HUD is a real model in the world, models/ui/playerhudrtt, placed by the game near its camera. In the game's own view
 // it lands in the UI overlay. In an offscreen view it lands in the picture, 20 units out, with bloom: the doubled HUD.
 // So the eyes leave out every model under models/ui. The context's +8 is the view it works for.
-static std::atomic<bool> g_eyeDropUi{true};
+// 1.2.2: only the HUD model is left out. Leaving out every models/ui model also hid in-world screens drawn as UI models, such
+// as the Battleplex console's menu (black screen in both eyes, Steve 2026-11-11). 0 keep all, 1 HUD only (default), 2 all ui.
+static std::atomic<int> g_eyeDropUi{1};
+static const char kHudModel[] = "playerhud";
 using ModelQueueFn = void(__fastcall*)(uint8_t*, uint8_t*, char);
 static ModelQueueFn g_origModelQueue;
 static const char kUiModels[] = "models\x5cui\x5c";
 static void __fastcall HookModelQueue(uint8_t* ctx, uint8_t* inst, char flag) {
     const uint8_t* const view = *reinterpret_cast<uint8_t* const*>(ctx + 8);
-    if ((view == g_eyeA.load() || view == g_eyeB.load()) && g_eyeDropUi.load()) {
+    const int drop = g_eyeDropUi.load();
+    if ((view == g_eyeA.load() || view == g_eyeB.load()) && drop) {
         const uint8_t* const model = *reinterpret_cast<uint8_t* const*>(inst + 0x88);
         const char* const name = model ? *reinterpret_cast<const char* const*>(model + 0x10) : nullptr;
-        if (name && memcmp(name, kUiModels, sizeof(kUiModels) - 1) == 0) return;
+        if (name && memcmp(name, kUiModels, sizeof(kUiModels) - 1) == 0) {
+            const bool hud = strstr(name, kHudModel) != nullptr;
+            {
+                static std::mutex m;
+                static std::set<std::string> seen;
+                std::lock_guard<std::mutex> l(m);
+                if (seen.size() < 60 && seen.insert(name).second) Log("EYEUI model %s: %s in the eyes", name, drop == 2 || hud ? "left out" : "kept");
+            }
+            if (drop == 2 || hud) return;
+        }
     }
     g_origModelQueue(ctx, inst, flag);
 }
@@ -1675,6 +1710,42 @@ static void __fastcall HookCameraSubmit(uint8_t* view, const uint8_t* desc) {
     if (isMain) {
         memcpy(g_mainLensGame, desc + 0x1c0, sizeof(g_mainLensGame));
         g_mainLensValid = true;
+        // Which code is driving the game's camera (1.2.4): the game addresses on the way here, logged when they change and have
+        // held for half a second, with what the mod made of it. Matched to camera types offline (RE_NOTES "Camera paths").
+        void* frames[8] = {};
+        const USHORT n = RtlCaptureStackBackTrace(1, 8, frames, nullptr);
+        uint32_t path[8] = {};
+        int m = 0;
+        for (USHORT i = 0; i < n && m < 5; ++i) {
+            const uint8_t* a = static_cast<uint8_t*>(frames[i]);
+            if (a >= g_base && a < g_base + g_textStart + g_textSize) path[m++] = static_cast<uint32_t>(a - g_base);
+        }
+        // The game's own view is submitted from more than one place per frame, so the paths seen over each second are compared
+        // as a set; a change that holds for two seconds is logged.
+        char key[64];
+        snprintf(key, sizeof(key), "%x/%x/%x", path[1], path[2], path[3]);
+        static std::set<std::string> window, last, shown;
+        static ULONGLONG windowStart = 0;
+        static int lines = 0, same = 0;
+        window.insert(key);
+        const ULONGLONG nowMs = GetTickCount64();
+        if (!windowStart) windowStart = nowMs;
+        if (nowMs - windowStart >= 1000) {
+            windowStart = nowMs;
+            same = window == last ? same + 1 : 0;
+            last = window;
+            window.clear();
+            if (same >= 1 && last != shown && lines < 300) {
+                shown = last;
+                ++lines;
+                std::string all;
+                for (const std::string& k : shown) all += (all.empty() ? "" : " ") + k;
+                const float p5 = *reinterpret_cast<const float*>(desc + 0x1c0 + 20);
+                const double vfov = p5 != 0 ? 2.0 * atan(1.0 / fabs(p5)) * 57.29577951 : 0;
+                Log("CAMERA paths %s | lens %.2f, %s%s, paused %d", all.c_str(), vfov, g_xrEyes.load() ? "3D world" : "flat screen",
+                    g_vendorNow.load() ? ", vendor screen" : "", *reinterpret_cast<int*>(g_base + kPausedFlag));
+            }
+        }
     }
     const float pin = g_mainPinhole.load();
     const int widen = g_flatWiden.load();
@@ -1838,6 +1909,32 @@ static void TexInfo() {
     WalkObject("inner", inner, 0x200);
 }
 
+// ---- mod menu by keyboard (1.2.1): Insert (MenuKey in the ini) opens and closes it, Steve's choice 2026-11-10 (an exception to
+// the lab's "no Insert alone" rule). Insert is free in the game's default bindings and in the bundled OFXR layer (F6 with
+// Ctrl+Alt, F8, F9, F10, F11). While the menu is open, and until the keys that closed it are let
+// go, key presses do not reach the game: raw input key-downs are blanked and key messages dropped. Key-ups always pass, so a key
+// held when the menu opened is never stuck. ----
+static std::atomic<bool> g_menuOpen{false};
+static std::atomic<bool> g_keysSwallow{false};
+static std::atomic<bool> g_menuKeys{false};  // the last menu input came from the keyboard: the help line shows keys
+static std::atomic<int> g_menuKey{VK_INSERT};
+static bool KeysBlocked() { return g_menuOpen.load() || g_keysSwallow.load(); }
+using GetRawInputDataFn = UINT(WINAPI*)(HRAWINPUT, UINT, LPVOID, PUINT, UINT);
+static GetRawInputDataFn g_origRawData;
+static std::atomic<uint32_t> g_keysBlocked{0};
+static UINT WINAPI HookRawData(HRAWINPUT h, UINT cmd, LPVOID data, PUINT size, UINT headerSize) {
+    const UINT r = g_origRawData(h, cmd, data, size, headerSize);
+    if (data && cmd == RID_INPUT && r != static_cast<UINT>(-1) && r >= sizeof(RAWINPUTHEADER) + sizeof(RAWKEYBOARD) && KeysBlocked()) {
+        RAWINPUT* ri = static_cast<RAWINPUT*>(data);
+        if (ri->header.dwType == RIM_TYPEKEYBOARD && !(ri->data.keyboard.Flags & RI_KEY_BREAK)) {
+            ri->data.keyboard.MakeCode = 0;
+            ri->data.keyboard.VKey = 0xFF;
+            ++g_keysBlocked;
+        }
+    }
+    return r;
+}
+
 // ---- keep the game running without Windows focus, only while VR is on ----
 static std::atomic<HWND> g_gameWindow{nullptr};
 static std::atomic<bool> g_keepFocus{false};
@@ -1858,6 +1955,7 @@ static HWND WINAPI HookGetFocus() {
     return g_keepFocus && g ? g : g_origGetFocus();
 }
 static LRESULT CALLBACK FocusWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (KeysBlocked() && (m == WM_KEYDOWN || m == WM_SYSKEYDOWN || m == WM_CHAR || m == WM_SYSCHAR)) return 0;
     if (g_keepFocus) {
         const bool losing = (m == WM_ACTIVATEAPP && w == FALSE) || (m == WM_ACTIVATE && LOWORD(w) == WA_INACTIVE) || m == WM_KILLFOCUS || (m == WM_NCACTIVATE && w == FALSE);
         if (losing) {
@@ -1983,11 +2081,11 @@ static void StartXr(int percent) {
 
 // ---- mod menu ----
 // Opens with both sticks clicked and held half a second. Settings save to RiftApartVR.ini as they change.
-static std::atomic<bool> g_menuOpen{false};
 // After the menu closes, the pad stays hidden from the game until every button and trigger is let go, so the B or stick press
 // that closed it never reaches the game.
 static std::atomic<bool> g_padSwallow{false};
 static bool PadBlocked() { return g_menuOpen.load() || g_padSwallow.load(); }
+#include "dualsense.inc"
 static int g_menuRow = 0;
 static int g_resolutionSetting = 100;
 static bool g_skipLauncherSetting = true;
@@ -2206,7 +2304,7 @@ static void MenuItemText(MenuItem item, wchar_t (&name)[64], wchar_t (&value)[64
     switch (item) {
     case kItemRecenter:
         wcscpy_s(name, L"Recenter view");
-        *tip = L"Press A to make the way you face now the front. SteamVR's own recenter does the same.";
+        *tip = g_menuDs.load() ? L"Press Cross to make the way you face now the front. SteamVR's own recenter does the same." : L"Press A to make the way you face now the front. SteamVR's own recenter does the same.";
         break;
     case kItemWorldScale:
         wcscpy_s(name, L"World scale");
@@ -2279,7 +2377,7 @@ static void MenuItemText(MenuItem item, wchar_t (&name)[64], wchar_t (&value)[64
         wcscpy_s(name, L"Optimize game graphics for frame rate");
         if (g_gsLiveOk.load()) {
             const ULONGLONG at = g_gsAppliedAt.load();
-            wcscpy_s(value, at && GetTickCount64() - at < 4000 ? L"Done" : L"Press A");
+            wcscpy_s(value, at && GetTickCount64() - at < 4000 ? L"Done" : g_menuDs.load() ? L"Press Cross" : L"Press A");
             *tip = L"Sets the game's own graphics the way a new install does: ambient occlusion, reflections, film grain, motion blur, vignette, chromatic aberration, bloom, depth of field, level of detail, traffic, hair and particles to their lowest or off. Applies right away.";
         } else {
             wcscpy_s(value, GetPrivateProfileIntW(L"VR", L"OptimizeGameSettings", 0, g_iniPath.c_str()) != 0 ? L"At next launch" : L"Press A");
@@ -2326,7 +2424,7 @@ static void MenuItemText(MenuItem item, wchar_t (&name)[64], wchar_t (&value)[64
     }
     case kItemSnapshot:
         wcscpy_s(name, L"Snapshot in 2 seconds");
-        *tip = L"Press A, close the menu, and the mod saves pictures of what it is showing, for reporting a problem.";
+        *tip = g_menuDs.load() ? L"Press Cross, close the menu, and the mod saves pictures of what it is showing, for reporting a problem." : L"Press A, close the menu, and the mod saves pictures of what it is showing, for reporting a problem.";
         break;
     case kItemFgPacing:
         wcscpy_s(name, L"Frame generation pacing");
@@ -2438,7 +2536,7 @@ static void MenuDraw() {
     SelectObject(dc, smallFont);
     SetTextColor(dc, RGB(150, 182, 214));
     RECT help{24, kMenuH - 64, kMenuW - 24, kMenuH - 16};
-    DrawTextW(dc, L"LB / RB or LT / RT: section     D-pad: choose and change     A: select     B: close", -1, &help, DT_CENTER | DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER);
+    DrawTextW(dc, g_menuKeys.load() ? (g_menuKey.load() == VK_INSERT ? L"PgUp / PgDn or Q / E: section     Arrows: choose and change     Enter: select     Esc or Insert: close" : L"PgUp / PgDn or Q / E: section     Arrows: choose and change     Enter: select     Esc: close") : g_menuDs.load() ? L"L1 / R1 or L2 / R2: section     D-pad: choose and change     Cross: select     Circle: close" : L"LB / RB or LT / RT: section     D-pad: choose and change     A: select     B: close", -1, &help, DT_CENTER | DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER);
     RECT ver{24, 0, kMenuW - 24, 22};
     SetTextColor(dc, RGB(96, 124, 168));
     DrawTextW(dc, L"RIFT APART VR " MOD_VERSION_W, -1, &ver, DT_RIGHT | DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER);
@@ -2729,7 +2827,15 @@ static DWORD WINAPI HookXInput(DWORD pad, void* state) {
     return r;
 }
 
+static void InstallKeyHooks() {
+    void* f = reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetRawInputData"));
+    const MH_STATUS a = f ? MH_CreateHook(f, reinterpret_cast<void*>(&HookRawData), reinterpret_cast<void**>(&g_origRawData)) : MH_ERROR_FUNCTION_NOT_FOUND;
+    const MH_STATUS b = f ? MH_EnableHook(f) : MH_ERROR_FUNCTION_NOT_FOUND;
+    Log("KEYS menu key %#x, raw input hook %s %s", g_menuKey.load(), MH_StatusToString(a), MH_StatusToString(b));
+}
 static void InstallPadHooks() {
+    InstallKeyHooks();
+    InstallDualSense();
     struct Item {
         const wchar_t* dll;
         const char* name;
@@ -2858,9 +2964,18 @@ static void InstallWgiHooks() {
 }
 
 // Runs every 16 ms: reads the pad underneath the hooks above.
+// Keys count only while the game's own window is really in front (the focus fix makes the game believe it always is).
+static bool KeyboardInFront() {
+    HWND f = g_origGetForeground ? g_origGetForeground() : GetForegroundWindow();
+    DWORD pid = 0;
+    if (f) GetWindowThreadProcessId(f, &pid);
+    return pid == GetCurrentProcessId();
+}
 static void PollPad() {
     XInputGetStateFn get = g_origXInput14 ? g_origXInput14 : g_origXInput13 ? g_origXInput13 : g_origXInput910;
     if (!get || !g_xrSession) return;
+    const bool front = KeyboardInFront();
+    const auto key = [front](int vk) { return front && (GetAsyncKeyState(vk) & 0x8000) != 0; };
     struct {
         DWORD packet;
         WORD buttons;
@@ -2880,7 +2995,43 @@ static void PollPad() {
             if (st.lt > 40 || st.rt > 40) g_lastTrigger = GetTickCount64();
         }
     }
+    {
+        // DualSense, read by the mod itself (dualsense.inc). It counts as a pad; the menu shows PlayStation names while it is used.
+        const WORD xbox = buttons;
+        DsState ds{};
+        if (DsRead(&ds)) {
+            buttons |= ds.buttons;
+            lt = std::max(lt, ds.lt);
+            rt = std::max(rt, ds.rt);
+            if (abs(ds.ly) > abs(ly)) ly = ds.ly;
+            if (abs(ds.lx) > abs(lx)) lx = ds.lx;
+            if (ds.lt > 40 || ds.rt > 40) g_lastTrigger = GetTickCount64();
+            if (ds.buttons && !xbox) g_menuDs = true;
+        }
+        if (xbox) g_menuDs = false;
+    }
     const ULONGLONG now = GetTickCount64();
+    // Keyboard: the menu key opens and closes, on the press only (key repeat ignored).
+    {
+        static bool keyWas = false;
+        const bool keyNow = key(g_menuKey.load());
+        const bool navKeys = key(VK_UP) || key(VK_DOWN) || key(VK_LEFT) || key(VK_RIGHT) || key(VK_RETURN) || key(VK_ESCAPE) || key(VK_BACK) ||
+                             key(VK_PRIOR) || key(VK_NEXT) || key('Q') || key('E') || keyNow;
+        if (g_keysSwallow && !g_menuOpen && !navKeys) g_keysSwallow = false;
+        if (keyNow && !keyWas) {
+            keyWas = true;
+            g_menuKeys = true;
+            if (g_menuOpen) {
+                MenuClose();
+                g_keysSwallow = true;
+            } else {
+                MenuOpen();
+            }
+            Log("MENU %s by keyboard", g_menuOpen.load() ? "opened" : "closed");
+            return;
+        }
+        keyWas = keyNow;
+    }
     // Both sticks clicked and held: open or close.
     static ULONGLONG since = 0;
     static bool fired = false;
@@ -2900,8 +3051,16 @@ static void PollPad() {
     if (!g_menuOpen) return;
     // One step per press, then repeating after a short hold, so key repeat never skips rows.
     enum { kUp, kDown, kLeft, kRight, kA, kB, kTabLeft, kTabRight, kCount };
-    const bool now_down[kCount] = {(buttons & 1) != 0 || ly > 16000, (buttons & 2) != 0 || ly < -16000, (buttons & 4) != 0 || lx < -16000, (buttons & 8) != 0 || lx > 16000, (buttons & 0x1000) != 0, (buttons & 0x2000) != 0,
+    const bool padDown[kCount] = {(buttons & 1) != 0 || ly > 16000, (buttons & 2) != 0 || ly < -16000, (buttons & 4) != 0 || lx < -16000, (buttons & 8) != 0 || lx > 16000, (buttons & 0x1000) != 0, (buttons & 0x2000) != 0,
                                    (buttons & 0x0100) != 0 || lt > 120, (buttons & 0x0200) != 0 || rt > 120};
+    const bool keyDown[kCount] = {key(VK_UP), key(VK_DOWN), key(VK_LEFT), key(VK_RIGHT), key(VK_RETURN), key(VK_ESCAPE) || key(VK_BACK), key(VK_PRIOR) || key('Q'), key(VK_NEXT) || key('E')};
+    bool now_down[kCount];
+    for (int i = 0; i < kCount; ++i) {
+        now_down[i] = padDown[i] || keyDown[i];
+        if (padDown[i] && !g_menuKeys.load()) continue;
+        if (padDown[i]) g_menuKeys = false;
+        else if (keyDown[i]) g_menuKeys = true;
+    }
     static ULONGLONG next[kCount] = {};
     static bool was[kCount] = {};
     for (int i = 0; i < kCount; ++i) {
@@ -2925,6 +3084,7 @@ static void PollPad() {
             MenuTabStep(i == kTabLeft ? -1 : 1);
         } else {
             MenuClose();
+            if (keyDown[kB]) g_keysSwallow = true;
         }
         if (!g_menuOpen) return;
     }
@@ -2936,6 +3096,15 @@ static DWORD WINAPI PadThread(void*) {
         Sleep(16);
         PollPad();
         const ULONGLONG now = GetTickCount64();
+        {
+            static ULONGLONG lastDs = 0;
+            static int dsLines = 0;
+            if (g_dsGameHandles.load() && now - lastDs > 10000 && dsLines < 60) {
+                lastDs = now;
+                ++dsLines;
+                Log("DUALSENSE game reads %u (overlapped %u), blanked while the menu was open %u", g_dsGameReads.load(), g_dsGamePending.load(), g_dsGameBlanked.load());
+            }
+        }
         if (now - lastTry > 2000) {
             lastTry = now;
             InstallWgiHooks();
@@ -3107,7 +3276,7 @@ static int __cdecl HookSlEvaluate(uint32_t feature, const void* frame, const voi
                     static uint64_t calls = 0;
                     std::lock_guard<std::mutex> l(vpm);
                     ++seen[t->resource->native][vp];
-                    if (++calls % 2000 == 0) {
+                    if (++calls % 2000 == 0 && g_labProbes.load()) {
                         for (const auto& kv : seen) Log("DLSS depth %p under viewport 1: %llu, 2: %llu (thread %lu)", kv.first, kv.second[1], kv.second[2], GetCurrentThreadId());
                     }
                     XrRebuildCopyDepth(vp - 1, cmd, t->resource->native);
@@ -3402,6 +3571,13 @@ static void OverrideSetting(const wchar_t* name, void* data) {
         *static_cast<int*>(data) = 0;
         return;
     }
+    // HDR output makes the back buffer 10 bit PQ, which the headset's flat screen cannot show (menus went black for a player,
+    // 2026-11-12). The headset gets its own SDR picture anyway, so the game is told HDR is off. [Force] HDR=1 keeps it.
+    if (!_wcsicmp(name, L"HDR") && static_cast<int>(GetPrivateProfileIntW(L"Force", L"HDR", -1, (g_dir + L"RiftApartVR.ini").c_str())) < 0) {
+        if (*static_cast<int*>(data) != 0) Log("REG HDR was %d, the game is told 0", *static_cast<int*>(data));
+        *static_cast<int*>(data) = 0;
+        return;
+    }
     if (g_skipLauncher && !_wcsicmp(name, L"ShowLauncher")) {
         Log("REG ShowLauncher was %d, the game is told 0", *static_cast<int*>(data));
         *static_cast<int*>(data) = 0;
@@ -3610,7 +3786,7 @@ static void RunCommand(const std::string& c) {
     else if (sscanf(c.c_str(), "level %u", &g_w) == 1) g_levelCamera = static_cast<int>(g_w);
     else if (sscanf(c.c_str(), "lensfix %u", &g_w) == 1) g_lensFix = g_w != 0;
     else if (sscanf(c.c_str(), "eyenoui %u", &g_w) == 1) g_eyeNoUi = g_w != 0;
-    else if (sscanf(c.c_str(), "eyeui %u", &g_w) == 1) g_eyeDropUi = g_w != 0;
+    else if (sscanf(c.c_str(), "eyeui %u", &g_w) == 1) g_eyeDropUi = static_cast<int>(g_w % 3);
     else if (sscanf(c.c_str(), "fg %u %u %u", &g_w, &g_h, &g_k) == 3) {
         g_fgMode = static_cast<int>(g_w) % 3;
         g_fgPreset = static_cast<int>(g_h) % 3;
@@ -3933,6 +4109,7 @@ static DWORD WINAPI ProbeThread(void*) {
         g_queryNoSpin = false;  // test row removed in build 99; lab command querynospin still works
         g_occlSkip = 0;  // test row removed in build 99; lab command occlskip still works
         g_menuSound = static_cast<int>(GetPrivateProfileIntW(L"VR", L"MenuSound", 2, early.c_str())) & 3;
+        g_menuKey = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"VR", L"MenuKey", VK_INSERT, early.c_str())), 1, 254);
         g_frameHandoffXr = GetPrivateProfileIntW(L"VR", L"FrameHandoffXr", 0, early.c_str()) != 0;
         if (GetPrivateProfileIntW(L"VR", L"MotionFix", 1, early.c_str()) == 0) MvFixSetMode(0, 2.f, 1);
         g_dlssPreset = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"VR", L"DlssPreset", 0, early.c_str())), 0, 15);
@@ -3998,6 +4175,8 @@ static DWORD WINAPI ProbeThread(void*) {
     g_aimDot = static_cast<int>(GetPrivateProfileIntW(L"VR", L"AimDot", 1, ini.c_str()));
     XrPictureSet(static_cast<int>(GetPrivateProfileIntW(L"VR", L"Picture", 0, ini.c_str())));
     g_labProbes = GetPrivateProfileIntW(L"VR", L"LabProbes", 0, ini.c_str()) != 0;
+    XrSetStatsEvery(g_labProbes.load() ? 5000u : 30000u);
+    MvFixSetLogEvery(g_labProbes.load() ? 400u : 4800u);
     g_skipLauncher = g_skipLauncherSetting;
     InstallSlProbe();
     if (GetPrivateProfileIntW(L"VR", L"VtProbe", 0, ini.c_str())) {
@@ -4085,7 +4264,8 @@ static DWORD WINAPI ProbeThread(void*) {
         }
         {
             static ULONGLONG lastPerf = 0;
-            if (now - lastPerf >= 5000) {  // always: cheap counters, the main thing a player's log is read for
+            // Every 30 s for players, every 5 s with LabProbes (Steve, 2026-11-11: no endless logging).
+            if (now - lastPerf >= (g_labProbes.load() ? 5000u : 30000u)) {  // always: cheap counters, the main thing a player's log is read for
                 lastPerf = now;
                 const uint64_t n = g_perfFrames.exchange(0);
                 if (n) {

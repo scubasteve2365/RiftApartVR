@@ -11,6 +11,8 @@ struct XrEyePose {
 bool XrInit(const wchar_t* dir);
 void XrRecommended(int* w, int* h);
 void XrMaxEyeSize(int* w, int* h);
+// How often the XRSTAT line is written: 5 s in the lab, 30 s for players.
+void XrSetStatsEvery(unsigned ms);
 // Picture setting: 0 Auto, 1 Steady (projection layer), 2 Panel (quad layers). Auto: Steady on Virtual Desktop, Panel elsewhere.
 void XrPictureSet(int mode);
 int XrPictureGet();

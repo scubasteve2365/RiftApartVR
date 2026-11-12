@@ -32,6 +32,8 @@ static std::vector<XrSwapchainImageD3D12KHR> g_images[2];
 static int g_chainW, g_chainH;
 static std::atomic<int> g_recW{0}, g_recH{0};
 static uint32_t g_maxW = 0, g_maxH = 0;
+static std::atomic<uint32_t> g_statsEveryMs{5000};
+void XrSetStatsEvery(unsigned ms) { g_statsEveryMs = ms; }
 // Picture setting: 0 Auto (Steady on Virtual Desktop, Panel on everything else), 1 Steady (projection layer), 2 Panel (quad layers).
 static std::atomic<int> g_pictureMode{0};
 static char g_runtimeName[128], g_systemName[256];
@@ -533,7 +535,7 @@ static DWORD WINAPI XrWorker(void*) {
         }
         if (!overlap) WaitFrameClosed();
         const ULONGLONG now = GetTickCount64();
-        if (now - lastStats > 5000) {
+        if (now - lastStats > g_statsEveryMs.load()) {
             lastStats = now;
             const uint64_t n = g_endedWithImages.load();
             static uint64_t lastN = 0;

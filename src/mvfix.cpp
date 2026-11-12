@@ -188,6 +188,8 @@ void MvFixSetMatrix(int vp, const float* clipToPrevClip, float scaleX, float sca
     g_haveMatrix[vp] = true;
 }
 
+static std::atomic<uint64_t> g_logEvery{400};
+void MvFixSetLogEvery(unsigned calls) { g_logEvery = calls ? calls : 400; }
 void MvFixSetMode(int mode, float factor, int convention) {
     g_mode = mode;
     g_factor = factor;
@@ -244,8 +246,8 @@ void* MvFixRun(int vp, void* cmd, void* depthRes, void* mvRes, uint32_t mvState,
             D3D12_RANGE none{0, 0};
             g_statsRead->Unmap(0, &none);
         }
-        if (++g_calls % 400 == 0) {
-            const double px = static_cast<double>(g_outW[vp]) * g_outH[vp] * 400;
+        if (++g_calls % g_logEvery.load() == 0) {
+            const double px = static_cast<double>(g_outW[vp]) * g_outH[vp] * static_cast<double>(g_logEvery.load());
             Log("MVFIX %llu calls: object movement over 0.5 px on %.2f%% of pixels, mean %.2f px there; camera part mean %.2f px",
                 g_calls, g_n / px * 100, g_n ? g_obj / 16.0 / g_n : 0.0, g_cam / 4.0 / px);
             g_n = g_obj = g_cam = 0;
