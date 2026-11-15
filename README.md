@@ -76,6 +76,7 @@ Frame generation and Clank's Space & Frame Warp cannot be used together. Whichev
 | Vendor screen up close | When the game zooms onto a shop screen, it fills your view. Off leaves it in the world |
 | Aim dot | A small ring in the world where your shots go: Off, While aiming, or Always |
 | Cutscenes on a screen | Zoomed shots puts very zoomed in cutscene shots on a screen and the rest in 3D. All puts every cutscene on a screen. Never keeps them all in 3D |
+| Heat Distortion Effect | The wavy heat shimmer the game puts over hot places such as lava. It bends the world as you look around, which is uncomfortable in VR. Off (the default) removes it from your view; On shows it as the game draws it |
 | Menu sound | The menu's click: Off, Low, Medium or High |
 
 ### Developer

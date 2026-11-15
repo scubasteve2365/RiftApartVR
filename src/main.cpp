@@ -32,9 +32,11 @@
 #include <string>
 #include <vector>
 
-#define BUILD_NUMBER 126
-#define MOD_VERSION "1.3"
-#define MOD_VERSION_W L"1.2.4"
+#define BUILD_NUMBER 132
+#define MOD_VERSION "1.3.1"
+#define MOD_WIDEN2(x) L##x
+#define MOD_WIDEN(x) MOD_WIDEN2(x)
+#define MOD_VERSION_W MOD_WIDEN(MOD_VERSION)  // one version number: the menu label had stayed at 1.2.4 through 1.3
 
 // The stubs in winhttp_stubs.asm jump through this table.
 static const char* const kNames[] = {
@@ -1334,9 +1336,33 @@ static const char kHudModel[] = "playerhud";
 using ModelQueueFn = void(__fastcall*)(uint8_t*, uint8_t*, char);
 static ModelQueueFn g_origModelQueue;
 static const char kUiModels[] = "models\x5cui\x5c";
+static std::atomic<int> g_modelNames{0};  // lab: log each model name the eyes queue, once
+static std::atomic<uint32_t> g_modelNamesCap{4000};
+static std::mutex g_modelDropLock;
+static std::vector<std::string> g_modelDrop;  // lab: eyes leave out models whose path contains one of these
+static std::atomic<bool> g_modelDropAny{false};
 static void __fastcall HookModelQueue(uint8_t* ctx, uint8_t* inst, char flag) {
     const uint8_t* const view = *reinterpret_cast<uint8_t* const*>(ctx + 8);
     const int drop = g_eyeDropUi.load();
+    if (g_modelDropAny.load() && (view == g_eyeA.load() || view == g_eyeB.load())) {
+        const uint8_t* const model = *reinterpret_cast<uint8_t* const*>(inst + 0x88);
+        const char* const name = model ? *reinterpret_cast<const char* const*>(model + 0x10) : nullptr;
+        if (name) {
+            std::lock_guard<std::mutex> l(g_modelDropLock);
+            for (const std::string& s : g_modelDrop)
+                if (strstr(name, s.c_str())) return;
+        }
+    }
+    if (g_modelNames.load() && (view == g_eyeA.load() || view == g_eyeB.load())) {
+        const uint8_t* const model = *reinterpret_cast<uint8_t* const*>(inst + 0x88);
+        const char* const name = model ? *reinterpret_cast<const char* const*>(model + 0x10) : nullptr;
+        if (name) {
+            static std::mutex m;
+            static std::set<std::string> seen;
+            std::lock_guard<std::mutex> l(m);
+            if (seen.size() < g_modelNamesCap.load() && seen.insert(name).second) Log("MODELNAME %s", name);
+        }
+    }
     if ((view == g_eyeA.load() || view == g_eyeB.load()) && drop) {
         const uint8_t* const model = *reinterpret_cast<uint8_t* const*>(inst + 0x88);
         const char* const name = model ? *reinterpret_cast<const char* const*>(model + 0x10) : nullptr;
@@ -1352,6 +1378,108 @@ static void __fastcall HookModelQueue(uint8_t* ctx, uint8_t* inst, char flag) {
         }
     }
     g_origModelQueue(ctx, inst, flag);
+}
+
+// ---- Pass queue 0x1215870 (build 67 probe, back in 1.3.1 for the heat haze): which passes an eye queues, and a lab skip list.
+// The bucket lives inside the view, so its address says which view queues.
+static std::atomic<int> g_passLog{0};
+static std::atomic<uint64_t> g_passSkipBits[4];
+static int64_t __fastcall HookPassQueue(void* bucket, int64_t idWide, int64_t a, int64_t b) {
+    const int id = static_cast<int>(idWide);
+    const auto at = reinterpret_cast<uint8_t*>(bucket);
+    uint8_t* const e0 = g_eyeA.load();
+    uint8_t* const e1 = g_eyeB.load();
+    const size_t span = 0x17000;
+    const bool eye = (e0 && at >= e0 && at < e0 + span) || (e1 && at >= e1 && at < e1 + span);
+    if (eye && g_passLog.load()) {
+        static std::mutex m;
+        static std::set<int> seen;
+        std::lock_guard<std::mutex> l(m);
+        if (seen.insert(id).second) Log("PASSQ eye id %#x off %zx from %zx", id, static_cast<size_t>(at - (e0 && at >= e0 && at < e0 + span ? e0 : e1)), static_cast<size_t>(reinterpret_cast<uint8_t*>(_ReturnAddress()) - g_base));
+    }
+    if (eye && id >= 0 && id < 256 && (g_passSkipBits[id / 64].load() >> (id % 64) & 1)) return 0;
+    return g_origPassQueue(bucket, idWide, a, b);
+}
+
+// ---- Visual effects: 0x139dc80(effect, item, sort slot, view, x) queues one effect draw into the VFX pass 0x49 (and 0x86, 0x47).
+// Lab probe for the heat haze (2026-11-14): list the effects the eyes draw, with any strings found near them, and skip by number.
+using VfxQueueFn = void(__fastcall*)(uint8_t*, uint8_t*, int, uint8_t*, void*);
+static VfxQueueFn g_origVfxQueue;
+static std::atomic<int> g_vfxLog{0};
+static std::mutex g_vfxLock;
+static std::vector<const uint8_t*> g_vfxSeen;
+static std::atomic<uint64_t> g_vfxSkipBits[4];
+static std::atomic<int> g_vfxSkipSlot{-1}, g_vfxSkipType{-1};  // lab: skip effects by sort slot, by type byte fx+0x17a
+static std::atomic<uint32_t> g_vfxSkipF60{0};                    // lab: skip effects whose item+0x48 -> +0x60 has any of these bits
+// Heat Distortion Effect (Options tab, `HeatDistortion` in the ini, 0 by default: the effect is left out of the eyes). The game's heat
+// shimmer, for example over Blizar Prime's lava, comes from effects whose item+0x48 -> +0x60 has bit 0x1000. Found 2026-11-14 on RigB in
+// Steve's save: leaving them out takes the background's frame to frame change from 11 to 12 levels to 3 to 6, and the picture differs
+// no more than two frames of normal animation do; the purple crystal glow and light shafts stay.
+static const uint32_t kHeatDistortionBit = 0x1000;
+static std::atomic<int> g_heatEffect{0};
+static std::atomic<uint64_t> g_heatLeftOut{0};
+static bool PrintableAt(const uint8_t* p, char* out, size_t n) {
+    char buf[64] = {};
+    if (!SafeCopy(buf, p, sizeof(buf) - 1)) return false;
+    size_t len = 0;
+    while (len < sizeof(buf) - 1 && buf[len] >= 0x20 && buf[len] < 0x7f) ++len;
+    if (len < 6 || buf[len] != 0) return false;
+    strncpy_s(out, n, buf, _TRUNCATE);
+    return true;
+}
+static void VfxDescribe(const uint8_t* fx, const uint8_t* item, int idx, int slot) {
+    uint64_t q[0x30] = {};
+    SafeCopy(q, fx, sizeof(q));
+    std::string names;
+    for (int i = 0; i < 0x30 && names.size() < 300; ++i) {
+        const uint64_t v = q[i];
+        if (v < 0x10000 || v > 0x7fffffffffff) continue;
+        char s[64];
+        if (PrintableAt(reinterpret_cast<const uint8_t*>(v), s, sizeof(s))) names += " +" + std::to_string(i * 8) + "=" + s;
+        else {
+            uint64_t inner[8] = {};
+            if (SafeCopy(inner, reinterpret_cast<const void*>(v), sizeof(inner)))
+                for (int j = 0; j < 8; ++j)
+                    if (inner[j] > 0x10000 && inner[j] < 0x7fffffffffff && PrintableAt(reinterpret_cast<const uint8_t*>(inner[j]), s, sizeof(s)))
+                        names += " +" + std::to_string(i * 8) + "/" + std::to_string(j * 8) + "=" + s;
+        }
+    }
+    uint32_t itemFlags = 0;
+    const uint8_t* i48 = nullptr;
+    SafeCopy(&i48, item + 0x48, sizeof(i48));
+    if (i48) SafeCopy(&itemFlags, i48 + 0x60, sizeof(itemFlags));
+    Log("VFX %d fx %p flags18 %llx b17a %u slot %d item0 %x item48+60 %x vt %llx%s", idx, fx, static_cast<unsigned long long>(q[3]), fx[0x17a],
+        slot, *reinterpret_cast<const uint32_t*>(item), itemFlags, static_cast<unsigned long long>(q[0] - reinterpret_cast<uint64_t>(g_base)), names.c_str());
+}
+static void __fastcall HookVfxQueue(uint8_t* fx, uint8_t* item, int slot, uint8_t* view, void* x) {
+    if (view && (view == g_eyeA.load() || view == g_eyeB.load())) {
+        if (g_vfxSkipSlot.load() == slot) return;
+        if (g_vfxSkipType.load() >= 0 && fx[0x17a] == g_vfxSkipType.load()) return;
+        const uint32_t m = g_vfxSkipF60.load() | (g_heatEffect.load() ? 0u : kHeatDistortionBit);
+        if (m) {
+            const uint8_t* i48 = *reinterpret_cast<uint8_t* const*>(item + 0x48);
+            const uint32_t f = i48 ? *reinterpret_cast<const uint32_t*>(i48 + 0x60) : 0;
+            if (f & m) {
+                if ((f & kHeatDistortionBit) && g_heatLeftOut.fetch_add(1) == 0) Log("HEAT distortion effect left out of the eyes (setting Off)");
+                return;
+            }
+        }
+    }
+    if (view && (view == g_eyeA.load() || view == g_eyeB.load()) && (g_vfxLog.load() || g_vfxSkipBits[0] | g_vfxSkipBits[1] | g_vfxSkipBits[2] | g_vfxSkipBits[3])) {
+        int idx = -1;
+        {
+            std::lock_guard<std::mutex> l(g_vfxLock);
+            for (size_t i = 0; i < g_vfxSeen.size(); ++i)
+                if (g_vfxSeen[i] == fx) { idx = static_cast<int>(i); break; }
+            if (idx < 0 && g_vfxSeen.size() < 256) {
+                idx = static_cast<int>(g_vfxSeen.size());
+                g_vfxSeen.push_back(fx);
+                if (g_vfxLog.load()) VfxDescribe(fx, item, idx, slot);
+            }
+        }
+        if (idx >= 0 && (g_vfxSkipBits[idx / 64].load() >> (idx % 64) & 1)) return;
+    }
+    g_origVfxQueue(fx, item, slot, view, x);
 }
 
 // Resting the flat view: the scene submit returns at once when view +0x11d8 is clear. Set again when not resting.
@@ -1801,6 +1929,10 @@ static void InstallHooks() {
     MH_CreateHook(g_base + kCameraPush.rva, reinterpret_cast<void*>(&HookCameraPush), reinterpret_cast<void**>(&g_origCameraPush));
     MH_CreateHook(g_base + kTone.rva, reinterpret_cast<void*>(&HookTone), reinterpret_cast<void**>(&g_origTone));
     MH_CreateHook(g_base + 0x11212d0, reinterpret_cast<void*>(&HookModelQueue), reinterpret_cast<void**>(&g_origModelQueue));
+    Log("VFXQ hook %s", MH_StatusToString(MH_CreateHook(g_base + 0x139dc80, reinterpret_cast<void*>(&HookVfxQueue), reinterpret_cast<void**>(&g_origVfxQueue))));
+    // Lab only: it runs for every pass of every view, every frame (removed in build 68 for that cost).
+    if (GetPrivateProfileIntW(L"VR", L"LabProbes", 0, (g_dir + L"RiftApartVR.ini").c_str()) != 0)
+        Log("PASSQ hook %s", MH_StatusToString(MH_CreateHook(g_base + 0x1215870, reinterpret_cast<void*>(&HookPassQueue), reinterpret_cast<void**>(&g_origPassQueue))));
     MH_CreateHook(g_base + kBufferSize.rva, reinterpret_cast<void*>(&HookBufferSize), reinterpret_cast<void**>(&g_origBufferSize));
     const MH_STATUS st = MH_EnableHook(MH_ALL_HOOKS);
     Log("HOOKS %s", MH_StatusToString(st));
@@ -1922,14 +2054,36 @@ static bool KeysBlocked() { return g_menuOpen.load() || g_keysSwallow.load(); }
 using GetRawInputDataFn = UINT(WINAPI*)(HRAWINPUT, UINT, LPVOID, PUINT, UINT);
 static GetRawInputDataFn g_origRawData;
 static std::atomic<uint32_t> g_keysBlocked{0};
+// 1.3.1: a key whose press the game never saw also loses its release. The game pauses on Esc's release, so closing the menu with Esc
+// paused the game (RigB 2026-11-14). Keys held before the menu opened keep their release, so none sticks.
+// Raw input and window messages are marked apart, so each path clears its own mark at the release.
+static std::atomic<uint64_t> g_downBlocked[4], g_rawDownBlocked[4];
+static bool TakeDownBlocked(std::atomic<uint64_t>* set, UINT vk) {
+    if (vk >= 256) return false;
+    return (set[vk / 64].fetch_and(~(1ull << (vk % 64))) >> (vk % 64)) & 1;
+}
+static void MarkDownBlocked(std::atomic<uint64_t>* set, UINT vk) {
+    if (vk < 256) set[vk / 64].fetch_or(1ull << (vk % 64));
+}
 static UINT WINAPI HookRawData(HRAWINPUT h, UINT cmd, LPVOID data, PUINT size, UINT headerSize) {
     const UINT r = g_origRawData(h, cmd, data, size, headerSize);
-    if (data && cmd == RID_INPUT && r != static_cast<UINT>(-1) && r >= sizeof(RAWINPUTHEADER) + sizeof(RAWKEYBOARD) && KeysBlocked()) {
+    if (data && cmd == RID_INPUT && r != static_cast<UINT>(-1) && r >= sizeof(RAWINPUTHEADER) + sizeof(RAWKEYBOARD)) {
         RAWINPUT* ri = static_cast<RAWINPUT*>(data);
-        if (ri->header.dwType == RIM_TYPEKEYBOARD && !(ri->data.keyboard.Flags & RI_KEY_BREAK)) {
-            ri->data.keyboard.MakeCode = 0;
-            ri->data.keyboard.VKey = 0xFF;
-            ++g_keysBlocked;
+        if (ri->header.dwType == RIM_TYPEKEYBOARD) {
+            const UINT vk = ri->data.keyboard.VKey;
+            const bool up = (ri->data.keyboard.Flags & RI_KEY_BREAK) != 0;
+            bool blank = false;
+            if (!up && KeysBlocked()) {
+                MarkDownBlocked(g_rawDownBlocked, vk);
+                blank = true;
+            } else if (up && TakeDownBlocked(g_rawDownBlocked, vk)) {
+                blank = true;
+            }
+            if (blank) {
+                ri->data.keyboard.MakeCode = 0;
+                ri->data.keyboard.VKey = 0xFF;
+                ++g_keysBlocked;
+            }
         }
     }
     return r;
@@ -1955,7 +2109,11 @@ static HWND WINAPI HookGetFocus() {
     return g_keepFocus && g ? g : g_origGetFocus();
 }
 static LRESULT CALLBACK FocusWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    if (KeysBlocked() && (m == WM_KEYDOWN || m == WM_SYSKEYDOWN || m == WM_CHAR || m == WM_SYSCHAR)) return 0;
+    if (KeysBlocked() && (m == WM_KEYDOWN || m == WM_SYSKEYDOWN || m == WM_CHAR || m == WM_SYSCHAR)) {
+        if (m == WM_KEYDOWN || m == WM_SYSKEYDOWN) MarkDownBlocked(g_downBlocked, static_cast<UINT>(w));
+        return 0;
+    }
+    if ((m == WM_KEYUP || m == WM_SYSKEYUP) && TakeDownBlocked(g_downBlocked, static_cast<UINT>(w))) return 0;
     if (g_keepFocus) {
         const bool losing = (m == WM_ACTIVATEAPP && w == FALSE) || (m == WM_ACTIVATE && LOWORD(w) == WA_INACTIVE) || m == WM_KILLFOCUS || (m == WM_NCACTIVATE && w == FALSE);
         if (losing) {
@@ -2208,7 +2366,7 @@ static const int kMenuW = 1024, kMenuH = 800;
 enum MenuItem {
     kItemRecenter, kItemWorldScale, kItemPitch, kItemHudDistance, kItemSkipLauncher,
     kItemFrameGen, kItemFgType, kItemFgQuality, kItemFgDetail, kItemStereo, kItemResolution, kItemOptimizeGame,
-    kItemVendor, kItemAimDot, kItemCutscenes, kItemPicture, kItemMenuSound,
+    kItemVendor, kItemAimDot, kItemCutscenes, kItemPicture, kItemMenuSound, kItemHeat,
     kItemSnapshot, kItemFgPacing, kItemFrameHandoff,
 };
 struct MenuTab {
@@ -2218,7 +2376,7 @@ struct MenuTab {
 static const MenuTab kTabs[] = {
     {L"GENERAL", {kItemRecenter, kItemWorldScale, kItemPitch, kItemHudDistance, kItemSkipLauncher}},
     {L"PERFORMANCE", {kItemStereo, kItemResolution, kItemFrameGen, kItemFgType, kItemFgQuality, kItemFgDetail, kItemOptimizeGame}},
-    {L"OPTIONS", {kItemVendor, kItemAimDot, kItemCutscenes, kItemPicture, kItemMenuSound}},
+    {L"OPTIONS", {kItemVendor, kItemAimDot, kItemCutscenes, kItemHeat, kItemPicture, kItemMenuSound}},
     {L"DEVELOPER", {kItemSnapshot, kItemFgPacing, kItemFrameHandoff}},
 };
 static const int kTabCount = static_cast<int>(sizeof(kTabs) / sizeof(kTabs[0]));
@@ -2415,6 +2573,11 @@ static void MenuItemText(MenuItem item, wchar_t (&name)[64], wchar_t (&value)[64
         *tip = text;
         break;
     }
+    case kItemHeat:
+        wcscpy_s(name, L"Heat Distortion Effect");
+        wcscpy_s(value, g_heatEffect.load() ? L"On" : L"Off");
+        *tip = L"The wavy heat shimmer the game puts over hot places such as lava. It bends the world as you look around, which is uncomfortable in VR. Off removes it from your view.";
+        break;
     case kItemMenuSound: {
         static const wchar_t* const levels[4] = {L"Off", L"Low", L"Medium", L"High"};
         wcscpy_s(name, L"Menu sound");
@@ -2690,6 +2853,11 @@ static void MenuChange(int dir) {
     case kItemPicture:
         XrPictureSet(XrPictureGet() + (step < 0 ? 2 : 1));
         SaveSetting(L"Picture", XrPictureGet());
+        break;
+    case kItemHeat:
+        g_heatEffect = g_heatEffect.load() ? 0 : 1;
+        SaveSetting(L"HeatDistortion", g_heatEffect.load());
+        Log("HEAT distortion effect %s", g_heatEffect.load() ? "on, as the game draws it" : "off");
         break;
     case kItemMenuSound:
         g_menuSound = (g_menuSound.load() + (step < 0 ? 3 : 1)) % 4;
@@ -3787,6 +3955,22 @@ static void RunCommand(const std::string& c) {
     else if (sscanf(c.c_str(), "lensfix %u", &g_w) == 1) g_lensFix = g_w != 0;
     else if (sscanf(c.c_str(), "eyenoui %u", &g_w) == 1) g_eyeNoUi = g_w != 0;
     else if (sscanf(c.c_str(), "eyeui %u", &g_w) == 1) g_eyeDropUi = static_cast<int>(g_w % 3);
+    else if (sscanf(c.c_str(), "modelnames %u", &g_w) == 1) g_modelNames = static_cast<int>(g_w);
+    else if (sscanf(c.c_str(), "passlog %u", &g_w) == 1) g_passLog = static_cast<int>(g_w);
+    else if (sscanf(c.c_str(), "vfxlog %u", &g_w) == 1) g_vfxLog = static_cast<int>(g_w);
+    else if (sscanf(c.c_str(), "vfxslot %d", &g_show) == 1) g_vfxSkipSlot = g_show;
+    else if (sscanf(c.c_str(), "vfxtype %d", &g_show) == 1) g_vfxSkipType = g_show;
+    else if (sscanf(c.c_str(), "vfxf60 %x", &g_w) == 1) g_vfxSkipF60 = g_w;
+    else if (sscanf(c.c_str(), "vfxskip %u", &g_w) == 1 && g_w < 256) g_vfxSkipBits[g_w / 64].fetch_or(1ull << (g_w % 64));
+    else if (sscanf(c.c_str(), "vfxkeep %u", &g_w) == 1 && g_w < 256) g_vfxSkipBits[g_w / 64].fetch_and(~(1ull << (g_w % 64)));
+    else if (sscanf(c.c_str(), "modeldrop %63s", g_text) == 1) {
+        std::lock_guard<std::mutex> l(g_modelDropLock);
+        if (!strcmp(g_text, "-")) g_modelDrop.clear(); else g_modelDrop.push_back(g_text);
+        g_modelDropAny = !g_modelDrop.empty();
+        Log("MODELDROP %s (%zu in list)", g_text, g_modelDrop.size());
+    }
+    else if (sscanf(c.c_str(), "passskip %x", &g_w) == 1) g_passSkipBits[(g_w & 0xff) / 64].fetch_or(1ull << ((g_w & 0xff) % 64));
+    else if (sscanf(c.c_str(), "passkeep %x", &g_w) == 1) g_passSkipBits[(g_w & 0xff) / 64].fetch_and(~(1ull << ((g_w & 0xff) % 64)));
     else if (sscanf(c.c_str(), "fg %u %u %u", &g_w, &g_h, &g_k) == 3) {
         g_fgMode = static_cast<int>(g_w) % 3;
         g_fgPreset = static_cast<int>(g_h) % 3;
@@ -4173,6 +4357,8 @@ static DWORD WINAPI ProbeThread(void*) {
         XrRebuildSetMode(alt == 2 ? 1 : 0);
     }
     g_aimDot = static_cast<int>(GetPrivateProfileIntW(L"VR", L"AimDot", 1, ini.c_str()));
+    g_heatEffect = GetPrivateProfileIntW(L"VR", L"HeatDistortion", 0, ini.c_str()) != 0 ? 1 : 0;
+    Log("HEAT distortion effect %s at start", g_heatEffect.load() ? "on" : "off");
     XrPictureSet(static_cast<int>(GetPrivateProfileIntW(L"VR", L"Picture", 0, ini.c_str())));
     g_labProbes = GetPrivateProfileIntW(L"VR", L"LabProbes", 0, ini.c_str()) != 0;
     XrSetStatsEvery(g_labProbes.load() ? 5000u : 30000u);
